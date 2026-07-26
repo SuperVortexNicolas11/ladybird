@@ -8,17 +8,24 @@
 #[path = "../../../../RustAllocator.rs"]
 mod rust_allocator;
 
+pub mod animation;
 pub mod calc;
 pub mod cascaded_properties;
+mod color_conversion;
+pub mod color_interpolation;
 pub mod computed_values;
+pub mod css_enums;
 pub mod css_pixels;
 mod css_tokenizer;
 pub mod custom_properties;
+pub mod display;
 pub mod ffi_stats;
+pub mod ffi_support;
 pub mod property_metadata;
 mod selector_engine;
 pub mod style_compute;
 mod style_value;
+pub mod transition;
 
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;

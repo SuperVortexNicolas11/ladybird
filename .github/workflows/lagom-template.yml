@@ -49,10 +49,10 @@ jobs:
       # Pull requests can trail behind `master` and can cause breakage if merging before running the CI checks on an updated branch.
       # Luckily, GitHub creates and maintains a merge branch that is updated whenever the target or source branch is modified. By
       # checking this branch out, we gain a stabler `master` at the cost of reproducibility.
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         if: ${{ github.event_name != 'pull_request' }}
 
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         if: ${{ github.event_name == 'pull_request' }}
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
@@ -215,24 +215,27 @@ jobs:
         if: ${{ inputs.os_name == 'Linux' && (inputs.build_preset == 'Release' || inputs.build_preset == 'Sanitizer') }}
         timeout-minutes: 5
         working-directory: ${{ github.workspace }}
-        run: Meta/WPT.sh run --test-list Tests/LibWeb/WPT/ci-smoke-tests.txt
+        shell: bash
+        run: |
+          export ASAN_OPTIONS="log_path=\"${GITHUB_WORKSPACE}/Build/asan.log\""
+          export UBSAN_OPTIONS="log_path=\"${GITHUB_WORKSPACE}/Build/ubsan.log\""
+          Meta/WPT.sh run --test-list Tests/LibWeb/WPT/ci-smoke-tests.txt
         env:
           BUILD_LADYBIRD: 'false'
           LADYBIRD_BINARY: ${{ github.workspace }}/Build/bin/Ladybird
           WEBDRIVER_BINARY: ${{ github.workspace }}/Build/bin/WebDriver
           WPT_PROCESSES: '4'
-          ASAN_OPTIONS: 'log_path=${{ github.workspace }}/Build/asan.log'
-          UBSAN_OPTIONS: 'log_path=${{ github.workspace }}/Build/ubsan.log'
 
       - name: Test
         if: ${{ inputs.build_preset == 'Sanitizer' }}
         working-directory: ${{ github.workspace }}
-        run: ctest --preset ${{ inputs.build_preset }} --output-on-failure --test-dir Build --timeout 1800
+        shell: bash
+        run: |
+          export ASAN_OPTIONS="log_path=\"${GITHUB_WORKSPACE}/Build/asan.log\""
+          export UBSAN_OPTIONS="log_path=\"${GITHUB_WORKSPACE}/Build/ubsan.log\""
+          ctest --preset ${{ inputs.build_preset }} --output-on-failure --test-dir Build --timeout 1800
         env:
           TESTS_ONLY: 1
-          # NOTE: These are appended to the preset's options.
-          ASAN_OPTIONS: 'log_path=asan.log'
-          UBSAN_OPTIONS: 'log_path=ubsan.log'
 
       - name: Test
         if: ${{ inputs.build_preset != 'Fuzzers' && inputs.build_preset != 'All_Debug' && inputs.build_preset != 'Sanitizer' }}

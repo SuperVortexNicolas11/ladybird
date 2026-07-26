@@ -185,7 +185,8 @@ public:
     CSS::UserSelect user_select_used_value() const;
 
     bool in_editable_subtree() const { return m_in_editable_subtree; }
-    void recompute_editable_subtree_flag();
+    bool recompute_editable_subtree_flag();
+    void recompute_editable_subtree_flags_and_repaint();
 
     virtual bool is_dom_node() const final { return true; }
     virtual bool is_html_element() const { return false; }
@@ -371,7 +372,7 @@ public:
 
     void clear_layout_node_and_paintable(Badge<Document>);
     void set_layout_node(Badge<Layout::Node>, Layout::Node&);
-    void detach_layout_node(Badge<Layout::TreeBuilder>);
+    void detach_layout_node(Badge<Layout::LayoutTreeBuilderAccess>);
 
     virtual bool is_child_allowed(Node const&) const { return true; }
 

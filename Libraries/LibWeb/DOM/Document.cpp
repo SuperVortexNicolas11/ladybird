@@ -188,6 +188,7 @@
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
 #include <LibWeb/Layout/BlockFormattingContext.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/SVGFormattingContext.h>
 #include <LibWeb/Layout/SVGSVGBox.h>
 #include <LibWeb/Layout/ScrollableOverflow.h>
@@ -619,6 +620,15 @@ Document::Document(JS::Realm& realm, URL::URL const& url)
 
 Document::~Document() = default;
 
+Layout::NodeArena& Document::layout_node_arena()
+{
+    // Created on first layout node so documents that never build a layout tree (e.g. temporary
+    // fragment-parsing documents) skip the Rust arena round-trip entirely.
+    if (!m_layout_node_arena)
+        m_layout_node_arena = make_ref_counted<Layout::NodeArena>();
+    return *m_layout_node_arena;
+}
+
 void Document::set_temporary_document_for_fragment_parsing(Badge<HTML::HTMLParser>)
 {
     // https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm
@@ -634,6 +644,13 @@ void Document::reset_style_invalidation_counters() const
 {
     m_style_invalidation_counters = {};
     m_style_invalidations_since_last_counter_dump = 0;
+}
+
+void Document::record_layout_tree_build(u64 rebuilt_subtree_root_count, bool escaped_rebuild_roots)
+{
+    ++m_layout_tree_build_stats.builds;
+    m_layout_tree_build_stats.last_build_rebuilt_subtree_roots = rebuilt_subtree_root_count;
+    m_layout_tree_build_stats.last_build_escaped_rebuild_roots = escaped_rebuild_roots;
 }
 
 void Document::record_style_invalidation() const
@@ -823,6 +840,9 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_previously_repainted_cursor_position);
     if (m_hit_test_display_list)
         m_hit_test_display_list->visit_edges(visitor);
+    // In the steady state the item cache source aliases the current list; avoid tracing it twice.
+    if (m_hit_test_display_list_used_as_item_cache_source && m_hit_test_display_list_used_as_item_cache_source != m_hit_test_display_list)
+        m_hit_test_display_list_used_as_item_cache_source->visit_edges(visitor);
     visitor.visit(m_editing_host_manager);
     visitor.visit(m_editing_history);
     visitor.visit(m_local_storage_holder);
@@ -1449,6 +1469,7 @@ void Document::tear_down_layout_tree()
     if (m_layout_root)
         m_layout_root->prepare_subtree_for_detach_from_layout_tree();
     m_hit_test_display_list = nullptr;
+    m_hit_test_display_list_used_as_item_cache_source = nullptr;
     m_layout_root = nullptr;
     m_paintable = nullptr;
     m_scrollable_overflow_contained_boxes_from_last_layout.clear();
@@ -2004,14 +2025,15 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
     Vector<Layout::Node*> rebuilt_subtree_roots;
     if (needs_layout_tree_rebuild) {
         auto tree_build_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
-        Layout::TreeBuilder tree_builder;
-        m_layout_root = as<Layout::Viewport>(*tree_builder.build(*this));
+        auto tree_build_result = Layout::build_layout_tree(*this);
+        m_layout_root = as<Layout::Viewport>(*tree_build_result.root);
+        record_layout_tree_build(tree_build_result.rebuilt_subtree_roots.size(), tree_build_result.layout_tree_update_escaped_rebuild_roots);
         needs_layout_tree_rebuild = false;
         layout_tree_was_built_in_partial_branch = true;
         pending_updates_escaped_during_partial_build = m_partial_relayout_invalidation.escapes()
-            || tree_builder.layout_tree_update_escaped_rebuild_roots();
+            || tree_build_result.layout_tree_update_escaped_rebuild_roots;
         m_partial_relayout_invalidation.clear_escape(PartialRelayoutEscapeClearReason::PartialLayoutTreeBuild);
-        rebuilt_subtree_roots = tree_builder.rebuilt_subtree_roots();
+        rebuilt_subtree_roots = move(tree_build_result.rebuilt_subtree_roots);
 
         if constexpr (UPDATE_LAYOUT_DEBUG) {
             dbgln("TREEBUILD {} µs", tree_build_timer.elapsed_time().to_microseconds());
@@ -2171,8 +2193,9 @@ void Document::update_layout(UpdateLayoutReason reason)
         auto timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
 
         if (needs_layout_tree_rebuild) {
-            Layout::TreeBuilder tree_builder;
-            m_layout_root = as<Layout::Viewport>(*tree_builder.build(*this));
+            auto tree_build_result = Layout::build_layout_tree(*this);
+            m_layout_root = as<Layout::Viewport>(*tree_build_result.root);
+            record_layout_tree_build(tree_build_result.rebuilt_subtree_roots.size(), tree_build_result.layout_tree_update_escaped_rebuild_roots);
 
             // NB: Called during layout update.
             if (document_element && document_element->unsafe_layout_node())
@@ -2535,24 +2558,32 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
             clamp_scroll_offset(const_cast<Painting::Paintable&>(*box_paintable));
     }
 
-    if (derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByAfterLayoutCommit)
-        return;
-
     bool any_overflow_changed = false;
     bool any_has_scrollable_overflow_flipped = false;
     for (auto const& [box, old_overflow_data] : old_overflow_data_by_box) {
         auto box_paintable = box->paintable_box();
         if (!box_paintable || !box_paintable->overflow_data().has_value())
             continue;
-        VERIFY(old_overflow_data.has_value());
+        // A box with no prior overflow data was just created or reset by the layout commit, so
+        // its paint cache is already clean.
+        if (!old_overflow_data.has_value())
+            continue;
         auto const& new_overflow_data = *box_paintable->overflow_data();
         bool rect_changed = old_overflow_data->scrollable_overflow_rect != new_overflow_data.scrollable_overflow_rect;
         bool has_scrollable_overflow_flipped = old_overflow_data->has_scrollable_overflow != new_overflow_data.has_scrollable_overflow;
-        any_overflow_changed |= rect_changed || has_scrollable_overflow_flipped;
+        if (!rect_changed && !has_scrollable_overflow_flipped)
+            continue;
+        // Cached paint commands and hit-test items capture scrollbar geometry and per-direction
+        // scrollability derived from the overflow rect, so they cannot be reused once it changes.
+        // This must also run for the after-layout-commit path: a subtree relayout re-measures a
+        // surviving ancestor's overflow without resetting the ancestor's paintable.
+        box_paintable->invalidate_paint_cache();
+        any_overflow_changed = true;
         any_has_scrollable_overflow_flipped |= has_scrollable_overflow_flipped;
-        if (any_has_scrollable_overflow_flipped)
-            break;
     }
+
+    if (derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByAfterLayoutCommit)
+        return;
 
     // Nothing derived from scrollable overflow needs updating. In particular, this keeps transform
     // changes that ride the accumulated-visual-context value-update path free of display list
@@ -4694,6 +4725,14 @@ void Document::run_the_resize_steps()
             visual_viewport.dispatch_event(visual_viewport_resize_event);
         }
     }
+}
+
+bool Document::append_pending_scroll_event(PendingScrollEvent event)
+{
+    if (m_pending_scroll_events.contains_slow(event))
+        return false;
+    m_pending_scroll_events.append(move(event));
+    return true;
 }
 
 // https://drafts.csswg.org/cssom-view-1/#document-run-the-scroll-steps
@@ -7338,10 +7377,7 @@ void Document::remove_form_associated_element_with_form_attribute(HTML::FormAsso
 void Document::set_design_mode_enabled_state(bool design_mode_enabled)
 {
     m_design_mode_enabled = design_mode_enabled;
-    for_each_in_inclusive_subtree([](Node& node) {
-        node.recompute_editable_subtree_flag();
-        return TraversalDecision::Continue;
-    });
+    recompute_editable_subtree_flags_and_repaint();
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#making-entire-documents-editable:-the-designmode-idl-attribute
@@ -7855,7 +7891,7 @@ void Document::for_each_active_css_style_sheet(Function<void(CSS::CSSStyleSheet&
 {
     if (m_style_sheets) {
         for (auto& style_sheet : m_style_sheets->sheets()) {
-            if (!(style_sheet->is_alternate() && style_sheet->disabled()))
+            if (!style_sheet->disabled())
                 callback(*style_sheet);
         }
     }
@@ -8083,7 +8119,7 @@ void Document::process_pending_top_layer_layout_changes()
                 invalidate_layout_tree(InvalidateLayoutTreeReason::TopLayerElementStillRenderedAfterRemoval);
                 return;
             }
-            Layout::TreeBuilder::detach_top_layer_element_layout_subtree(element);
+            Layout::detach_top_layer_element_layout_subtree(element);
             if (element->is_connected())
                 elements_to_mark_for_layout_tree_update.append(element);
         }
@@ -8092,7 +8128,7 @@ void Document::process_pending_top_layer_layout_changes()
     for (auto const& member : m_top_layer_elements) {
         if (!member->rendered_in_top_layer())
             continue;
-        Layout::TreeBuilder::detach_top_layer_element_layout_subtree(member);
+        Layout::detach_top_layer_element_layout_subtree(member);
         elements_to_mark_for_layout_tree_update.append(member);
     }
 
@@ -8880,8 +8916,11 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
         display_list_recorder.fill_rect(bitmap_rect, CSS::SystemColor::canvas(color_scheme));
 
     auto background_color = this->background_color();
-    if (navigable()->is_top_level_traversable())
-        page().client().page_did_change_background_color(canvas_background_color());
+    if (navigable()->is_top_level_traversable()) {
+        auto canvas_background_color = this->canvas_background_color();
+        display_list->set_surface_clear_color(canvas_background_color);
+        page().client().page_did_change_background_color(canvas_background_color);
+    }
 
     display_list_recorder.fill_rect(bitmap_rect, background_color);
 
@@ -8895,6 +8934,17 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
     context.set_paint_command_cache_mode(cache_mode);
     if (!line_box_border_overlays_replace_cacheable_content)
         context.set_paint_command_cache_source_display_list(viewport_paintable.display_list_used_as_paint_command_cache_source());
+    // An incompatible visual context tree rebuild leaves the retained list's item context indices
+    // meaningless, so it only serves as a splice source while the tree version still matches.
+    if (auto const* hit_test_item_cache_source = m_hit_test_display_list_used_as_item_cache_source.ptr();
+        hit_test_item_cache_source && hit_test_item_cache_source->visual_context_tree_version() == viewport_paintable.visual_context_tree().version()) {
+        context.set_hit_test_item_cache_source(hit_test_item_cache_source);
+        // The new recording ends up with roughly as many items as the source it splices from.
+        hit_test_display_list->ensure_item_capacity(hit_test_item_cache_source->item_count());
+    } else {
+        // Versions only move forward, so a mismatched list can never be spliced from again.
+        m_hit_test_display_list_used_as_item_cache_source = nullptr;
+    }
     viewport_paintable.refresh_scroll_state();
     viewport_paintable.initialize_async_scrolling_metadata_recording(context);
 
@@ -8941,6 +8991,8 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
         // Rotation can drop the last reference to the list the context's raw pointer still targets.
         context.set_paint_command_cache_source_display_list(nullptr);
         viewport_paintable.set_display_list_used_as_paint_command_cache_source(display_list, resource_storage.collect_referenced_resources(*display_list));
+        context.set_hit_test_item_cache_source(nullptr);
+        m_hit_test_display_list_used_as_item_cache_source = hit_test_display_list;
     }
 
     m_hit_test_display_list = move(hit_test_display_list);
@@ -8955,6 +9007,11 @@ void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
     m_caret_hit_test_debug_rect = rect;
     set_needs_repaint(InvalidateDisplayList::Yes);
     page().client().request_frame();
+}
+
+void Document::clear_hit_test_item_cache_source()
+{
+    m_hit_test_display_list_used_as_item_cache_source = nullptr;
 }
 
 Painting::HitTestDisplayList const* Document::ensure_hit_test_display_list()
@@ -9501,6 +9558,16 @@ Utf16String Document::dump_display_list()
                 if (nesting_change > 0)
                     indent += nesting_change;
             });
+
+            auto mask_context_indices = list.mask_display_lists().keys();
+            insertion_sort(mask_context_indices);
+            for (auto context_index : mask_context_indices) {
+                builder.append_repeated(' ', base_indent * 2);
+                builder.appendff("MaskDisplayList for context {}:\n", context_index.value());
+                auto display_list_id = list.mask_display_list_id(context_index).release_value();
+                auto& mask_display_list = resource_storage.display_list(display_list_id);
+                dump_commands(mask_display_list, base_indent + 1);
+            }
         };
 
     dump_commands(*display_list, 0);

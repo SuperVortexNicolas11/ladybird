@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
 #include <AK/TemporaryChange.h>
 #include <LibCore/Environment.h>
@@ -18,12 +19,12 @@
 #include <LibWeb/Painting/BackgroundPainting.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListRecorder.h>
+#include <LibWeb/Painting/HitTestDisplayList.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
 #include <LibWeb/Painting/SVGSVGPaintable.h>
 #include <LibWeb/Painting/StackingContext.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
-#include <LibWeb/SVG/SVGMaskElement.h>
 
 namespace Web::Painting {
 
@@ -89,6 +90,14 @@ static void verify_spliced_commands_match_fresh_recording(Paintable const& paint
     VERIFY_NOT_REACHED();
 }
 
+static void verify_spliced_hit_test_items_match_fresh_recording(Paintable const& paintable, DisplayListRecordingContext& context, PaintPhase phase, Paintable::HitTestItemRange spliced_range)
+{
+    auto scratch_hit_test_display_list = HitTestDisplayList::create(context.display_list_recorder().visual_context_tree().version());
+    auto scratch_context = context.clone(context.display_list_recorder(), scratch_hit_test_display_list.ptr());
+    paintable.record_hit_test_items(scratch_context, phase);
+    context.hit_test_display_list()->verify_cached_items_match_fresh_recording(spliced_range, *scratch_hit_test_display_list, paintable, phase);
+}
+
 static void paint_node(Paintable const& paintable, DisplayListRecordingContext& context, PaintPhase phase)
 {
     TemporaryChange save_nesting_level(context.display_list_recorder().m_save_nesting_level, 0);
@@ -100,8 +109,6 @@ static void paint_node(Paintable const& paintable, DisplayListRecordingContext& 
     else
         context.display_list_recorder().set_accumulated_visual_context(paintable.accumulated_visual_context_index());
 
-    paintable.record_hit_test_items(context, phase);
-
     auto& recorder = context.display_list_recorder();
     auto const* cache_source_display_list = context.paint_command_cache_source_display_list();
     // NB: Some commands embed visual context indices in their payloads. Those
@@ -111,6 +118,32 @@ static void paint_node(Paintable const& paintable, DisplayListRecordingContext& 
         && cache_source_display_list->compatible_visual_context_tree_version() == recorder.visual_context_tree().version();
     bool const skip_cache = paintable.fixed_background_visual_context().has_value();
     bool const cache_writes_enabled = context.paint_command_cache_mode() == PaintCommandCacheMode::ReadWrite;
+
+    // Hit-test items are only ever recorded in the Background, Foreground, and Overlay phases;
+    // every record_hit_test_items() implementation early-returns for the rest.
+    bool const phase_can_record_hit_test_items = phase == PaintPhase::Background || phase == PaintPhase::Foreground || phase == PaintPhase::Overlay;
+    if (auto* hit_test_display_list = context.hit_test_display_list(); hit_test_display_list && phase_can_record_hit_test_items) {
+        auto const* item_cache_source = context.hit_test_item_cache_source();
+        auto cached_items = !skip_cache && item_cache_source
+            ? paintable.valid_cached_hit_test_items(phase, item_cache_source->id())
+            : Optional<Paintable::HitTestItemRange> {};
+        if (cached_items.has_value()) {
+            auto destination_range = hit_test_display_list->append_cached_items(*item_cache_source, *cached_items);
+            if (verify_display_list_cache_enabled()) [[unlikely]]
+                verify_spliced_hit_test_items_match_fresh_recording(paintable, context, phase, destination_range);
+            if (cache_writes_enabled)
+                paintable.set_cached_hit_test_items(phase, hit_test_display_list->id(), destination_range);
+        } else {
+            auto items_before = hit_test_display_list->item_count();
+            paintable.record_hit_test_items(context, phase);
+            if (!skip_cache && cache_writes_enabled) {
+                auto items_after = hit_test_display_list->item_count();
+                VERIFY(items_after <= NumericLimits<u32>::max());
+                paintable.set_cached_hit_test_items(phase, hit_test_display_list->id(), { static_cast<u32>(items_before), static_cast<u32>(items_after - items_before) });
+            }
+        }
+    }
+
     auto const phase_context_index = recorder.accumulated_visual_context();
     bool const phase_has_empty_effective_clip = recorder.visual_context_tree().has_empty_effective_clip(phase_context_index);
 
@@ -460,47 +493,41 @@ void StackingContext::paint(DisplayListRecordingContext& context) const
     }
 
     // Collect all masks (CSS mask-image, SVG <mask>, SVG <clipPath>).
-    Vector<DisplayListRecorder::MaskInfo> masks;
+    Vector<MaskLayerDisplayList> masks;
 
-    if (any_of(mask_layers, [](auto const& layer) { return layer.background_image != nullptr; })) {
-        auto visual_context_tree = AccumulatedVisualContextTree::create();
-        auto mask_display_list = DisplayList::create(visual_context_tree);
-        DisplayListRecorder display_list_recorder(*mask_display_list, visual_context_tree, context.display_list_recorder().resource_storage());
-        auto mask_painting_context = context.clone(display_list_recorder);
-        auto absolute_mask_rect = paintable_box().absolute_border_box_rect();
-        auto mask_rect_in_device_pixels = context.enclosing_device_rect(absolute_mask_rect);
-        auto mask_rect = CSSPixelRect { {}, absolute_mask_rect.size() };
-        auto resolved_mask = resolve_background_layers(mask_layers, paintable_box(), Color::Transparent, CSS::BackgroundBox::BorderBox, mask_rect, {});
+    for (auto const& mask_layer : paintable_box().mask_layer_presence(MaskLayerSet::CssAndSvg)) {
+        switch (mask_layer.origin) {
+        case MaskLayerOrigin::CssMaskLayers: {
+            auto visual_context_tree = AccumulatedVisualContextTree::create();
+            auto mask_display_list = DisplayList::create(visual_context_tree);
+            DisplayListRecorder display_list_recorder(*mask_display_list, visual_context_tree, context.display_list_recorder().resource_storage());
+            auto mask_painting_context = context.clone(display_list_recorder);
+            auto mask_rect = CSSPixelRect { {}, mask_layer.area.size() };
+            auto resolved_mask = resolve_background_layers(mask_layers, paintable_box(), Color::Transparent, CSS::BackgroundBox::BorderBox, mask_rect, {});
 
-        // FIXME: Respect `image-rendering` here.
-        paint_background(mask_painting_context, paintable_box(), CSS::ImageRendering::Auto, resolved_mask, {});
-        masks.append({ { *mask_display_list, move(visual_context_tree) }, mask_rect_in_device_pixels.to_type<int>(), Gfx::MaskKind::Alpha });
-    }
-
-    if (auto mask_area = paintable_box().get_mask_area(); mask_area.has_value()) {
-        if (auto mask_display_list = paintable_box().calculate_mask(context, *mask_area); mask_display_list.has_value()) {
-            auto rect = context.enclosing_device_rect(*mask_area).to_type<int>();
-            auto kind = paintable_box().get_mask_type().value_or(Gfx::MaskKind::Alpha);
-            masks.append({ mask_display_list.release_value(), rect, kind });
+            // FIXME: Respect `image-rendering` here.
+            paint_background(mask_painting_context, paintable_box(), CSS::ImageRendering::Auto, resolved_mask, {});
+            masks.append({ MaskLayerOrigin::CssMaskLayers, { *mask_display_list, move(visual_context_tree) } });
+            break;
+        }
+        case MaskLayerOrigin::SvgMask:
+            if (auto mask_display_list = paintable_box().calculate_mask(context, mask_layer.area); mask_display_list.has_value())
+                masks.append({ MaskLayerOrigin::SvgMask, mask_display_list.release_value() });
+            break;
+        case MaskLayerOrigin::SvgClip:
+            if (auto clip_display_list = paintable_box().calculate_clip(context, mask_layer.area); clip_display_list.has_value())
+                masks.append({ MaskLayerOrigin::SvgClip, clip_display_list.release_value() });
+            break;
         }
     }
 
-    if (auto clip_area = paintable_box().get_clip_area(); clip_area.has_value()) {
-        if (auto clip_display_list = paintable_box().calculate_clip(context, *clip_area); clip_display_list.has_value()) {
-            auto rect = context.enclosing_device_rect(*clip_area).to_type<int>();
-            masks.append({ clip_display_list.release_value(), rect, Gfx::MaskKind::Alpha });
-        }
-    }
-
-    context.display_list_recorder().begin_masks(masks);
+    register_mask_display_lists(context, paintable_box(), masks);
 
     auto context_before_children = context.display_list_recorder().accumulated_visual_context();
 
     paint_internal(context);
 
     context.display_list_recorder().set_accumulated_visual_context(context_before_children);
-
-    context.display_list_recorder().end_masks(masks);
 }
 
 void StackingContext::dump(StringBuilder& builder, int indent) const

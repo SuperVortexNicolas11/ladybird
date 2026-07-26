@@ -53,8 +53,6 @@ public:
     bool is_font_relative() const { return CSS::is_font_relative(m_unit); }
     bool is_container_relative() const { return CSS::is_container_relative(m_unit); }
     bool is_viewport_relative() const { return CSS::is_viewport_relative(m_unit); }
-    bool is_relative() const { return CSS::is_relative(m_unit); }
-    bool is_computationally_independent() const { return !is_font_relative() && !is_container_relative(); }
 
     double raw_value() const { return m_value; }
     LengthUnit unit() const { return m_unit; }
@@ -78,6 +76,11 @@ public:
         void set_did_resolve_viewport_relative_length(bool& did_resolve_viewport_relative_length) const
         {
             m_did_resolve_viewport_relative_length = &did_resolve_viewport_relative_length;
+        }
+
+        [[nodiscard]] bool* viewport_metric_dependency_flag() const
+        {
+            return m_did_resolve_viewport_relative_length;
         }
 
         void record_viewport_relative_length_resolution() const

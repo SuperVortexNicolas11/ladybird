@@ -163,7 +163,6 @@ set(SOURCES
     CSS/CSSUnparsedValue.cpp
     CSS/CSSVariableReferenceValue.cpp
     CSS/ColorFunctionDescriptor.cpp
-    CSS/ColorInterpolation.cpp
     CSS/CustomPropertyData.cpp
     CSS/Descriptor.cpp
     CSS/Display.cpp
@@ -201,7 +200,6 @@ set(SOURCES
     CSS/Invalidation/SlotInvalidator.cpp
     CSS/Invalidation/StyleInvalidator.cpp
     CSS/Invalidation/StructuralMutationInvalidator.cpp
-    CSS/Interpolation.cpp
     CSS/InvalidationSet.cpp
     CSS/Length.cpp
     CSS/LengthBox.cpp
@@ -234,8 +232,6 @@ set(SOURCES
     CSS/Parser/ValueParsing.cpp
     CSS/Percentage.cpp
     CSS/PreferredColorScheme.cpp
-    CSS/PreferredContrast.cpp
-    CSS/PreferredMotion.cpp
     CSS/Ratio.cpp
     CSS/Resolution.cpp
     CSS/Screen.cpp
@@ -244,7 +240,6 @@ set(SOURCES
     CSS/SelectorRustBridge.cpp
     CSS/SelectorMatching.cpp
     CSS/Serialize.cpp
-    CSS/Size.cpp
     CSS/Sizing.cpp
     CSS/StyleComputer.cpp
     CSS/StyleInvalidation.cpp
@@ -830,6 +825,7 @@ set(SOURCES
     Layout/ListItemMarkerBox.cpp
     Layout/NavigableContainerViewport.cpp
     Layout/Node.cpp
+    Layout/NodeArena.cpp
     Layout/RadioButton.cpp
     Layout/RangeInputBox.cpp
     Layout/ReplacedBox.cpp
@@ -858,6 +854,7 @@ set(SOURCES
     Layout/VideoBox.cpp
     Layout/Viewport.cpp
     Loader/ContentBlocker.cpp
+    Loader/DownloadFilename.cpp
     Loader/FileRequest.cpp
     Loader/GeneratedPagesLoader.cpp
     Loader/ProxyMappings.cpp
@@ -1150,6 +1147,7 @@ set(SOURCES
     WebAssembly/WebAssembly.cpp
     WebAssembly/WebAssemblyModule.cpp
     WebAudio/AnalyserNode.cpp
+    WebAudio/AudioArray.cpp
     WebAudio/AudioBuffer.cpp
     WebAudio/AudioBufferSourceNode.cpp
     WebAudio/AudioContext.cpp
@@ -1157,6 +1155,7 @@ set(SOURCES
     WebAudio/AudioListener.cpp
     WebAudio/AudioNode.cpp
     WebAudio/AudioParam.cpp
+    WebAudio/AudioParamTimeline.cpp
     WebAudio/AudioScheduledSourceNode.cpp
     WebAudio/BaseAudioContext.cpp
     WebAudio/BiquadFilterNode.cpp
@@ -1173,6 +1172,13 @@ set(SOURCES
     WebAudio/OscillatorNode.cpp
     WebAudio/PannerNode.cpp
     WebAudio/PeriodicWave.cpp
+    WebAudio/Rendering/AudioBus.cpp
+    WebAudio/Rendering/BiquadCoefficients.cpp
+    WebAudio/Rendering/OfflineAudioRenderer.cpp
+    WebAudio/Rendering/RealtimeAudioRenderer.cpp
+    WebAudio/Rendering/RenderGraph.cpp
+    WebAudio/Rendering/RenderNode.cpp
+    WebAudio/Rendering/RenderNodes.cpp
     WebAudio/ScriptProcessorNode.cpp
     WebAudio/StereoPannerNode.cpp
     WebDriver/Actions.cpp
@@ -1340,6 +1346,17 @@ import_rust_crate(
     FFI_HEADERS HTML/Parser/RustFFI.h
 )
 
+set(layout_rust_features "")
+if (NOT BUILD_SHARED_LIBS)
+    set(layout_rust_features FEATURES allocator)
+endif()
+import_rust_crate(
+    MANIFEST_PATH Layout/Rust/Cargo.toml
+    CRATE_NAME libweb_layout_rust
+    ${layout_rust_features}
+    FFI_HEADERS Layout/TreeBuilderRustFFI.h
+)
+
 set(css_rust_features "")
 if (NOT BUILD_SHARED_LIBS)
     set(css_rust_features FEATURES allocator)
@@ -1356,8 +1373,9 @@ if (NOT BUILD_SHARED_LIBS)
     set(content_blocker_rust_features FEATURES allocator)
 endif()
 import_rust_crate(MANIFEST_PATH ContentBlocker/Rust/Cargo.toml CRATE_NAME libweb_content_blocker_rust ${content_blocker_rust_features} FFI_HEADER ContentBlockerRustFFI.h)
-target_link_libraries(LibWeb PRIVATE libweb_rust libweb_css_rust libweb_content_blocker_rust)
+target_link_libraries(LibWeb PRIVATE libweb_rust libweb_layout_rust libweb_css_rust libweb_content_blocker_rust)
 get_target_property(_libweb_rust_lib libweb_rust IMPORTED_LOCATION)
+get_target_property(_libweb_layout_rust_lib libweb_layout_rust IMPORTED_LOCATION)
 get_target_property(_libweb_css_rust_lib libweb_css_rust IMPORTED_LOCATION)
 get_target_property(_libweb_content_blocker_rust_lib libweb_content_blocker_rust IMPORTED_LOCATION)
 set_property(SOURCE HTML/Parser/HTMLTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
@@ -1370,6 +1388,7 @@ endif()
 if(NOT BUILD_SHARED_LIBS)
     add_custom_command(TARGET LibWeb POST_BUILD
         COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_rust>
+        COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_layout_rust>
         COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_css_rust>
         COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_content_blocker_rust>
         COMMAND ${CMAKE_AR} -qS $<TARGET_FILE:LibWeb> *.o
@@ -1387,6 +1406,7 @@ if(NOT BUILD_SHARED_LIBS)
     # re-merges the fresh Rust objects.
     set_property(SOURCE CSS/Parser/RustTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_css_rust_lib})
     set_property(SOURCE HTML/Parser/HTMLEncodingDetection.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE Layout/TreeBuilder.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_layout_rust_lib})
     set_property(SOURCE Loader/ContentBlocker.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_content_blocker_rust_lib})
 endif()
 

@@ -44,6 +44,7 @@ namespace Web::Painting {
 struct FlexboxInspectorOverlayOptions;
 struct GridInspectorOverlayOptions;
 class HitTestDisplayList;
+class Paintable;
 class ResizeHandle;
 class Scrollbar;
 
@@ -52,6 +53,24 @@ bool should_paint_viewport_scrollbars();
 ResolvedCSSFilter resolve_css_filter(CSS::Filter const& computed_filter, Paintable const& paintable_box);
 
 bool body_background_is_propagated_to_root(Layout::NodeWithStyle const&);
+
+struct MaskLayerPresence {
+    MaskLayerOrigin origin;
+    CSSPixelRect area;
+    Gfx::MaskKind kind { Gfx::MaskKind::Alpha };
+};
+
+enum class MaskLayerSet : u8 {
+    CssAndSvg,
+    SvgOnly,
+};
+
+struct MaskLayerDisplayList {
+    MaskLayerOrigin origin;
+    DisplayListResource resource;
+};
+
+void register_mask_display_lists(DisplayListRecordingContext&, Paintable const&, ReadonlySpan<MaskLayerDisplayList>);
 
 class WEB_API Paintable
     : public RefCounted<Paintable>
@@ -186,6 +205,8 @@ public:
     virtual Optional<CSSPixelRect> get_clip_area() const { return {}; }
     virtual Optional<DisplayListResource> calculate_clip(DisplayListRecordingContext&, CSSPixelRect const&) const { return {}; }
 
+    Vector<MaskLayerPresence, 3> mask_layer_presence(MaskLayerSet) const;
+
     auto& box_model() { return m_box_model; }
     auto const& box_model() const { return m_box_model; }
 
@@ -204,6 +225,7 @@ public:
 
     CSSPixelPoint scroll_offset() const;
     ScrollHandled set_scroll_offset(CSSPixelPoint);
+    ScrollHandled set_scroll_offset_from_user_input(CSSPixelPoint);
     ScrollHandled scroll_by(double delta_x, double delta_y);
     void scroll_into_view(CSSPixelRect);
 
@@ -368,8 +390,6 @@ public:
 
     CSSPixelRect transform_reference_box() const;
 
-    VisualContextIndex nearest_scroll_node_index() const;
-
     RefPtr<Paintable const> nearest_scrollable_ancestor() const;
 
     using StickyInsets = Painting::StickyInsets;
@@ -418,6 +438,16 @@ public:
     };
     Optional<CachedCommandRange> valid_cached_commands(PaintPhase, u64 source_display_list_id, bool phase_has_empty_effective_clip) const;
     void set_cached_commands(PaintPhase, u64 display_list_id, DisplayListCommandRange, VisualContextIndex recorded_context_index, bool captured_under_empty_effective_clip) const;
+
+    // A capture may hold hit-test items recorded under both this paintable's own context index and its
+    // descendants' context index, so spliced items are not rewritten; instead a cached range is usable
+    // only while both indices still match what they were at capture time.
+    struct HitTestItemRange {
+        u32 start { 0 };
+        u32 count { 0 };
+    };
+    Optional<HitTestItemRange> valid_cached_hit_test_items(PaintPhase, u64 source_hit_test_display_list_id) const;
+    void set_cached_hit_test_items(PaintPhase, u64 hit_test_display_list_id, HitTestItemRange) const;
 
     void set_fixed_background_visual_context(VisualContextIndex index) { m_fixed_background_visual_context = index; }
     [[nodiscard]] Optional<VisualContextIndex> fixed_background_visual_context() const { return m_fixed_background_visual_context; }
@@ -472,6 +502,7 @@ private:
     void detach_from_layout_node(Badge<Layout::Node>);
     void detach_chrome_widgets();
     void set_containing_block(Paintable* containing_block);
+    GC::Ptr<DOM::EventTarget> scroll_event_target();
 
     void paint_middle_button_scroll_indicator(DisplayListRecordingContext&) const;
     void invalidate_absolute_geometry_cache(InvalidateDescendantGeometry);

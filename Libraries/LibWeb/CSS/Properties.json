@@ -2948,6 +2948,7 @@
     "initial": "add"
   },
   "mask-image": {
+    "affects-accumulated-visual-contexts": true,
     "animation-type": "discrete",
     "inherited": false,
     "affects-layout": false,
@@ -3033,6 +3034,7 @@
     "percentages-resolve-to": "length"
   },
   "mask-type": {
+    "affects-accumulated-visual-contexts": true,
     "animation-type": "discrete",
     "inherited": false,
     "affects-layout": false,
@@ -4525,7 +4527,7 @@
     "animation-type": "discrete",
     "inherited": false,
     "initial": "auto",
-    "max-values": 2,
+    "max-values": 3,
     "requires-computation": "never",
     "valid-types": [
       "touch-action"

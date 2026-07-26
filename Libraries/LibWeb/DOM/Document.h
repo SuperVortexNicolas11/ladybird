@@ -113,6 +113,7 @@ enum class InvalidateLayoutTreeReason {
     X(ElementSetScrollTop)                   \
     X(EventHandlerDispatchChromeWidgetEvent) \
     X(EventHandlerHandleDragAndDrop)         \
+    X(EventHandlerHandleKeyDown)             \
     X(EventHandlerHandleMouseDown)           \
     X(EventHandlerHandleMouseMove)           \
     X(EventHandlerHandleMouseUp)             \
@@ -745,6 +746,7 @@ public:
     // one at construction; a full layout pass renumbers the whole tree densely and resets the
     // counter past the dense range.
     [[nodiscard]] u32 allocate_layout_node_index() { return m_next_layout_node_index++; }
+    [[nodiscard]] Layout::NodeArena& layout_node_arena();
     void reset_layout_node_index_counter(u32 next_index)
     {
         m_next_layout_node_index = next_index;
@@ -803,6 +805,7 @@ public:
         Utf16FlyString event_type;
         bool operator==(PendingScrollEvent const&) const = default;
     };
+    bool append_pending_scroll_event(PendingScrollEvent);
     Vector<PendingScrollEvent>& pending_scroll_events() { return m_pending_scroll_events; }
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#completely-loaded
@@ -1050,6 +1053,16 @@ public:
     void record_full_style_invalidation() const;
     static void set_style_invalidation_counter_dump_interval(Optional<u64>);
 
+    // Confinement report of the most recent layout tree build, for tests observing whether a
+    // partial rebuild stayed inside its rebuilt subtrees.
+    struct LayoutTreeBuildStats {
+        u64 builds { 0 };
+        u64 last_build_rebuilt_subtree_roots { 0 };
+        bool last_build_escaped_rebuild_roots { false };
+    };
+    LayoutTreeBuildStats const& layout_tree_build_stats() const { return m_layout_tree_build_stats; }
+    void record_layout_tree_build(u64 rebuilt_subtree_root_count, bool escaped_rebuild_roots);
+
     void set_needs_accumulated_visual_contexts_update(bool);
     bool needs_accumulated_visual_contexts_update() const { return m_needs_accumulated_visual_contexts_update; }
     void schedule_accumulated_visual_context_value_update(Element&);
@@ -1146,6 +1159,7 @@ public:
     RefPtr<Painting::DisplayList> record_display_list(HTML::PaintConfig, Painting::DisplayListResourceStorage&, Painting::PaintCommandCacheMode);
     Painting::HitTestDisplayList const* hit_test_display_list() const { return m_hit_test_display_list.ptr(); }
     Painting::HitTestDisplayList const* ensure_hit_test_display_list();
+    void clear_hit_test_item_cache_source();
     Optional<Painting::HitTestResult> hit_test(CSSPixelPoint, Painting::HitTestType);
     Optional<Painting::CaretPosition> caret_position_from_point(CSSPixelPoint);
     Optional<Painting::CaretPosition> caret_position_from_point_for_selection_start(CSSPixelPoint);
@@ -1409,6 +1423,7 @@ private:
 
     GC::Ptr<HTML::Window> m_window;
 
+    RefPtr<Layout::NodeArena> m_layout_node_arena;
     RefPtr<Layout::Viewport> m_layout_root;
 
     GC::Ptr<Node> m_hovered_node;
@@ -1719,9 +1734,13 @@ private:
     Vector<GC::Ref<Node>> m_style_scopes_with_pending_has_invalidations;
     CSS::SheetSetStyleCacheRegistry m_sheet_set_style_cache_registry;
     RefPtr<Painting::HitTestDisplayList> m_hit_test_display_list;
+    // The previous recording's list, retained so cached per-paintable item ranges can be spliced into
+    // the next recording. Rotated only by cache-read-write recordings; survives display list invalidation.
+    RefPtr<Painting::HitTestDisplayList> m_hit_test_display_list_used_as_item_cache_source;
     Optional<CSSPixelRect> m_caret_hit_test_debug_rect;
 
     mutable StyleInvalidationCounters m_style_invalidation_counters;
+    LayoutTreeBuildStats m_layout_tree_build_stats;
     mutable u64 m_style_invalidations_since_last_counter_dump { 0 };
 
     mutable GC::Ptr<WebIDL::ObservableArray> m_adopted_style_sheets;
