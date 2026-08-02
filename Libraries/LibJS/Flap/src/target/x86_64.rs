@@ -4,29 +4,28 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::{Architecture, CompileOptions, ObjectFormat};
-use crate::frontend::layout::KnownLayoutConstant;
-use super::description::{BinaryOperation, FloatBinaryOperation, FloatConversion as IntrinsicFloatConversion, FloatUnaryOperation, FloatingPointOperation, IntegerBinaryOperation, IntegerWidth, MemoryOperation, MemoryWidth, Operation, ShiftOperation, SignCondition};
-use super::ir::{
-    MachineFunction as Handler, MachineInstruction, MachineProgram as Program,
-    MachineCondition as Condition, MachineMemoryAddress,
-    MachineOperand as Operand, RuntimeConstants,
-};
-use super::machine_verify::{
-    define_machine_opcodes, operands_match,
-};
 use super::description::OperandKind::{
-    FprIn as FR, FuncSymbol as F, GprIn as R, GprInOrImm as RI,
-    Imm as I, Label as L, Memory as A, RegisterIn as AR,
+    FprIn as FR, FuncSymbol as F, GprIn as R, GprInOrImm as RI, Imm as I, Label as L, Memory as A, RegisterIn as AR,
 };
-use super::registers::x86_64 as registers;
-use super::emitter::{
-    SimpleInstruction, SimpleOperand, emit_file_header, emit_handlers,
-    emit_label, emit_program, emit_simple_instruction, integer, native,
-    simple, w, word,
+use super::description::{
+    BinaryOperation, FloatBinaryOperation, FloatConversion as IntrinsicFloatConversion, FloatUnaryOperation,
+    FloatingPointOperation, IntegerBinaryOperation, IntegerWidth, MemoryOperation, MemoryWidth, Operation,
+    ShiftOperation, SignCondition,
 };
 #[cfg(test)]
 use super::emitter::emit_handler_range;
+use super::emitter::{
+    SimpleInstruction, SimpleOperand, emit_file_header, emit_handlers, emit_label, emit_program,
+    emit_simple_instruction, integer, native, simple, w, word,
+};
+use super::ir::{
+    MachineCondition as Condition, MachineFunction as Handler, MachineInstruction, MachineMemoryAddress,
+    MachineOperand as Operand, MachineProgram as Program, RuntimeConstants,
+};
+use super::machine_verify::{define_machine_opcodes, operands_match};
+use super::registers::x86_64 as registers;
+use crate::frontend::layout::KnownLayoutConstant;
+use crate::{Architecture, CompileOptions, ObjectFormat};
 use std::fmt::Write;
 
 pub(crate) mod finalize;
@@ -66,12 +65,8 @@ impl AluOperation {
 pub(crate) fn alu_immediate_fits(width: IntegerWidth, value: i64) -> bool {
     match width {
         IntegerWidth::U64 => i32::try_from(value).is_ok(),
-        IntegerWidth::U32 => {
-            (i32::MIN as i64..=u32::MAX as i64).contains(&value)
-        }
-        IntegerWidth::U16 => {
-            (i16::MIN as i64..=u16::MAX as i64).contains(&value)
-        }
+        IntegerWidth::U32 => (i32::MIN as i64..=u32::MAX as i64).contains(&value),
+        IntegerWidth::U16 => (i16::MIN as i64..=u16::MAX as i64).contains(&value),
         IntegerWidth::U8 => false,
     }
 }
@@ -79,6 +74,7 @@ pub(crate) fn alu_immediate_fits(width: IntegerWidth, value: i64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FloatConversion {
     Signed64ToDouble,
+    Signed32ToDouble,
     FloatToDouble,
     DoubleToFloat,
     DoubleToSigned32Truncate,
@@ -215,6 +211,11 @@ define_machine_opcodes! {
     [MoveAbsolute64Immediate] => Self::MoveAbsolute64Immediate => [[R, I]] printing simple!("movabs"; native(0), SimpleOperand::Immediate(1));
     [Or64Register] => Self::Or64Register => [[R, R]] printing simple!("or"; native(0), native(1));
     [AluRegister { operation: AluOperation, width: IntegerWidth }] => Self::AluRegister { operation, width } => [[R, R]] printing simple!(operation.mnemonic(); integer(0, width), integer(1, width));
+    [AluMemory { operation: AluOperation, width: IntegerWidth }] => Self::AluMemory { operation, width } => [[R, A]] printing simple!(operation.mnemonic(); integer(0, width), SimpleOperand::Resolved(1, match width {
+        IntegerWidth::U32 => "DWORD PTR ",
+        IntegerWidth::U64 => "QWORD PTR ",
+        IntegerWidth::U8 | IntegerWidth::U16 => unreachable!("unsupported x86-64 memory ALU width"),
+    }));
     [AluImmediate { operation: AluOperation, width: IntegerWidth }] => Self::AluImmediate { operation, width } => [[R, I]] encoding {
         immediate(1).is_some_and(|value| alu_immediate_fits(width, value))
     } printing simple!(operation.mnemonic(); integer(0, width), SimpleOperand::Immediate(1));
@@ -276,12 +277,13 @@ define_machine_opcodes! {
     };
     [FloatConversion(FloatConversion)] => Self::FloatConversion(conversion) => {
         match conversion {
-            FloatConversion::Signed64ToDouble => operands_match(operands, &[FR, R]),
+            FloatConversion::Signed64ToDouble | FloatConversion::Signed32ToDouble => operands_match(operands, &[FR, R]),
             FloatConversion::FloatToDouble | FloatConversion::DoubleToFloat => operands_match(operands, &[FR, FR]),
             FloatConversion::DoubleToSigned32Truncate | FloatConversion::DoubleToSigned64Truncate => operands_match(operands, &[R, FR]),
         }
     } printing match conversion {
         FloatConversion::Signed64ToDouble => simple!("cvtsi2sd"; native(0), native(1)),
+        FloatConversion::Signed32ToDouble => simple!("cvtsi2sd"; native(0), integer(1, IntegerWidth::U32)),
         FloatConversion::FloatToDouble => simple!("cvtss2sd"; native(0), native(1)),
         FloatConversion::DoubleToFloat => simple!("cvtsd2ss"; native(0), native(1)),
         FloatConversion::DoubleToSigned32Truncate => simple!("cvttsd2si"; integer(0, IntegerWidth::U32), native(1)),
@@ -303,8 +305,8 @@ define_machine_opcodes! {
     [ResetBit] => Self::ResetBit => [[R, I]] encoding {
         immediate(1).is_some_and(|value| (0..64).contains(&value))
     } printing simple!("btr"; native(0), SimpleOperand::Immediate(1));
-    [SignExtendRaxToRdx] => Self::SignExtendRaxToRdx => [[]] printing simple!("cqo");
-    [SignedDivide64Register] => Self::SignedDivide64Register => [[R]] printing simple!("idiv"; native(0));
+    [SignExtendEaxToEdx] => Self::SignExtendEaxToEdx => [[]] printing simple!("cdq");
+    [SignedDivide32Register] => Self::SignedDivide32Register => [[R]] printing simple!("idiv"; integer(0, IntegerWidth::U32));
 }
 
 impl Opcode {
@@ -346,14 +348,10 @@ impl Opcode {
             Operation::IntegerBinary {
                 operation: IntegerBinaryOperation::Binary(operation),
                 width,
-            }
-                if matches!(
-                    operation,
-                    BinaryOperation::Add | BinaryOperation::Subtract
-                ) && width == IntegerWidth::U64 =>
+            } if matches!(operation, BinaryOperation::Add | BinaryOperation::Subtract)
+                && width == IntegerWidth::U64 =>
             {
-                let operation = AluOperation::from_binary(operation)
-                    .expect("add and subtract have x86-64 ALU opcodes");
+                let operation = AluOperation::from_binary(operation).expect("add and subtract have x86-64 ALU opcodes");
                 if matches!(operands.get(1), Some(super::ir::Operand::Immediate(_))) {
                     Self::AluImmediate { operation, width }
                 } else {
@@ -376,15 +374,11 @@ impl Opcode {
                 }
             }
             Operation::Move(IntegerWidth::U64) => {
-                let Some(super::ir::Operand::Immediate(value)) =
-                    operands.get(1)
-                else {
+                let Some(super::ir::Operand::Immediate(value)) = operands.get(1) else {
                     return Self::Move64Register;
                 };
                 let unsigned_value = *value as u64;
-                if unsigned_value <= 0x7fff_ffff
-                    || (-0x8000_0000..0).contains(value)
-                {
+                if unsigned_value <= 0x7fff_ffff || (-0x8000_0000..0).contains(value) {
                     Self::Move64Immediate
                 } else if unsigned_value <= 0xffff_ffff {
                     Self::Move32Immediate
@@ -403,9 +397,12 @@ impl Opcode {
             Operation::Float(operation) => match operation {
                 FloatingPointOperation::Binary(operation) => Self::FloatArithmetic(operation),
                 FloatingPointOperation::Unary(operation) => Self::FloatUnary(operation),
-                FloatingPointOperation::Convert(
-                    IntrinsicFloatConversion::Int32ToFloat64 | IntrinsicFloatConversion::Uint32ToFloat64,
-                ) => Self::FloatConversion(FloatConversion::Signed64ToDouble),
+                FloatingPointOperation::Convert(IntrinsicFloatConversion::Int32ToFloat64) => {
+                    Self::FloatConversion(FloatConversion::Signed32ToDouble)
+                }
+                FloatingPointOperation::Convert(IntrinsicFloatConversion::Uint32ToFloat64) => {
+                    Self::FloatConversion(FloatConversion::Signed64ToDouble)
+                }
                 FloatingPointOperation::Convert(IntrinsicFloatConversion::Float32ToFloat64) => {
                     Self::FloatConversion(FloatConversion::FloatToDouble)
                 }
@@ -434,9 +431,7 @@ impl Opcode {
             Operation::Memory(MemoryOperation::Load { .. } | MemoryOperation::Store(_))
             | Operation::Move(_)
             | Operation::IntegerBinary { .. } => {
-                unreachable!(
-                    "operand-sensitive operation must use select_for_operands"
-                )
+                unreachable!("operand-sensitive operation must use select_for_operands")
             }
             _ => Self::Pseudo,
         }
@@ -477,16 +472,8 @@ impl X86_64Abi {
     }
 }
 
-const SYSV_SAVED_REGISTERS: [(&str, i32); 5] = [
-    ("rbx", -24),
-    ("r12", -32),
-    ("r13", -40),
-    ("r14", -48),
-    ("r15", -56),
-];
-const WIN64_SAVED_REGISTERS: [&str; 7] = [
-    "rbx", "rsi", "rdi", "r12", "r13", "r14", "r15",
-];
+const SYSV_SAVED_REGISTERS: [(&str, i32); 5] = [("rbx", -24), ("r12", -32), ("r13", -40), ("r14", -48), ("r15", -56)];
+const WIN64_SAVED_REGISTERS: [&str; 7] = ["rbx", "rsi", "rdi", "r12", "r13", "r14", "r15"];
 
 fn emit_saved_registers(out: &mut String, abi: X86_64Abi) {
     if abi.is_win64() {
@@ -540,13 +527,16 @@ pub(crate) fn generate(program: &Program, options: &CompileOptions) -> String {
         "",
         |out| generate_entry_point(out, program, abi),
         |out| generate_fallback_handler(out, program, abi),
-        |out| emit_handlers(
-            out,
-            program,
-            "#",
-            |out, cold| w!(out, "{}", if cold { ".p2align 4" } else { ".p2align 6" }),
-            |out, instruction, handler| emit_instruction(out, instruction, handler, program),
-        ),
+        |out| {
+            emit_handlers(
+                out,
+                program,
+                "#",
+                |out, cold| w!(out, "{}", if cold { ".p2align 4" } else { ".p2align 6" }),
+                |out, instruction, handler| emit_instruction(out, instruction, handler, program),
+                |_| {},
+            )
+        },
         |out| generate_exit_point(out, object_format, abi),
     )
 }
@@ -602,15 +592,14 @@ fn generate_entry_point(out: &mut String, program: &Program, abi: X86_64Abi) {
     w!(out, "    mov r13d, {entry_point}         # pc = entry_point");
     let values_padding = if abi.is_win64() { "           " } else { "          " };
     w!(out, "    mov rbx, {values}{values_padding}# values");
-    let int32_tag_shifted =
-        runtime(program)[KnownLayoutConstant::Int32TagShifted];
+    let int32_tag_shifted = runtime(program)[KnownLayoutConstant::Int32TagShifted];
     let int32_tag_shifted_register = int32_tag_shifted_register();
-    w!(out, "    movabs {int32_tag_shifted_register}, {int32_tag_shifted}  # INT32_TAG_SHIFTED");
-    w!(out, "    mov QWORD PTR {}, {vm}  # save VM*", vm_slot(abi));
     w!(
         out,
-        "    lea r12, [rip + asm_dispatch_table]  # dispatch table"
+        "    movabs {int32_tag_shifted_register}, {int32_tag_shifted}  # INT32_TAG_SHIFTED"
     );
+    w!(out, "    mov QWORD PTR {}, {vm}  # save VM*", vm_slot(abi));
+    w!(out, "    lea r12, [rip + asm_dispatch_table]  # dispatch table");
     emit_dispatch(out);
     w!(out);
 }
@@ -646,25 +635,22 @@ fn generate_fallback_handler(out: &mut String, program: &Program, abi: X86_64Abi
 /// Emit instructions to reload values (rbx) and pb (r14) from the VM*
 /// saved on the stack. Uses rcx as scratch.
 fn emit_state_reload(out: &mut String, program: &Program, abi: X86_64Abi) {
-    let interp_ctx =
-        runtime(program)[KnownLayoutConstant::VmRunningExecutionContext];
-    let exec_executable =
-        runtime(program)[KnownLayoutConstant::ExecutionContextExecutable];
-    let exec_bytecode =
-        runtime(program)[KnownLayoutConstant::ExecutableBytecodeData];
+    let interp_ctx = runtime(program)[KnownLayoutConstant::VmRunningExecutionContext];
+    let exec_executable = runtime(program)[KnownLayoutConstant::ExecutionContextExecutable];
+    let exec_bytecode = runtime(program)[KnownLayoutConstant::ExecutableBytecodeData];
     emit_load_vm(out, "rcx", abi);
     w!(out, "    mov rbx, QWORD PTR [rcx + {interp_ctx}]");
     w!(out, "    add rbx, {}", values_offset(program));
-    w!(out, "    mov rcx, QWORD PTR [rbx + {}]", exec_executable - values_offset(program));
+    w!(
+        out,
+        "    mov rcx, QWORD PTR [rbx + {}]",
+        exec_executable - values_offset(program)
+    );
     w!(out, "    mov r14, QWORD PTR [rcx + {exec_bytecode}]");
 }
 
 fn vm_slot(abi: X86_64Abi) -> &'static str {
-    if abi.is_win64() {
-        WIN64_VM_SLOT
-    } else {
-        SYSV_VM_SLOT
-    }
+    if abi.is_win64() { WIN64_VM_SLOT } else { SYSV_VM_SLOT }
 }
 
 fn emit_load_vm(out: &mut String, dst: &str, abi: X86_64Abi) {
@@ -692,9 +678,12 @@ fn emit_vm_pc_instruction_args(out: &mut String, abi: X86_64Abi) {
 }
 
 fn emit_sync_pc_to_execution_context(out: &mut String, program: &Program) {
-    let program_counter =
-        runtime(program)[KnownLayoutConstant::ExecutionContextProgramCounter];
-    w!(out, "    mov DWORD PTR [rbx + {}], r13d", program_counter - values_offset(program));
+    let program_counter = runtime(program)[KnownLayoutConstant::ExecutionContextProgramCounter];
+    w!(
+        out,
+        "    mov DWORD PTR [rbx + {}], r13d",
+        program_counter - values_offset(program)
+    );
 }
 
 fn emit_dispatch(out: &mut String) {
@@ -736,9 +725,7 @@ fn format_x86_machine_address(address: &MachineMemoryAddress) -> String {
     format_x86_address(&terms, address.displacement.unwrap_or(0))
 }
 
-fn format_x86_machine_address_additive(
-    address: &MachineMemoryAddress,
-) -> String {
+fn format_x86_machine_address_additive(address: &MachineMemoryAddress) -> String {
     let terms = format_x86_machine_address_terms(address);
     match address.displacement {
         Some(displacement) => format!("[{terms} + {displacement}]"),
@@ -746,9 +733,7 @@ fn format_x86_machine_address_additive(
     }
 }
 
-fn format_x86_machine_address_terms(
-    address: &MachineMemoryAddress,
-) -> String {
+fn format_x86_machine_address_terms(address: &MachineMemoryAddress) -> String {
     match (address.index, address.scale) {
         (None, None) => address.base.to_string(),
         (Some(index), None) => format!("{} + {index}", address.base),
@@ -778,27 +763,18 @@ fn float_arithmetic_mnemonic(operation: FloatBinaryOperation) -> &'static str {
     }
 }
 
-fn emit_instruction(
-    out: &mut String,
-    insn: &MachineInstruction,
-    handler: &Handler,
-    program: &Program,
-) {
+fn emit_instruction(out: &mut String, insn: &MachineInstruction, handler: &Handler, program: &Program) {
     let opcode = insn.opcode.x86_64();
     debug_assert!(!opcode.is_pseudo());
-    if emit_simple_instruction(
-        out,
-        insn,
-        opcode.simple_instruction(),
-        |operand| match (opcode, operand) {
+    if emit_simple_instruction(out, insn, opcode.simple_instruction(), |operand| {
+        match (opcode, operand) {
             (
-                Opcode::LoadAdditiveDisplacement { .. }
-                | Opcode::StoreAdditiveDisplacement(_),
+                Opcode::LoadAdditiveDisplacement { .. } | Opcode::StoreAdditiveDisplacement(_),
                 Operand::Address(address),
             ) => format_x86_machine_address_additive(address),
             _ => resolve_op(operand, handler, program),
-        },
-    ) {
+        }
+    }) {
         return;
     }
     match opcode {
@@ -810,20 +786,15 @@ fn emit_instruction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::ir::MachineMemoryAddress as MemoryAddress;
-    use crate::target::registers::{
-        physical_register_named, resolve_interpreter_register,
-    };
-    use crate::types::InterpreterRegister;
     use crate::ObjectFormat;
+    use crate::target::ir::MachineMemoryAddress as MemoryAddress;
+    use crate::target::registers::{physical_register_named, resolve_interpreter_register};
+    use crate::types::InterpreterRegister;
 
     fn test_program() -> Program {
         Program {
             runtime: RuntimeConstants::from_values([
-                (
-                    KnownLayoutConstant::Int32TagShifted,
-                    0x7ffa_0000_0000_0000u64 as i64,
-                ),
+                (KnownLayoutConstant::Int32TagShifted, 0x7ffa_0000_0000_0000u64 as i64),
                 (KnownLayoutConstant::SizeOfExecutionContext, 120),
             ]),
             dispatch_handlers: Vec::new(),
@@ -845,20 +816,11 @@ mod tests {
         }
     }
 
-    fn memory(
-        base: &str,
-        index: Option<&str>,
-        scale: Option<i64>,
-        displacement: Option<i64>,
-    ) -> Operand {
+    fn memory(base: &str, index: Option<&str>, scale: Option<i64>, displacement: Option<i64>) -> Operand {
         let register = |name: &str| {
             InterpreterRegister::from_name(name)
-                .and_then(|identity| {
-                    resolve_interpreter_register(identity, Architecture::X86_64)
-                })
-                .or_else(|| {
-                    physical_register_named(name, Architecture::X86_64)
-                })
+                .and_then(|identity| resolve_interpreter_register(identity, Architecture::X86_64))
+                .or_else(|| physical_register_named(name, Architecture::X86_64))
                 .expect("test memory address must name a target register")
         };
         Operand::Address(MemoryAddress {
@@ -879,12 +841,7 @@ mod tests {
     fn emit(instructions: impl IntoIterator<Item = MachineInstruction>) -> String {
         let mut output = String::new();
         for instruction in instructions {
-            emit_instruction(
-                &mut output,
-                &instruction,
-                &call_handler(),
-                &test_program(),
-            );
+            emit_instruction(&mut output, &instruction, &call_handler(), &test_program());
         }
         output
     }
@@ -909,16 +866,9 @@ mod tests {
         // allocation) flow through resolve_op unchanged.
         let scaled_memory = memory("rax", Some("r11"), Some(8), None);
 
-        assert_eq!(
-            resolve_op(&scaled_memory, &handler, &program),
-            "[rax + r11 * 8]"
-        );
-        let offset_memory =
-            memory("rax", Some("r11"), Some(8), Some(8));
-        assert_eq!(
-            resolve_op(&offset_memory, &handler, &program),
-            "[rax + r11 * 8 + 8]"
-        );
+        assert_eq!(resolve_op(&scaled_memory, &handler, &program), "[rax + r11 * 8]");
+        let offset_memory = memory("rax", Some("r11"), Some(8), Some(8));
+        assert_eq!(resolve_op(&offset_memory, &handler, &program), "[rax + r11 * 8 + 8]");
     }
 
     #[test]
@@ -953,6 +903,47 @@ mod tests {
     }
 
     #[test]
+    fn emits_checked_arithmetic_with_a_bytecode_field_operand() {
+        let output = emit([instruction(
+            Opcode::AluMemory {
+                operation: AluOperation::Add,
+                width: IntegerWidth::U32,
+            },
+            vec![
+                Operand::PhysicalRegister(crate::target::registers::x86_64::RAX),
+                memory("pb", Some("pc"), None, Some(12)),
+            ],
+        )]);
+
+        assert_eq!(output, "    add eax, DWORD PTR [r14 + r13 + 12]\n");
+    }
+
+    #[test]
+    fn recovers_checked_add_lhs_from_the_wrapped_result() {
+        let output = emit([
+            instruction(
+                Opcode::AluMemory {
+                    operation: AluOperation::Subtract,
+                    width: IntegerWidth::U32,
+                },
+                vec![
+                    Operand::PhysicalRegister(crate::target::registers::x86_64::RCX),
+                    memory("pb", Some("pc"), None, Some(12)),
+                ],
+            ),
+            instruction(
+                Opcode::SignExtend32To64,
+                vec![
+                    Operand::PhysicalRegister(crate::target::registers::x86_64::RCX),
+                    Operand::PhysicalRegister(crate::target::registers::x86_64::RCX),
+                ],
+            ),
+        ]);
+
+        assert_eq!(output, "    sub ecx, DWORD PTR [r14 + r13 + 12]\n    movsxd rcx, ecx\n");
+    }
+
+    #[test]
     fn emits_high_single_bit_branch_mask_with_bt() {
         let output = emit([
             instruction(
@@ -977,23 +968,13 @@ mod tests {
     fn emits_bit_31_branches_as_sign_tests() {
         let mut output = String::new();
 
-        for (condition, branch) in [
-            (Condition::Negative, "js"),
-            (Condition::NotNegative, "jns"),
-        ] {
+        for (condition, branch) in [(Condition::Negative, "js"), (Condition::NotNegative, "jns")] {
             output += &emit([
                 instruction(
                     Opcode::TestRegister(IntegerWidth::U32),
-                    vec![
-                        Operand::PhysicalRegister(crate::target::registers::x86_64::RAX),
-                    ],
+                    vec![Operand::PhysicalRegister(crate::target::registers::x86_64::RAX)],
                 ),
-                instruction(
-                    Opcode::JumpCondition(condition),
-                    vec![
-                        Operand::Label(".slow".into()),
-                    ],
-                ),
+                instruction(Opcode::JumpCondition(condition), vec![Operand::Label(".slow".into())]),
             ]);
             assert!(output.contains("test eax, eax"));
             assert!(output.contains(&format!("{branch} .Lasm_Call.slow")));
@@ -1024,7 +1005,10 @@ mod tests {
     fn mov32_zero_extends_even_when_registers_alias() {
         let output = emit([instruction(
             Opcode::Move32Register,
-            vec![Operand::PhysicalRegister(crate::target::registers::x86_64::RAX), Operand::PhysicalRegister(crate::target::registers::x86_64::RAX)],
+            vec![
+                Operand::PhysicalRegister(crate::target::registers::x86_64::RAX),
+                Operand::PhysicalRegister(crate::target::registers::x86_64::RAX),
+            ],
         )]);
 
         assert!(output.contains("mov eax, eax"));
@@ -1033,9 +1017,7 @@ mod tests {
     #[test]
     fn emits_finalized_float_conversion() {
         let output = emit([instruction(
-            Opcode::FloatConversion(
-                FloatConversion::DoubleToSigned32Truncate,
-            ),
+            Opcode::FloatConversion(FloatConversion::DoubleToSigned32Truncate),
             vec![
                 Operand::PhysicalRegister(crate::target::registers::x86_64::RDX),
                 Operand::PhysicalRegister(crate::target::registers::x86_64::XMM0),
@@ -1049,13 +1031,8 @@ mod tests {
     fn emits_byte_memory_branch_without_a_register_load() {
         let output = emit([
             instruction(
-                Opcode::TestMemoryImmediate(
-                    MemoryWidth::Byte,
-                ),
-                vec![
-                    memory("rcx", None, None, Some(4)),
-                    Operand::Immediate(2),
-                ],
+                Opcode::TestMemoryImmediate(MemoryWidth::Byte),
+                vec![memory("rcx", None, None, Some(4)), Operand::Immediate(2)],
             ),
             instruction(
                 Opcode::JumpCondition(Condition::Zero),

@@ -15,13 +15,16 @@
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/Dump.h>
+#include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
+#include <LibWeb/HTML/HTMLTableCellElement.h>
+#include <LibWeb/HTML/HTMLTableColElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/BlockContainer.h>
-#include <LibWeb/Layout/FormattingContext.h>
 #include <LibWeb/Layout/ImageBox.h>
 #include <LibWeb/Layout/InlineNode.h>
+#include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TableWrapper.h>
@@ -38,48 +41,6 @@
 #include <LibWeb/SVG/SVGTextContentElement.h>
 
 namespace Web::Layout {
-
-static RustFFI::FfiTableDisplay table_display(CSS::Display display)
-{
-    if (display.is_table_inside())
-        return RustFFI::FfiTableDisplay::TableRoot;
-    if (display.is_table_row_group())
-        return RustFFI::FfiTableDisplay::TableRowGroup;
-    if (display.is_table_header_group())
-        return RustFFI::FfiTableDisplay::TableHeaderGroup;
-    if (display.is_table_footer_group())
-        return RustFFI::FfiTableDisplay::TableFooterGroup;
-    if (display.is_table_column_group())
-        return RustFFI::FfiTableDisplay::TableColumnGroup;
-    if (display.is_table_column())
-        return RustFFI::FfiTableDisplay::TableColumn;
-    if (display.is_table_row())
-        return RustFFI::FfiTableDisplay::TableRow;
-    if (display.is_table_cell())
-        return RustFFI::FfiTableDisplay::TableCell;
-    if (display.is_table_caption())
-        return RustFFI::FfiTableDisplay::TableCaption;
-    return RustFFI::FfiTableDisplay::Other;
-}
-
-static u8 display_bits(CSS::ComputedValues const& computed_values)
-{
-    auto display = computed_values.display();
-    u8 bits = 0;
-    auto set = [&](RustFFI::NodeDisplayFlag flag, bool value) {
-        if (value)
-            bits |= static_cast<u8>(flag);
-    };
-    set(RustFFI::NodeDisplayFlag::InlineOutside, display.is_inline_outside());
-    set(RustFFI::NodeDisplayFlag::FlowInside, display.is_flow_inside());
-    set(RustFFI::NodeDisplayFlag::FlexInside, display.is_flex_inside());
-    set(RustFFI::NodeDisplayFlag::GridInside, display.is_grid_inside());
-    set(RustFFI::NodeDisplayFlag::Floating, computed_values.float_() != CSS::Float::None);
-    auto position = computed_values.position();
-    set(RustFFI::NodeDisplayFlag::AbsolutelyPositioned,
-        position == CSS::Positioning::Absolute || position == CSS::Positioning::Fixed);
-    return bits;
-}
 
 NodeArenaAllocation::NodeArenaAllocation(DOM::Document& document)
     : m_arena(document.layout_node_arena())
@@ -106,6 +67,13 @@ Node::Node(DOM::Document& document, DOM::Node* node, AttachToDOMNode attach_to_d
     // remain replaced elements for CSS box generation and inline layout. (ReplacedBox's
     // constructor sets the flag for actual replaced boxes.)
     set_flag(RustFFI::NodeFlag::IsReplacedElement, node && is<HTML::HTMLInputElement>(*node));
+    set_flag(RustFFI::NodeFlag::IsHtmlInputElement, node && is<HTML::HTMLInputElement>(*node));
+    set_flag(RustFFI::NodeFlag::IsHtmlHtmlElement, node && node->is_html_html_element());
+    set_flag(RustFFI::NodeFlag::IsInUserAgentShadowTree,
+        node && node->containing_shadow_root() && node->containing_shadow_root()->is_user_agent_internal());
+    set_flag(RustFFI::NodeFlag::UsesButtonLayout,
+        node && is<HTML::HTMLElement>(*node) && static_cast<HTML::HTMLElement const&>(*node).uses_button_layout());
+    set_flag(RustFFI::NodeFlag::IsEditingHost, node && node->is_editing_host());
 
     if (node && attach_to_dom_node == AttachToDOMNode::Yes)
         node->set_layout_node({}, *this);
@@ -131,6 +99,7 @@ void Node::set_node_kind(RustFFI::NodeKind kind)
                                                            .is_block_container = is_block_container(),
                                                            .is_text = is_text_node(),
                                                            .is_svg_box = is_svg_box(),
+                                                           .is_replaced_box = is_replaced_box(),
                                                        }));
 #endif
 }
@@ -194,32 +163,10 @@ Node* Node::topmost_layout_node_of_top_layer_placement()
     return direct_viewport_child_candidate;
 }
 
-// https://www.w3.org/TR/css-display-3/#out-of-flow
-bool Node::is_out_of_flow(FormattingContext const& formatting_context) const
-{
-    auto const* node_with_style = as_if<NodeWithStyle>(*this);
-    return node_with_style && node_with_style->is_out_of_flow(formatting_context);
-}
-
 bool Node::is_out_of_flow() const
 {
     auto const* node_with_style = as_if<NodeWithStyle>(*this);
     return node_with_style && node_with_style->is_out_of_flow();
-}
-
-bool NodeWithStyle::is_out_of_flow(FormattingContext const& formatting_context) const
-{
-    // A layout node is out of flow if either:
-
-    // 1. It is floated (which requires that floating is not inhibited).
-    if (!formatting_context.inhibits_floating() && is_floating())
-        return true;
-
-    // 2. It is "absolutely positioned".
-    if (is_absolutely_positioned())
-        return true;
-
-    return false;
 }
 
 // https://drafts.csswg.org/css-position-3/#fixed-positioning-containing-block
@@ -701,10 +648,10 @@ NodeWithStyle::NodeWithStyle(DOM::Document& document, DOM::Node* node, NonnullRe
     : Node(document, node)
     , m_computed_values(move(computed_values))
 {
-    node_data().layout_index = document.allocate_layout_node_index();
     set_flag(RustFFI::NodeFlag::HasStyle, true);
     set_flag(RustFFI::NodeFlag::IsBody, node && node == document.body());
-    mirror_computed_values_to_node_data();
+    publish_style_container_to_node_data();
+    synchronize_table_span_data();
 }
 
 NodeWithStyle::ImageObserver::ImageObserver(NodeWithStyle& owner, NonnullRefPtr<CSS::ImageStyleValue const> image)
@@ -1007,16 +954,39 @@ NonnullRefPtr<NodeWithStyle> NodeWithStyle::create_anonymous_wrapper() const
 
 void NodeWithStyle::set_computed_values(NonnullRefPtr<CSS::ComputedValues const> computed_values)
 {
+    VERIFY(!layout_pass_currently_running());
     m_computed_values = move(computed_values);
-    mirror_computed_values_to_node_data();
+    publish_style_container_to_node_data();
+
+    for (auto* child = first_child_ptr(); child; child = child->next_sibling_ptr()) {
+        if (auto* text_child = as_if<TextNode>(*child))
+            text_child->enroll_for_arena_text_content_sync();
+    }
 }
 
-void NodeWithStyle::mirror_computed_values_to_node_data()
+void NodeWithStyle::publish_style_container_to_node_data()
 {
-    node_data().style = m_computed_values.ptr();
-    node_data().table_display = table_display(m_computed_values->display());
-    node_data().table_display_before = table_display(m_computed_values->display_before_box_type_transformation());
-    node_data().display_bits = display_bits(*m_computed_values);
+    node_data().style = m_computed_values->style_container();
+}
+
+void NodeWithStyle::synchronize_table_span_data()
+{
+    u16 column_span = 1;
+    u16 row_span = 1;
+    u32 raw_column_span = 1;
+    if (auto const* node = dom_node()) {
+        if (auto const* cell = as_if<HTML::HTMLTableCellElement>(*node)) {
+            column_span = static_cast<u16>(cell->col_span());
+            row_span = static_cast<u16>(cell->row_span());
+        } else if (auto const* column = as_if<HTML::HTMLTableColElement>(*node)) {
+            column_span = static_cast<u16>(column->span());
+        }
+        if (auto const* element = as_if<HTML::HTMLElement>(*node))
+            raw_column_span = element->get_attribute_value(HTML::AttributeNames::span).to_number<u32>().value_or(1);
+    }
+    node_data().table_column_span = column_span;
+    node_data().table_row_span = row_span;
+    RustFFI::layout_arena_set_raw_table_column_span(arena_handle(), slot_id(this), raw_column_span);
 }
 
 void NodeWithStyle::set_display(CSS::Display display)
@@ -1051,10 +1021,7 @@ void NodeWithStyle::reset_table_box_computed_values_used_by_wrapper_to_init_valu
         values.set_float(CSS::InitialValues::float_());
         values.set_clear(CSS::InitialValues::clear());
         values.set_inset(CSS::InitialValues::inset());
-        values.set_grid_column_end(CSS::InitialValues::grid_column_end());
-        values.set_grid_column_start(CSS::InitialValues::grid_column_start());
-        values.set_grid_row_end(CSS::InitialValues::grid_row_end());
-        values.set_grid_row_start(CSS::InitialValues::grid_row_start());
+        values.reset_grid_placements_to_auto();
         values.set_align_self(CSS::InitialValues::align_self());
         values.set_justify_self(CSS::InitialValues::justify_self());
         values.set_order(CSS::InitialValues::order());
@@ -1084,10 +1051,7 @@ void NodeWithStyle::transfer_table_box_computed_values_to_wrapper_computed_value
     builder->set_clear(computed_values().clear());
     // CSS 2 moves table-root positioning and margins to the wrapper. The wrapper is also the grid item for
     // display:table, so grid placement, self-alignment, and order need to move there as well.
-    builder->set_grid_column_end(computed_values().grid_column_end());
-    builder->set_grid_column_start(computed_values().grid_column_start());
-    builder->set_grid_row_end(computed_values().grid_row_end());
-    builder->set_grid_row_start(computed_values().grid_row_start());
+    builder->copy_grid_placements_from(computed_values());
     builder->set_align_self(computed_values().align_self());
     builder->set_justify_self(computed_values().justify_self());
     builder->set_order(computed_values().order());

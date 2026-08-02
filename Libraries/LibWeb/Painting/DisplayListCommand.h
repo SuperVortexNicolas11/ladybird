@@ -48,6 +48,7 @@ class DisplayList;
     V(SaveLayer, save_layer)                                                           \
     V(Restore, restore)                                                                \
     V(AddClipRect, add_clip_rect)                                                      \
+    V(AddClipPath, add_clip_path)                                                      \
     V(PaintLinearGradient, paint_linear_gradient)                                      \
     V(PaintRadialGradient, paint_radial_gradient)                                      \
     V(PaintConicGradient, paint_conic_gradient)                                        \
@@ -268,11 +269,7 @@ struct DrawVideoFrame {
     static constexpr DisplayListCommandType command_type = DisplayListCommandType::DrawVideoFrame;
 
     Gfx::IntRect dst_rect;
-    VideoFrameResourceId video_frame_id;
-    // NB: The video frame resource updates in place under a stable id, so the command bytes don't change when
-    //     a new frame arrives. The content generation encodes frame changes so that display list damage
-    //     computation can tell that the video needs to be repainted.
-    u64 content_generation { 0 };
+    VideoSinkResourceId video_sink_id;
     Gfx::ScalingMode scaling_mode;
 
     [[nodiscard]] Gfx::IntRect bounding_rect() const { return dst_rect; }
@@ -310,6 +307,19 @@ struct AddClipRect {
     Gfx::IntRect rect;
 
     [[nodiscard]] Gfx::IntRect bounding_rect() const { return rect; }
+    bool is_clip() const { return true; }
+    void dump(StringBuilder&) const;
+};
+
+struct AddClipPath {
+    static constexpr StringView command_name = "AddClipPath"sv;
+    static constexpr DisplayListCommandType command_type = DisplayListCommandType::AddClipPath;
+
+    Gfx::IntRect path_bounding_rect;
+    DisplayListDataSpan path_data;
+    Gfx::WindingRule winding_rule;
+
+    [[nodiscard]] Gfx::IntRect bounding_rect() const { return path_bounding_rect; }
     bool is_clip() const { return true; }
     void dump(StringBuilder&) const;
 };

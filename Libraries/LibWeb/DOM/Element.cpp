@@ -1086,6 +1086,10 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
     attribute_changed(local_name, old_value, value, namespace_);
 
     if (old_value != value) {
+        if (local_name.is_one_of(HTML::AttributeNames::colspan, HTML::AttributeNames::rowspan, HTML::AttributeNames::span)) {
+            if (auto* layout_node = unsafe_layout_node())
+                layout_node->synchronize_table_span_data();
+        }
         if (!document().suppresses_attribute_style_invalidation()) {
             CSS::Invalidation::invalidate_style_after_attribute_change(
                 *this,
@@ -1241,6 +1245,16 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
     return invalidation;
 }
 
+CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styles_after_animation_update(Badge<Web::Animations::AnimationUpdateContext>)
+{
+    VERIFY(m_computed_values);
+
+    bool did_change_custom_properties = false;
+    auto invalidation = recompute_pseudo_element_styles(did_change_custom_properties, m_computed_values->display().is_list_item(), nullptr);
+    apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(invalidation);
+    return invalidation;
+}
+
 void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reason)
 {
     // NB: We normally mark the parent element for the rebuild rather than this element itself, so that a "display"
@@ -1282,7 +1296,14 @@ void Element::apply_computed_style_to_layout_node_if_needed(CSS::RequiredInvalid
     if (invalidation.needs_repaint())
         set_needs_repaint();
 
-    // Do the same for pseudo-elements.
+    apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(invalidation);
+}
+
+void Element::apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(CSS::RequiredInvalidationAfterStyleChange const& invalidation)
+{
+    if (invalidation.needs_layout_tree_rebuild())
+        return;
+
     for_each_synthetic_pseudo_element([&](CSS::PseudoElement pseudo_element_type, SyntheticPseudoElement const& pseudo_element) {
         auto pseudo_element_style = computed_values(pseudo_element_type);
         if (!pseudo_element_style)
@@ -2616,12 +2637,15 @@ double Element::scroll_top() const
         return window->scroll_y();
 
     // 8. If the element does not have any associated box, return zero and terminate these steps.
-    if (!paintable_box())
+    // NB: A box that is not a scroll container is never scrolled away from its default alignment, even if it keeps a
+    //     stored scroll offset from when it was one for restoration when it becomes one again.
+    auto paintable_box = this->paintable_box();
+    if (!paintable_box || !paintable_box->layout_node().is_scroll_container())
         return 0.0;
 
     // 9. Return the y-coordinate of the scrolling area at the alignment point with the top of the padding edge of the element.
     // FIXME: Is this correct?
-    return paintable_box()->scroll_offset().y().to_double();
+    return paintable_box->scroll_offset().y().to_double();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
@@ -2658,12 +2682,15 @@ double Element::scroll_left() const
         return window->scroll_x();
 
     // 8. If the element does not have any associated box, return zero and terminate these steps.
-    if (!paintable_box())
+    // NB: A box that is not a scroll container is never scrolled away from its default alignment, even if it keeps a
+    //     stored scroll offset from when it was one for restoration when it becomes one again.
+    auto paintable_box = this->paintable_box();
+    if (!paintable_box || !paintable_box->layout_node().is_scroll_container())
         return 0.0;
 
     // 9. Return the x-coordinate of the scrolling area at the alignment point with the left of the padding edge of the element.
     // FIXME: Is this correct?
-    return paintable_box()->scroll_offset().x().to_double();
+    return paintable_box->scroll_offset().x().to_double();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
@@ -3242,7 +3269,7 @@ WebIDL::ExceptionOr<void> Element::insert_adjacent_text(Utf16View where, Utf16Vi
 }
 
 // https://drafts.csswg.org/cssom-view-1/#determine-the-scroll-into-view-position
-static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, Bindings::ScrollLogicalPosition block, Bindings::ScrollLogicalPosition inline_, Node& scrolling_box)
+static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CSSPixelRect target_bounding_border_box, Bindings::ScrollLogicalPosition block, Bindings::ScrollLogicalPosition inline_, Node& scrolling_box)
 {
     // To determine the scroll-into-view position of a target, which is an Element, pseudo-element, or Range, with a
     // block flow direction position block, an inline base direction position inline, and a scrolling box scrolling box,
@@ -3260,10 +3287,12 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, Bi
             CSSPixels::nearest_value_for(visual_viewport.height()),
         };
         scrolling_box_rect = { visual_viewport.offset(), visible_size };
+        if (auto paintable_box = document.paintable_box())
+            scrolling_box_rect = paintable_box->scroll_snapport_rect(scrolling_box_rect);
         current_scroll_position = document.navigable()->viewport_scroll_offset() + visual_viewport.offset();
     } else if (auto paintable_box = scrolling_box.paintable_box()) {
         current_scroll_position = paintable_box->scroll_offset();
-        scrolling_box_rect = paintable_box->absolute_rect();
+        scrolling_box_rect = paintable_box->transform_rect_to_viewport(paintable_box->scroll_snapport_rect(), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
     } else {
         return {};
     }
@@ -3273,7 +3302,8 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, Bi
     // 1. Let target bounding border box be the box represented by the return value of invoking Element’s
     //    getBoundingClientRect(), if target is an Element, or Range’s getBoundingClientRect(),
     //    if target is a Range.
-    auto target_bounding_border_box = target.get_bounding_client_rect();
+    // AD-HOC: The caller performs this step once and passes the result in, moving it outward as each scrolling box is
+    //         scrolled, so that an outer scrolling box sees where the target is going to be.
 
     // AD-HOC: The spec doesn't specify when to do this, but we need to apply scroll-margin and scroll-margin to target
     //         bounding border box (https://drafts.csswg.org/cssom-view-1/#example-51af1565).
@@ -3287,36 +3317,6 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, Bi
     target_bounding_border_box.set_right(target_bounding_border_box.right() + scroll_margin_left + scroll_margin_right);
     target_bounding_border_box.set_bottom(target_bounding_border_box.bottom() + scroll_margin_top + scroll_margin_bottom);
     target_bounding_border_box.set_left(target_bounding_border_box.left() - scroll_margin_left);
-
-    auto scrolling_box_computed_values = [&scrolling_box]() -> RefPtr<CSS::ComputedValues const> {
-        if (scrolling_box.is_document()) {
-            if (auto scrolling_element = scrolling_box.document().scrolling_element())
-                return scrolling_element->computed_values();
-            return nullptr;
-        }
-
-        if (auto const* element = as_if<DOM::Element>(scrolling_box)) {
-            return element->computed_values();
-        }
-
-        return nullptr;
-    }();
-
-    if (scrolling_box_computed_values) {
-        auto const& scroll_padding = scrolling_box_computed_values->scroll_padding();
-        auto scrolling_box_width = scrolling_box_rect.width();
-        auto scrolling_box_height = scrolling_box_rect.height();
-
-        auto scroll_padding_top = scroll_padding.top().to_px_or_zero(scrolling_box_height);
-        auto scroll_padding_right = scroll_padding.right().to_px_or_zero(scrolling_box_width);
-        auto scroll_padding_bottom = scroll_padding.bottom().to_px_or_zero(scrolling_box_height);
-        auto scroll_padding_left = scroll_padding.left().to_px_or_zero(scrolling_box_width);
-
-        target_bounding_border_box.set_top(target_bounding_border_box.top() - scroll_padding_top);
-        target_bounding_border_box.set_right(target_bounding_border_box.right() + scroll_padding_left + scroll_padding_right);
-        target_bounding_border_box.set_bottom(target_bounding_border_box.bottom() + scroll_padding_top + scroll_padding_bottom);
-        target_bounding_border_box.set_left(target_bounding_border_box.left() - scroll_padding_left);
-    }
 
     // 2. Let scrolling box edge A be the beginning edge in the block flow direction of scrolling box, and
     //    let element edge A be target bounding border box’s edge on the same physical side as that of
@@ -3452,6 +3452,8 @@ static GC::Ref<WebIDL::Promise> scroll_an_element_into_view(Element& target, Bin
         ancestor = ancestor->parent();
     }
 
+    auto target_bounding_border_box = target.get_bounding_client_rect();
+
     for (auto& scrolling_box : scrolling_boxes) {
         // 1. If the Document associated with target is not same origin with the Document associated with the element
         //    or viewport associated with scrolling box, abort any remaining iteration of this loop.
@@ -3461,7 +3463,21 @@ static GC::Ref<WebIDL::Promise> scroll_an_element_into_view(Element& target, Bin
         // 2. Let position be the scroll position resulting from running the steps to determine the scroll-into-view
         //    position of target with behavior as the scroll behavior, block as the block flow position, inline as the
         //    inline base direction position and scrolling box as the scrolling box.
-        auto position = determine_the_scroll_into_view_position(target, block, inline_, scrolling_box);
+        auto position = determine_the_scroll_into_view_position(target, target_bounding_border_box, block, inline_, scrolling_box);
+
+        // AD-HOC: A smooth scroll leaves the scrolling box at its old scroll position while the outer scrolling boxes
+        //         are considered, so move the target to where this scroll is going to leave it. The viewport is always
+        //         the outermost scrolling box, so its own scroll cannot affect a later iteration.
+        if (!scrolling_box.is_document()) {
+            if (auto paintable_box = scrolling_box.paintable_box()) {
+                target_bounding_border_box.translate_by(paintable_box->scroll_offset() - paintable_box->clamp_scroll_offset(position));
+
+                auto scrollport_rect = paintable_box->transform_rect_to_viewport(paintable_box->absolute_padding_box_rect(), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
+                auto visible_rect = target_bounding_border_box.intersected(scrollport_rect);
+                if (!visible_rect.is_empty())
+                    target_bounding_border_box = visible_rect;
+            }
+        }
 
         // 3. If position is not the same as scrolling box’s current scroll position, or scrolling box has an ongoing
         //    smooth scroll,
@@ -4307,7 +4323,9 @@ GC::Ref<WebIDL::Promise> Element::scroll(Bindings::ScrollToOptions options)
     // 8. If the element is the root element, return the Promise returned by scroll() on window after the method is
     //    invoked with scrollX on window as first argument and y as second argument, and abort the remaining steps.
     if (document.document_element() == this) {
-        options.left = window->scroll_x();
+        // AD-HOC: Pass x rather than scrollX on window. This matches the behavior of other engines.
+        //         See: https://github.com/w3c/csswg-drafts/issues/8700
+        options.left = x;
         options.top = y;
         return window->scroll(options);
     }
@@ -4324,12 +4342,13 @@ GC::Ref<WebIDL::Promise> Element::scroll(Bindings::ScrollToOptions options)
     // 10. If the element does not have any associated box, the element has no associated scrolling box, or the element
     //     has no overflow, return a resolved Promise and abort the remaining steps.
     // FIXME: or the element has no overflow
-    if (!paintable_box())
+    auto paintable_box = this->paintable_box();
+    if (!paintable_box || !paintable_box->layout_node().is_scroll_container())
         return WebIDL::create_resolved_promise(realm(), JS::js_undefined());
 
     // 11. Scroll the element to x,y, with the scroll behavior being the value of the behavior dictionary member of
     //     options. Let scrollPromise be the Promise returned from this step.
-    auto scroll_offset = paintable_box()->scroll_offset();
+    auto scroll_offset = paintable_box->scroll_offset();
     scroll_offset.set_x(CSSPixels::nearest_value_for(x));
     scroll_offset.set_y(CSSPixels::nearest_value_for(y));
     auto navigable = document.navigable();

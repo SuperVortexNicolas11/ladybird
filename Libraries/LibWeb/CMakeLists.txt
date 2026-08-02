@@ -802,25 +802,16 @@ set(SOURCES
     Layout/AudioBox.cpp
     Layout/AvailableSpace.cpp
     Layout/BlockContainer.cpp
-    Layout/BlockFormattingContext.cpp
     Layout/Box.cpp
     Layout/BreakNode.cpp
     Layout/CanvasBox.cpp
     Layout/CheckBox.cpp
     Layout/FieldSetBox.cpp
-    Layout/FlexFormattingContext.cpp
-    Layout/FormattingContext.cpp
-    Layout/GridFormattingContext.cpp
     Layout/ImageBox.cpp
     Layout/ImageProvider.cpp
-    Layout/InlineFormattingContext.cpp
-    Layout/InlineLevelIterator.cpp
     Layout/InlineNode.cpp
-    Layout/LayoutState.cpp
+    Layout/LayoutRustBridge.cpp
     Layout/LegendBox.cpp
-    Layout/LineBox.cpp
-    Layout/LineBoxFragment.cpp
-    Layout/LineBuilder.cpp
     Layout/ListItemBox.cpp
     Layout/ListItemMarkerBox.cpp
     Layout/NavigableContainerViewport.cpp
@@ -829,11 +820,9 @@ set(SOURCES
     Layout/RadioButton.cpp
     Layout/RangeInputBox.cpp
     Layout/ReplacedBox.cpp
-    Layout/ReplacedWithChildrenFormattingContext.cpp
     Layout/SVGBox.cpp
     Layout/SVGClipBox.cpp
     Layout/SVGForeignObjectBox.cpp
-    Layout/SVGFormattingContext.cpp
     Layout/SVGGeometryBox.cpp
     Layout/SVGGraphicsBox.cpp
     Layout/SVGImageBox.cpp
@@ -843,8 +832,6 @@ set(SOURCES
     Layout/SVGTextBox.cpp
     Layout/SVGTextPathBox.cpp
     Layout/ScrollableOverflow.cpp
-    Layout/TableFormattingContext.cpp
-    Layout/TableGrid.cpp
     Layout/TableWrapper.cpp
     Layout/TextAreaBox.cpp
     Layout/TextInputBox.cpp
@@ -1343,40 +1330,24 @@ endforeach()
 import_rust_crate(
     MANIFEST_PATH Rust/Cargo.toml
     CRATE_NAME libweb_rust
-    FFI_HEADERS HTML/Parser/RustFFI.h
+    FFI_HEADERS
+        HTML/Parser/RustFFI.h
+        RustFFI.h
+        SelectorRustFFI.h
+        StyleValueRustFFI.h
+        ComputedValuesRustFFI.h
+        Layout/TreeBuilderRustFFI.h
+        Layout/LayoutRustFFI.h
 )
-
-set(layout_rust_features "")
-if (NOT BUILD_SHARED_LIBS)
-    set(layout_rust_features FEATURES allocator)
-endif()
-import_rust_crate(
-    MANIFEST_PATH Layout/Rust/Cargo.toml
-    CRATE_NAME libweb_layout_rust
-    ${layout_rust_features}
-    FFI_HEADERS Layout/TreeBuilderRustFFI.h
-)
-
-set(css_rust_features "")
-if (NOT BUILD_SHARED_LIBS)
-    set(css_rust_features FEATURES allocator)
-endif()
-import_rust_crate(
-    MANIFEST_PATH CSS/Rust/Cargo.toml
-    CRATE_NAME libweb_css_rust
-    ${css_rust_features}
-    FFI_HEADERS RustFFI.h SelectorRustFFI.h StyleValueRustFFI.h ComputedValuesRustFFI.h
-)
+target_link_libraries(libweb_rust INTERFACE LibGfx)
 
 set(content_blocker_rust_features "")
 if (NOT BUILD_SHARED_LIBS)
     set(content_blocker_rust_features FEATURES allocator)
 endif()
 import_rust_crate(MANIFEST_PATH ContentBlocker/Rust/Cargo.toml CRATE_NAME libweb_content_blocker_rust ${content_blocker_rust_features} FFI_HEADER ContentBlockerRustFFI.h)
-target_link_libraries(LibWeb PRIVATE libweb_rust libweb_layout_rust libweb_css_rust libweb_content_blocker_rust)
+target_link_libraries(LibWeb PRIVATE libweb_rust libweb_content_blocker_rust)
 get_target_property(_libweb_rust_lib libweb_rust IMPORTED_LOCATION)
-get_target_property(_libweb_layout_rust_lib libweb_layout_rust IMPORTED_LOCATION)
-get_target_property(_libweb_css_rust_lib libweb_css_rust IMPORTED_LOCATION)
 get_target_property(_libweb_content_blocker_rust_lib libweb_content_blocker_rust IMPORTED_LOCATION)
 set_property(SOURCE HTML/Parser/HTMLTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
 set_property(SOURCE HTML/Parser/HTMLParser.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
@@ -1388,8 +1359,6 @@ endif()
 if(NOT BUILD_SHARED_LIBS)
     add_custom_command(TARGET LibWeb POST_BUILD
         COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_rust>
-        COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_layout_rust>
-        COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_css_rust>
         COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_content_blocker_rust>
         COMMAND ${CMAKE_AR} -qS $<TARGET_FILE:LibWeb> *.o
         COMMAND ${CMAKE_RANLIB} $<TARGET_FILE:LibWeb>
@@ -1404,9 +1373,10 @@ if(NOT BUILD_SHARED_LIBS)
     # stale Rust objects. Force the C++ FFI bridge files to depend on the
     # Rust archives: when they change, LibWeb re-archives, and POST_BUILD
     # re-merges the fresh Rust objects.
-    set_property(SOURCE CSS/Parser/RustTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_css_rust_lib})
+    set_property(SOURCE CSS/Parser/RustTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE HTML/Parser/HTMLEncodingDetection.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
-    set_property(SOURCE Layout/TreeBuilder.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_layout_rust_lib})
+    set_property(SOURCE Layout/LayoutRustBridge.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE Layout/TreeBuilder.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE Loader/ContentBlocker.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_content_blocker_rust_lib})
 endif()
 

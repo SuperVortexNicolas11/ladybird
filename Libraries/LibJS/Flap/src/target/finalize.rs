@@ -6,42 +6,38 @@
 
 //! Post-allocation control-flow layout and machine instruction finalization.
 
-use super::description::{
-    BinaryOperation, BranchOperation, CallKind, ControlOperation, FloatCondition, FloatConversion, FloatingPointOperation,
-    IntegerBinaryOperation, IntegerWidth, MemoryOperation, MemoryWidth, Operation, SignCondition,
-};
-#[cfg(test)]
-use super::description::{
-    PairWidth,
-};
-use super::ir::{
-    AllocatedFunction, AllocatedInstruction, AllocatedOperand,
-    AllocatedProgram, MachineFunction, MachineInstruction, MachineOpcode,
-    MachineProgram, RuntimeConstants,
-};
 use super::backend::{Backend, backend_for};
+#[cfg(test)]
+use super::description::PairWidth;
+use super::description::{
+    BinaryOperation, BranchOperation, CallKind, ControlOperation, FloatCondition, FloatConversion,
+    FloatingPointOperation, IntegerBinaryOperation, IntegerWidth, MemoryOperation, MemoryWidth, Operation,
+    SignCondition,
+};
 use super::finalize_support::{AllocatedOperands, Emit, finalization_error, verified_register};
+use super::ir::{
+    AllocatedFunction, AllocatedInstruction, AllocatedOperand, AllocatedProgram, MachineFunction, MachineInstruction,
+    MachineOpcode, MachineProgram, RuntimeConstants,
+};
 use crate::CompileOptions;
-use crate::{CompileError, CompileStage};
 #[cfg(test)]
 use crate::frontend::layout::KnownLayoutConstant;
 #[cfg(test)]
 use crate::{Architecture, ObjectFormat};
+use crate::{CompileError, CompileStage};
 
 fn finalize_function_for_target(
-    function: AllocatedFunction,
+    mut function: AllocatedFunction,
     runtime: &RuntimeConstants,
     options: &CompileOptions,
 ) -> Result<MachineFunction, CompileError> {
     let backend = backend_for(options.target.architecture);
     let mut emit = Emit::new(runtime, &function.name, function.size, options);
     let (hot_instructions, mut cold_instructions) = if function.is_cold {
-        let instruction = function.cfg.single_instruction().ok_or_else(|| {
-            finalization_error(
-                &function.name,
-                "cold handler must consist solely of call_slow_path",
-            )
-        })?;
+        let instruction = function
+            .cfg
+            .single_instruction()
+            .ok_or_else(|| finalization_error(&function.name, "cold handler must consist solely of call_slow_path"))?;
         if instruction.opcode.operation() != Operation::Call(CallKind::SlowPath) {
             return Err(finalization_error(
                 &function.name,
@@ -57,17 +53,12 @@ fn finalize_function_for_target(
             .cfg
             .layout_hot_and_cold()
             .map_err(|message| finalization_error(&function.name, message))?;
+        // Nothing reads the graph after this, so it hands its instructions over
+        // rather than being copied out of.
+        let (hot, cold) = std::mem::take(&mut function.cfg).linearize_hot_and_cold(&layout);
         (
-            finalize_instructions(
-                function.cfg.linearize_omitting_jumps_to_next_block(&layout.hot),
-                backend,
-                &mut emit,
-            )?,
-            finalize_instructions(
-                function.cfg.linearize_omitting_jumps_to_next_block(&layout.cold),
-                backend,
-                &mut emit,
-            )?,
+            finalize_instructions(hot, backend, &mut emit)?,
+            finalize_instructions(cold, backend, &mut emit)?,
         )
     };
 
@@ -83,10 +74,7 @@ fn finalize_function_for_target(
 }
 
 #[cfg(test)]
-fn finalize_function(
-    function: AllocatedFunction,
-    runtime: &RuntimeConstants,
-) -> Result<MachineFunction, CompileError> {
+fn finalize_function(function: AllocatedFunction, runtime: &RuntimeConstants) -> Result<MachineFunction, CompileError> {
     let options = CompileOptions {
         target: crate::Target {
             architecture: Architecture::X86_64,
@@ -114,9 +102,7 @@ pub(crate) fn finalize_program(
     let functions = program
         .functions
         .into_iter()
-        .map(|function| {
-            finalize_function_for_target(function, &runtime, options)
-        })
+        .map(|function| finalize_function_for_target(function, &runtime, options))
         .collect::<Result<_, _>>()?;
     let machine = MachineProgram {
         runtime,
@@ -220,9 +206,7 @@ fn finalize_float_operation(
 ) {
     if !matches!(
         operation,
-        FloatingPointOperation::Convert(
-            FloatConversion::Float64ToInt32 | FloatConversion::JavaScriptToInt32,
-        )
+        FloatingPointOperation::Convert(FloatConversion::Float64ToInt32 | FloatConversion::JavaScriptToInt32)
     ) {
         backend.float_operation(emit, opcode, operation, operands);
         return;
@@ -252,6 +236,8 @@ fn finalize_call(
         CallKind::Interpreter => backend.interpreter_call(emit, operands.relocation(0)),
         CallKind::RawNative => backend.raw_native_call(emit, operands),
         CallKind::SlowPath => backend.slow_path_call(emit, operands)?,
+        CallKind::BinarySlowPath => backend.binary_slow_path_call(emit, operands)?,
+        CallKind::JumpSlowPath => backend.jump_slow_path_call(emit, operands)?,
     }
     Ok(())
 }
@@ -287,9 +273,7 @@ fn finalize_instruction(
     let operation = instruction.opcode.operation();
 
     if let Operation::Assertion(operation) = operation {
-        let ok_label = emit
-            .enable_assertions
-            .then(|| emit.unique_label("assert_ok"));
+        let ok_label = emit.enable_assertions.then(|| emit.unique_label("assert_ok"));
         backend.finalize_assertion(emit, operation, &instruction.operands, ok_label)?;
         if emit.enable_assertions {
             emit.last_fp_compare = None;
@@ -362,9 +346,7 @@ fn finalize_instruction(
         Operation::LoadProgramCounter => backend.finalize_program_counter_load(emit, operands),
         Operation::Call(kind) => finalize_call(backend, emit, kind, operands)?,
         Operation::Control(
-            kind @ (ControlOperation::DispatchNext
-            | ControlOperation::Dispatch
-            | ControlOperation::DispatchVariable),
+            kind @ (ControlOperation::DispatchNext | ControlOperation::Dispatch | ControlOperation::DispatchVariable),
         ) => finalize_dispatch(backend, emit, kind, operands)?,
         Operation::StoreOperand => backend.finalize_operand_store(emit, operands)?,
         Operation::LoadLabel => backend.finalize_label_load(emit, operands)?,
@@ -422,7 +404,7 @@ fn finalize_instruction(
         Operation::Cold => {
             return emit.error("operation Cold was not expanded into legal machine instructions");
         }
-        Operation::DivMod => backend.finalize_divide(emit, operands),
+        Operation::Modulo => backend.finalize_divide(emit, operands),
         _ => emit.output.push(MachineInstruction {
             opcode,
             operands: instruction.operands,
@@ -436,28 +418,17 @@ mod tests {
     use super::*;
     use crate::Architecture;
     use crate::low_ir::cfg::ControlFlowGraph;
-    use crate::target::description::{
-        ControlOperation, Operation,
-    };
-    use crate::target::ir::{
-        AllocatedInstruction,
-        AllocatedMemoryAddress, AllocatedOperand as Operand,
-    };
+    use crate::target::description::{ControlOperation, Operation};
+    use crate::target::ir::{AllocatedInstruction, AllocatedMemoryAddress, AllocatedOperand as Operand};
     use crate::target::registers::x86_64;
 
     type Instruction = crate::low_ir::Instruction<Operand>;
 
-    fn allocated_function(
-        instructions: Vec<Instruction>,
-        is_cold: bool,
-    ) -> AllocatedFunction {
+    fn allocated_function(instructions: Vec<Instruction>, is_cold: bool) -> AllocatedFunction {
         let instructions = instructions
             .into_iter()
             .map(|instruction| AllocatedInstruction {
-                opcode: select_allocated_opcode(
-                    instruction.opcode,
-                    &instruction.operands,
-                ),
+                opcode: select_allocated_opcode(instruction.opcode, &instruction.operands),
                 operands: instruction.operands,
             })
             .collect();
@@ -470,22 +441,13 @@ mod tests {
         }
     }
 
-    fn select_allocated_opcode(
-        opcode: Operation,
-        operands: &[Operand],
-    ) -> crate::target::description::SelectedOpcode {
-        let operands = operands
-            .iter()
-            .map(Operand::selection_operand)
-            .collect::<Vec<_>>();
+    fn select_allocated_opcode(opcode: Operation, operands: &[Operand]) -> crate::target::description::SelectedOpcode {
+        let operands = operands.iter().map(Operand::selection_operand).collect::<Vec<_>>();
         opcode.select_for_operands(Architecture::X86_64, &operands)
     }
 
     fn runtime() -> RuntimeConstants {
-        RuntimeConstants::from_values([(
-            KnownLayoutConstant::SizeOfExecutionContext,
-            120,
-        )])
+        RuntimeConstants::from_values([(KnownLayoutConstant::SizeOfExecutionContext, 120)])
     }
 
     fn test_options() -> CompileOptions {
@@ -509,10 +471,7 @@ mod tests {
             operands,
         };
         let instruction = AllocatedInstruction {
-            opcode: select_allocated_opcode(
-                instruction.opcode,
-                &instruction.operands,
-            ),
+            opcode: select_allocated_opcode(instruction.opcode, &instruction.operands),
             operands: instruction.operands,
         };
         let options = test_options();
@@ -548,9 +507,7 @@ mod tests {
                 },
                 Instruction {
                     opcode: Operation::Control(ControlOperation::DispatchNext),
-                    operands: vec![Operand::PhysicalRegister(
-                        x86_64::RAX,
-                    )],
+                    operands: vec![Operand::PhysicalRegister(x86_64::RAX)],
                 },
             ],
             false,
@@ -560,28 +517,21 @@ mod tests {
         assert_eq!(machine.hot_instructions.len(), 3);
         assert!(matches!(
             machine.hot_instructions[0].opcode,
-            MachineOpcode::X86_64(
-                super::super::x86_64::Opcode::AluImmediate {
-                    operation:
-                        super::super::x86_64::AluOperation::Add,
-                    width: IntegerWidth::U32,
-                }
-            )
+            MachineOpcode::X86_64(super::super::x86_64::Opcode::AluImmediate {
+                operation: super::super::x86_64::AluOperation::Add,
+                width: IntegerWidth::U32,
+            })
         ));
         assert!(matches!(
             machine.hot_instructions[1].opcode,
-            MachineOpcode::X86_64(
-                super::super::x86_64::Opcode::Load {
-                    width: MemoryWidth::Byte,
-                    signed: false,
-                }
-            )
+            MachineOpcode::X86_64(super::super::x86_64::Opcode::Load {
+                width: MemoryWidth::Byte,
+                signed: false,
+            })
         ));
         assert!(matches!(
             machine.hot_instructions[2].opcode,
-            MachineOpcode::X86_64(
-                super::super::x86_64::Opcode::JumpMemory
-            )
+            MachineOpcode::X86_64(super::super::x86_64::Opcode::JumpMemory)
         ));
         assert!(machine.cold_instructions.is_empty());
     }
@@ -591,9 +541,7 @@ mod tests {
         let function = allocated_function(
             vec![Instruction {
                 opcode: Operation::Control(ControlOperation::DispatchNext),
-                operands: vec![Operand::PhysicalRegister(
-                    x86_64::RAX,
-                )],
+                operands: vec![Operand::PhysicalRegister(x86_64::RAX)],
             }],
             true,
         );
@@ -613,10 +561,7 @@ mod tests {
                         operation: IntegerBinaryOperation::Binary(BinaryOperation::Add),
                         width: IntegerWidth::U64,
                     },
-                    operands: vec![
-                        Operand::PhysicalRegister(x86_64::RAX),
-                        Operand::Immediate(i64::MAX),
-                    ],
+                    operands: vec![Operand::PhysicalRegister(x86_64::RAX), Operand::Immediate(i64::MAX)],
                 }],
                 false,
             ),
@@ -675,16 +620,8 @@ mod tests {
                     operands: vec![
                         Operand::PhysicalRegister(x86_64::RCX),
                         Operand::PhysicalRegister(x86_64::RDX),
-                        address(
-                            x86_64::RCX,
-                            Some(x86_64::RDX),
-                            None,
-                        ),
-                        address(
-                            x86_64::RCX,
-                            Some(x86_64::RDX),
-                            Some(8),
-                        ),
+                        address(x86_64::RCX, Some(x86_64::RDX), None),
+                        address(x86_64::RCX, Some(x86_64::RDX), Some(8)),
                     ],
                 }],
                 false,
@@ -698,6 +635,4 @@ mod tests {
             "x86-64 pair-load destinations may not both alias the address"
         );
     }
-
-
 }

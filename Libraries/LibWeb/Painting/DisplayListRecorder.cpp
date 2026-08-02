@@ -487,14 +487,13 @@ void DisplayListRecorder::draw_canvas(Gfx::IntRect const& dst_rect, CanvasId can
     });
 }
 
-void DisplayListRecorder::draw_video_frame(Gfx::IntRect const& dst_rect, VideoFrameResourceId frame_id, RefPtr<Media::VideoFrame const> frame, u64 content_generation, Gfx::ScalingMode scaling_mode)
+void DisplayListRecorder::draw_video_frame(Gfx::IntRect const& dst_rect, VideoSinkResourceId video_sink_id, Media::VideoSinkHandle sink_handle, Gfx::ScalingMode scaling_mode)
 {
     if (dst_rect.is_empty())
         return;
     append_command(DrawVideoFrame {
         .dst_rect = dst_rect,
-        .video_frame_id = resource_storage().add_video_frame(frame_id, move(frame)),
-        .content_generation = content_generation,
+        .video_sink_id = resource_storage().add_video_sink(video_sink_id, sink_handle),
         .scaling_mode = scaling_mode,
     });
 }
@@ -635,6 +634,19 @@ void DisplayListRecorder::draw_glyph_run(Gfx::FloatPoint baseline_start, Gfx::Gl
 void DisplayListRecorder::add_clip_rect(Gfx::IntRect const& rect)
 {
     append_command(AddClipRect { rect });
+}
+
+void DisplayListRecorder::add_clip_path(Gfx::Path const& path, Gfx::WindingRule winding_rule)
+{
+    CommandPayloadBuilder<AddClipPath> payload_builder(m_display_list);
+    auto path_span = append_path_data(payload_builder, path);
+    append_command(
+        AddClipPath {
+            .path_bounding_rect = enclosing_int_rect(path.bounding_box()),
+            .path_data = path_span,
+            .winding_rule = winding_rule,
+        },
+        payload_builder.inline_data());
 }
 
 void DisplayListRecorder::save()

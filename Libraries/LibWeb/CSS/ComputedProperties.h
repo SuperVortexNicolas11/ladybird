@@ -19,6 +19,8 @@
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/EasingFunction.h>
 #include <LibWeb/CSS/FontFeatureData.h>
+#include <LibWeb/CSS/GridTrackPlacement.h>
+#include <LibWeb/CSS/GridTrackSize.h>
 #include <LibWeb/CSS/LengthBox.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/PseudoClass.h>
@@ -274,6 +276,7 @@ public:
     UserSelect user_select() const;
     Isolation isolation() const;
     TouchActionData touch_action() const;
+    AspectRatio aspect_ratio() const;
     Containment contain() const;
     Vector<Utf16FlyString> container_name() const;
     ContainerType container_type() const;
@@ -301,8 +304,10 @@ public:
     float fill_opacity() const;
     Optional<SVGPaint> stroke(ColorResolutionContext const&) const;
     Vector<Variant<LengthPercentage, float>> stroke_dasharray() const;
+    LengthPercentage stroke_dashoffset() const;
     StrokeLinecap stroke_linecap() const;
     StrokeLinejoin stroke_linejoin() const;
+    LengthPercentage stroke_width() const;
     VectorEffect vector_effect() const;
     double stroke_miterlimit() const;
     float stroke_opacity() const;
@@ -321,7 +326,7 @@ public:
     int math_depth() const;
     [[nodiscard]] static CSSPixels normal_line_height(Gfx::FontPixelMetrics const&);
     [[nodiscard]] CSSPixels line_height(FontComputer const&) const;
-    [[nodiscard]] LineHeightData line_height_data(FontComputer const&) const;
+    [[nodiscard]] LineHeightData line_height_data() const;
     [[nodiscard]] CSSPixels font_size() const;
     double font_weight() const;
     Percentage font_width() const;

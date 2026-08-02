@@ -6,6 +6,8 @@
 
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/CSS/GridTrackPlacement.h>
+#include <LibWeb/CSS/GridTrackSize.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/AngleStyleValue.h>
@@ -43,10 +45,40 @@
 
 namespace Web::CSS {
 
+static constexpr bool style_group_payload_is_rust_native(ComputedValuesFFI::StyleGroupLifecycle lifecycle)
+{
+    switch (lifecycle) {
+    case ComputedValuesFFI::StyleGroupLifecycle::Cpp:
+    case ComputedValuesFFI::StyleGroupLifecycle::CppWithBorderFacts:
+    case ComputedValuesFFI::StyleGroupLifecycle::CppWithInheritedTextFacts:
+    case ComputedValuesFFI::StyleGroupLifecycle::CppWithFontFacts:
+        return false;
+    case ComputedValuesFFI::StyleGroupLifecycle::InheritedTable:
+    case ComputedValuesFFI::StyleGroupLifecycle::InheritedBox:
+    case ComputedValuesFFI::StyleGroupLifecycle::Sizing:
+    case ComputedValuesFFI::StyleGroupLifecycle::Alignment:
+    case ComputedValuesFFI::StyleGroupLifecycle::SVGReset:
+    case ComputedValuesFFI::StyleGroupLifecycle::Surround:
+    case ComputedValuesFFI::StyleGroupLifecycle::Box:
+    case ComputedValuesFFI::StyleGroupLifecycle::Grid:
+        return true;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+template<typename T>
+static consteval ComputedValuesFFI::StyleGroupLifecycle style_group_lifecycle_of()
+{
+    if constexpr (requires { T::style_group_lifecycle; })
+        return T::style_group_lifecycle;
+    else
+        return ComputedValuesFFI::StyleGroupLifecycle::Cpp;
+}
+
 template<typename T>
 static consteval ComputedValuesFFI::StyleGroupVTable make_style_group_vtable()
 {
-    if constexpr (requires { T::style_group_lifecycle; }) {
+    if constexpr (style_group_payload_is_rust_native(style_group_lifecycle_of<T>())) {
         return {
             .lifecycle = T::style_group_lifecycle,
             .size = sizeof(T),
@@ -58,7 +90,7 @@ static consteval ComputedValuesFFI::StyleGroupVTable make_style_group_vtable()
         };
     }
     return {
-        .lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Cpp,
+        .lifecycle = style_group_lifecycle_of<T>(),
         .size = sizeof(T),
         .align = alignof(T),
         .default_construct = [](void* payload) {
@@ -101,8 +133,6 @@ static constexpr Array text_reset_group_properties {
     PropertyID::TextDecorationThickness,
     PropertyID::TextDecorationStyle,
     PropertyID::TextDecorationColor,
-    PropertyID::TextOverflow,
-    PropertyID::UnicodeBidi,
     PropertyID::WhiteSpaceTrim,
 };
 
@@ -165,13 +195,10 @@ static constexpr Array misc_reset_group_properties {
     PropertyID::Appearance,
     PropertyID::OutlineStyle,
     PropertyID::ObjectFit,
-    PropertyID::ColumnCount,
-    PropertyID::ColumnWidth,
     PropertyID::ColumnHeight,
     PropertyID::OutlineColor,
     PropertyID::OutlineOffset,
     PropertyID::OutlineWidth,
-    PropertyID::TableLayout,
     PropertyID::UserSelect,
     PropertyID::ObjectPosition,
     PropertyID::ViewTransitionName,
@@ -182,6 +209,7 @@ static constexpr Array misc_reset_group_properties {
     PropertyID::ShapeImageThreshold,
     PropertyID::ShapeMargin,
     PropertyID::ShapeOutside,
+    PropertyID::WillChange,
 };
 
 // overflow-wrap has no generated keyword converter; the mapping matches the
@@ -280,7 +308,6 @@ static constexpr Array grid_group_properties {
     PropertyID::GridAutoRows,
     PropertyID::GridTemplateColumns,
     PropertyID::GridTemplateRows,
-    PropertyID::GridAutoFlow,
     PropertyID::GridColumnEnd,
     PropertyID::GridColumnStart,
     PropertyID::GridRowEnd,
@@ -366,26 +393,6 @@ static constexpr Array anchor_group_properties {
     PropertyID::PositionVisibility,
 };
 
-// The properties feeding the box group's descriptors, in registration
-// order.
-static constexpr Array box_group_properties {
-    PropertyID::AspectRatio,
-    PropertyID::Float,
-    PropertyID::Clear,
-    PropertyID::Position,
-    PropertyID::ZIndex,
-    PropertyID::Display,
-    PropertyID::OverflowX,
-    PropertyID::OverflowY,
-    PropertyID::BoxSizing,
-    PropertyID::VerticalAlign,
-    PropertyID::Contain,
-    PropertyID::ContainerName,
-    PropertyID::ContainerType,
-    PropertyID::WillChange,
-    PropertyID::Resize,
-};
-
 // The properties feeding the border group's descriptors, in registration
 // order; each side's color feeds both the resolved color and the retained
 // shell.
@@ -465,8 +472,6 @@ static void register_style_group_field_descriptors()
     add(text_reset, PropertyID::TextDecorationThickness, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(text_reset, PropertyID::TextDecorationStyle, offsetof(TextReset, text_decoration_style), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_text_decoration_style>());
     add(text_reset, PropertyID::TextDecorationColor, offsetof(TextReset, text_decoration_color), GROUP_FIELD_COLOR, 0, nullptr);
-    add(text_reset, PropertyID::TextOverflow, offsetof(TextReset, text_overflow), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_text_overflow>());
-    add(text_reset, PropertyID::UnicodeBidi, offsetof(TextReset, unicode_bidi), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_unicode_bidi>());
     add(text_reset, PropertyID::WhiteSpaceTrim, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::None), nullptr);
 
     using Effects = ComputedValues::EffectsValues;
@@ -492,13 +497,10 @@ static void register_style_group_field_descriptors()
     add(misc_reset, PropertyID::Appearance, offsetof(MiscReset, computed_appearance), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_appearance>());
     add(misc_reset, PropertyID::OutlineStyle, offsetof(MiscReset, outline_style), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_outline_style>());
     add(misc_reset, PropertyID::ObjectFit, offsetof(MiscReset, object_fit), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_object_fit>());
-    add(misc_reset, PropertyID::ColumnCount, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
-    add(misc_reset, PropertyID::ColumnWidth, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(misc_reset, PropertyID::ColumnHeight, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(misc_reset, PropertyID::OutlineColor, offsetof(MiscReset, outline_color), GROUP_FIELD_COLOR_OR_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(misc_reset, PropertyID::OutlineOffset, 0, GROUP_FIELD_REQUIRE_PX, 0, nullptr, 0);
     add(misc_reset, PropertyID::OutlineWidth, offsetof(MiscReset, outline_width), GROUP_FIELD_CSS_PIXELS_NON_NEGATIVE, 0, nullptr);
-    add(misc_reset, PropertyID::TableLayout, offsetof(MiscReset, table_layout), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_table_layout>());
     add(misc_reset, PropertyID::UserSelect, offsetof(MiscReset, user_select), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_user_select>());
     add(misc_reset, PropertyID::ObjectPosition, 0, GROUP_FIELD_REQUIRE_INITIAL_VALUE, 0, nullptr);
     add(misc_reset, PropertyID::ViewTransitionName, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::None), nullptr);
@@ -509,6 +511,7 @@ static void register_style_group_field_descriptors()
     add(misc_reset, PropertyID::ShapeImageThreshold, offsetof(MiscReset, shape_image_threshold), GROUP_FIELD_RESOLVED_F64, 0, nullptr);
     add(misc_reset, PropertyID::ShapeMargin, 0, GROUP_FIELD_REQUIRE_PX, 0, nullptr, 0);
     add(misc_reset, PropertyID::ShapeOutside, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::None), nullptr);
+    add(misc_reset, PropertyID::WillChange, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
 
     using InheritedText = ComputedValues::InheritedTextValues;
     constexpr auto inherited_text = to_underlying(StyleGroupIndex::InheritedTextValues);
@@ -624,26 +627,6 @@ static void register_style_group_field_descriptors()
     add(anchor, PropertyID::PositionTryOrder, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Normal), nullptr);
     add(anchor, PropertyID::PositionVisibility, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Always), nullptr);
 
-    using Box = ComputedValues::BoxValues;
-    constexpr auto box = to_underlying(StyleGroupIndex::BoxValues);
-    add(box, PropertyID::AspectRatio, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
-    add(box, PropertyID::Float, offsetof(Box, float_), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_float>());
-    add(box, PropertyID::Clear, offsetof(Box, clear), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_clear>());
-    add(box, PropertyID::Position, offsetof(Box, position), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_positioning>());
-    add(box, PropertyID::ZIndex, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
-    // NB: An untouched display also pins display_before_box_type_transformation to
-    //     its default, since the box type transformation replaces the stored value.
-    add(box, PropertyID::Display, 0, GROUP_FIELD_REQUIRE_INITIAL_VALUE, 0, nullptr);
-    add(box, PropertyID::OverflowX, offsetof(Box, overflow_x), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_overflow>());
-    add(box, PropertyID::OverflowY, offsetof(Box, overflow_y), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_overflow>());
-    add(box, PropertyID::BoxSizing, offsetof(Box, box_sizing), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_box_sizing>());
-    add(box, PropertyID::VerticalAlign, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Baseline), nullptr);
-    add(box, PropertyID::Contain, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::None), nullptr);
-    add(box, PropertyID::ContainerName, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::None), nullptr);
-    add(box, PropertyID::ContainerType, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Normal), nullptr);
-    add(box, PropertyID::WillChange, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
-    add(box, PropertyID::Resize, offsetof(Box, resize), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_resize>());
-
     using Border = ComputedValues::BorderValues;
     constexpr auto border = to_underlying(StyleGroupIndex::BorderValues);
     struct BorderSide {
@@ -705,10 +688,60 @@ static_assert(sizeof(ComputedValues::SVGResetValues) == sizeof(ComputedValuesFFI
 static_assert(alignof(ComputedValues::SVGResetValues) == alignof(ComputedValuesFFI::SVGResetValues));
 static_assert(sizeof(ComputedValues::SurroundValues) == sizeof(ComputedValuesFFI::SurroundValues));
 static_assert(alignof(ComputedValues::SurroundValues) == alignof(ComputedValuesFFI::SurroundValues));
+static_assert(sizeof(ComputedValues::BoxValues) == sizeof(ComputedValuesFFI::BoxValues));
+static_assert(alignof(ComputedValues::BoxValues) == alignof(ComputedValuesFFI::BoxValues));
 static_assert(sizeof(Size) == sizeof(ComputedValuesFFI::ComputedSize));
 static_assert(alignof(Size) == alignof(ComputedValuesFFI::ComputedSize));
 static_assert(sizeof(RustStyleValueHandle) == sizeof(StyleValueFFI::StyleValueData const*));
 static_assert(alignof(RustStyleValueHandle) == alignof(StyleValueFFI::StyleValueData const*));
+
+// The border group keeps its C++ lifecycle, but its four leading BorderData
+// members double as the Rust BorderLayoutFacts prefix that layout reads as
+// typed fields.
+static_assert(sizeof(Gfx::Color) == sizeof(u32));
+static_assert(sizeof(LineStyle) == sizeof(u8));
+static_assert(sizeof(BorderData) == sizeof(ComputedValuesFFI::ComputedBorderSide));
+static_assert(offsetof(BorderData, color) == offsetof(ComputedValuesFFI::ComputedBorderSide, color));
+static_assert(offsetof(BorderData, line_style) == offsetof(ComputedValuesFFI::ComputedBorderSide, line_style));
+static_assert(offsetof(BorderData, width) == offsetof(ComputedValuesFFI::ComputedBorderSide, width));
+static_assert(offsetof(ComputedValues::BorderValues, border_left) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_left));
+static_assert(offsetof(ComputedValues::BorderValues, border_top) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_top));
+static_assert(offsetof(ComputedValues::BorderValues, border_right) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_right));
+static_assert(offsetof(ComputedValues::BorderValues, border_bottom) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_bottom));
+static_assert(sizeof(ComputedValuesFFI::BorderLayoutFacts) <= offsetof(ComputedValues::BorderValues, border_left_color_style_value));
+
+// The inherited-text group keeps its C++ lifecycle, but its leading members
+// double as the Rust InheritedTextLayoutFacts prefix that layout reads as
+// typed fields.
+static_assert(sizeof(TextIndentData) == sizeof(ComputedValuesFFI::ComputedTextIndent));
+static_assert(offsetof(TextIndentData, length_percentage) == offsetof(ComputedValuesFFI::ComputedTextIndent, length_percentage));
+static_assert(offsetof(TextIndentData, each_line) == offsetof(ComputedValuesFFI::ComputedTextIndent, each_line));
+static_assert(offsetof(TextIndentData, hanging) == offsetof(ComputedValuesFFI::ComputedTextIndent, hanging));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_align) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_align));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_justify) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_justify));
+static_assert(offsetof(ComputedValues::InheritedTextValues, white_space_collapse) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, white_space_collapse));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_wrap_mode) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_wrap_mode));
+static_assert(offsetof(ComputedValues::InheritedTextValues, word_break) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, word_break));
+static_assert(offsetof(ComputedValues::InheritedTextValues, tab_size_is_number) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, tab_size_is_number));
+static_assert(offsetof(ComputedValues::InheritedTextValues, letter_spacing) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, letter_spacing));
+static_assert(offsetof(ComputedValues::InheritedTextValues, word_spacing) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, word_spacing));
+static_assert(offsetof(ComputedValues::InheritedTextValues, tab_size_length) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, tab_size_length));
+static_assert(offsetof(ComputedValues::InheritedTextValues, tab_size_number) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, tab_size_number));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_indent) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_indent));
+static_assert(sizeof(ComputedValuesFFI::InheritedTextLayoutFacts) <= offsetof(ComputedValues::InheritedTextValues, color));
+
+// The font group keeps its C++ lifecycle, but its leading members double as
+// the Rust FontLayoutFacts prefix that layout reads as typed fields.
+static_assert(sizeof(RefPtr<Gfx::FontCascadeList const>) == sizeof(void const*));
+static_assert(offsetof(ComputedValues::FontValues, font_size) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_size));
+static_assert(offsetof(ComputedValues::FontValues, line_height_used) == offsetof(ComputedValuesFFI::FontLayoutFacts, line_height_used));
+static_assert(offsetof(ComputedValues::FontValues, font_variant_emoji) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_variant_emoji));
+static_assert(offsetof(ComputedValues::FontValues, font_ascent) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_ascent));
+static_assert(offsetof(ComputedValues::FontValues, font_descent) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_descent));
+static_assert(offsetof(ComputedValues::FontValues, font_x_height) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_x_height));
+static_assert(offsetof(ComputedValues::FontValues, first_available_font) == offsetof(ComputedValuesFFI::FontLayoutFacts, first_available_font));
+static_assert(offsetof(ComputedValues::FontValues, font_list) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_cascade_list));
+static_assert(sizeof(ComputedValuesFFI::FontLayoutFacts) <= offsetof(ComputedValues::FontValues, font_families));
 
 void const* style_group_default_payload(size_t group_index)
 {
@@ -768,20 +801,6 @@ ComputedValues::InheritedSVGValues ComputedValues::InheritedSVGValues::make_defa
     return values;
 }
 
-ComputedValues::GridValues ComputedValues::GridValues::make_default_payload_value()
-{
-    GridValues values;
-    values.grid_auto_columns = property_initial_value(PropertyID::GridAutoColumns)->as_grid_track_size_list().grid_track_size_list();
-    values.grid_auto_rows = property_initial_value(PropertyID::GridAutoRows)->as_grid_track_size_list().grid_track_size_list();
-    values.grid_template_columns = property_initial_value(PropertyID::GridTemplateColumns)->as_grid_track_size_list().grid_track_size_list();
-    values.grid_template_rows = property_initial_value(PropertyID::GridTemplateRows)->as_grid_track_size_list().grid_track_size_list();
-    values.grid_column_start = property_initial_value(PropertyID::GridColumnStart)->as_grid_track_placement().grid_track_placement();
-    values.grid_column_end = property_initial_value(PropertyID::GridColumnEnd)->as_grid_track_placement().grid_track_placement();
-    values.grid_row_start = property_initial_value(PropertyID::GridRowStart)->as_grid_track_placement().grid_track_placement();
-    values.grid_row_end = property_initial_value(PropertyID::GridRowEnd)->as_grid_track_placement().grid_track_placement();
-    return values;
-}
-
 ComputedValues::TransformValues ComputedValues::TransformValues::make_default_payload_value()
 {
     TransformValues values;
@@ -820,6 +839,7 @@ bool ComputedValues::FontValues::operator==(FontValues const& other) const
 
 bool ComputedValues::adopt_identical_group_payloads(ComputedValues const& previous) const
 {
+    VERIFY(!m_style_container);
     bool all_shared = true;
     auto adopt = [&]<typename T>(StyleStructRef<T> const& mine, StyleStructRef<T> const& theirs) {
         if (mine.ptr_equals(theirs))
@@ -856,6 +876,284 @@ bool ComputedValues::adopt_identical_group_payloads(ComputedValues const& previo
     LIBWEB_ADOPT_STYLE_GROUP(m_noninherited.svg_reset)
 #undef LIBWEB_ADOPT_STYLE_GROUP
     return all_shared;
+}
+
+void const* ComputedValues::style_group_payload(StyleGroupIndex group) const
+{
+    switch (group) {
+    case StyleGroupIndex::InheritedTableValues:
+        return &*m_inherited.table;
+    case StyleGroupIndex::InheritedListValues:
+        return &*m_inherited.list;
+    case StyleGroupIndex::InheritedUIValues:
+        return &*m_inherited.ui;
+    case StyleGroupIndex::InheritedSVGValues:
+        return &*m_inherited.svg;
+    case StyleGroupIndex::InheritedTextValues:
+        return &*m_inherited.text;
+    case StyleGroupIndex::InheritedBoxValues:
+        return &*m_inherited.box;
+    case StyleGroupIndex::FontValues:
+        return &*m_inherited.font;
+    case StyleGroupIndex::AnimationValues:
+        return &*m_noninherited.animation;
+    case StyleGroupIndex::SVGResetValues:
+        return &*m_noninherited.svg_reset;
+    case StyleGroupIndex::GridValues:
+        return &*m_noninherited.grid;
+    case StyleGroupIndex::AnchorValues:
+        return &*m_noninherited.anchor;
+    case StyleGroupIndex::EffectsValues:
+        return &*m_noninherited.effects;
+    case StyleGroupIndex::MaskValues:
+        return &*m_noninherited.mask_data;
+    case StyleGroupIndex::TextResetValues:
+        return &*m_noninherited.text_reset;
+    case StyleGroupIndex::ContentValues:
+        return &*m_noninherited.content_data;
+    case StyleGroupIndex::TransformValues:
+        return &*m_noninherited.transform;
+    case StyleGroupIndex::BackgroundValues:
+        return &*m_noninherited.background;
+    case StyleGroupIndex::BorderValues:
+        return &*m_noninherited.border;
+    case StyleGroupIndex::AlignmentValues:
+        return &*m_noninherited.alignment;
+    case StyleGroupIndex::MiscResetValues:
+        return &*m_noninherited.misc;
+    case StyleGroupIndex::SizingValues:
+        return &*m_noninherited.sizing;
+    case StyleGroupIndex::SurroundValues:
+        return &*m_noninherited.surround;
+    case StyleGroupIndex::BoxValues:
+        return &*m_noninherited.box;
+    case StyleGroupIndex::Count:
+        break;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+void const* ComputedValues::style_container() const
+{
+    if (!m_style_container) {
+        Array<void const*, to_underlying(StyleGroupIndex::Count)> groups;
+        for (size_t index = 0; index < groups.size(); ++index)
+            groups[index] = style_group_payload(static_cast<StyleGroupIndex>(index));
+        m_style_container = ComputedValuesFFI::rust_style_container_create(groups.data(), groups.size());
+    }
+    return m_style_container;
+}
+
+static Utf16FlyString make_grid_implicit_line_name(Utf16View name, StringView suffix)
+{
+    Utf16StringBuilder builder;
+    builder.append(name);
+    builder.append_ascii(suffix);
+    auto line_name = builder.to_string();
+    return Utf16FlyString::from_utf16(line_name.utf16_view());
+}
+
+struct GridGroupBuilderArena {
+    Vector<size_t> name_raws;
+    Vector<u32> name_indices;
+    Vector<ComputedValuesFFI::ComputedGridTrackEntry> entries;
+    Vector<ComputedValuesFFI::ComputedGridArea> areas;
+    HashMap<Utf16FlyString, u32> indices_by_name;
+
+    u32 intern_name(Utf16FlyString const& name)
+    {
+        if (auto existing = indices_by_name.get(name); existing.has_value())
+            return existing.value();
+
+        VERIFY(name_raws.size() < ComputedValuesFFI::GRID_NO_INDEX);
+        auto index = static_cast<u32>(name_raws.size());
+        name_raws.append(name.to_raw_leaked());
+        indices_by_name.set(name, index);
+        return index;
+    }
+};
+
+static ComputedValuesFFI::ComputedGridTrackBreadth grid_group_track_breadth(GridSize const& grid_size)
+{
+    if (grid_size.is_flexible_length()) {
+        return {
+            .is_flex = true,
+            .flex_factor = grid_size.flex_factor(),
+            .size = to_ffi_computed_size(Size::make_auto()),
+        };
+    }
+    auto size = grid_size.css_size();
+    VERIFY(size.type() != Size::Type::None);
+    return {
+        .is_flex = false,
+        .flex_factor = 0,
+        .size = to_ffi_computed_size(move(size)),
+    };
+}
+
+static ComputedValuesFFI::ComputedGridTrackList build_grid_group_track_list(GridTrackSizeList const& list, GridGroupBuilderArena& arena)
+{
+    ComputedValuesFFI::ComputedGridTrackList result {
+        .is_subgrid = list.is_subgrid(),
+        .preserves_line_name_sets = list.preserves_line_name_sets(),
+        .first_entry = ComputedValuesFFI::GRID_NO_INDEX,
+    };
+    u32 previous_entry = ComputedValuesFFI::GRID_NO_INDEX;
+
+    for (auto const& item : list.list()) {
+        VERIFY(arena.entries.size() < ComputedValuesFFI::GRID_NO_INDEX);
+        auto entry_index = static_cast<u32>(arena.entries.size());
+        arena.entries.append({
+            .kind = to_underlying(ComputedValuesFFI::ComputedGridTrackEntryKind::LineNames),
+            .next_sibling = ComputedValuesFFI::GRID_NO_INDEX,
+            .name_index_start = 0,
+            .name_index_count = 0,
+            .size = grid_group_track_breadth(GridSize::make_auto()),
+            .min_size = grid_group_track_breadth(GridSize::make_auto()),
+            .max_size = grid_group_track_breadth(GridSize::make_auto()),
+            .repeat_type = 0,
+            .repeat_count = 0,
+            .repeat_list = {
+                .is_subgrid = false,
+                .preserves_line_name_sets = false,
+                .first_entry = ComputedValuesFFI::GRID_NO_INDEX,
+            },
+        });
+
+        if (result.first_entry == ComputedValuesFFI::GRID_NO_INDEX)
+            result.first_entry = entry_index;
+        if (previous_entry != ComputedValuesFFI::GRID_NO_INDEX)
+            arena.entries[previous_entry].next_sibling = entry_index;
+        previous_entry = entry_index;
+
+        item.visit(
+            [&](GridLineNames const& line_names) {
+                auto name_index_start = arena.name_indices.size();
+                for (auto const& line_name : line_names.names())
+                    arena.name_indices.append(arena.intern_name(line_name.name));
+                auto& entry = arena.entries[entry_index];
+                entry.kind = to_underlying(ComputedValuesFFI::ComputedGridTrackEntryKind::LineNames);
+                entry.name_index_start = name_index_start;
+                entry.name_index_count = arena.name_indices.size() - name_index_start;
+            },
+            [&](ExplicitGridTrack const& track) {
+                if (track.is_default()) {
+                    auto& entry = arena.entries[entry_index];
+                    entry.kind = to_underlying(ComputedValuesFFI::ComputedGridTrackEntryKind::TrackSize);
+                    entry.size = grid_group_track_breadth(track.grid_size());
+                    return;
+                }
+                if (track.is_minmax()) {
+                    auto& entry = arena.entries[entry_index];
+                    entry.kind = to_underlying(ComputedValuesFFI::ComputedGridTrackEntryKind::MinMax);
+                    entry.min_size = grid_group_track_breadth(track.minmax().min_grid_size());
+                    entry.max_size = grid_group_track_breadth(track.minmax().max_grid_size());
+                    return;
+                }
+
+                auto const& repeat = track.repeat();
+                auto repeat_list = build_grid_group_track_list(repeat.grid_track_size_list(), arena);
+                auto& entry = arena.entries[entry_index];
+                entry.kind = to_underlying(ComputedValuesFFI::ComputedGridTrackEntryKind::Repeat);
+                entry.repeat_type = to_underlying(repeat.type());
+                entry.repeat_count = repeat.is_fixed() ? repeat.repeat_count() : 0;
+                entry.repeat_list = repeat_list;
+            });
+    }
+    return result;
+}
+
+static ComputedValuesFFI::ComputedGridPlacement build_grid_group_placement(GridTrackPlacement const& placement, GridGroupBuilderArena& arena)
+{
+    ComputedValuesFFI::ComputedGridPlacement result {
+        .kind = to_underlying(ComputedValuesFFI::ComputedGridPlacementKind::Auto),
+        .has_line_number = false,
+        .line_number = 0,
+        .has_name = false,
+        .name_index = ComputedValuesFFI::GRID_NO_INDEX,
+        .implicit_start_name_index = ComputedValuesFFI::GRID_NO_INDEX,
+        .implicit_end_name_index = ComputedValuesFFI::GRID_NO_INDEX,
+    };
+    if (placement.is_auto())
+        return result;
+
+    if (placement.is_span()) {
+        result.kind = to_underlying(ComputedValuesFFI::ComputedGridPlacementKind::Span);
+        result.has_line_number = true;
+        result.line_number = int_from_style_value(placement.span());
+        if (placement.span_name().has_value()) {
+            result.has_name = true;
+            result.name_index = arena.intern_name(*placement.span_name());
+        }
+        return result;
+    }
+
+    result.kind = to_underlying(ComputedValuesFFI::ComputedGridPlacementKind::Line);
+    if (placement.has_line_number()) {
+        result.has_line_number = true;
+        result.line_number = int_from_style_value(placement.line_number());
+    }
+    if (placement.has_identifier()) {
+        result.has_name = true;
+        result.name_index = arena.intern_name(placement.identifier());
+        result.implicit_start_name_index = arena.intern_name(
+            make_grid_implicit_line_name(placement.identifier().view(), "-start"sv));
+        result.implicit_end_name_index = arena.intern_name(
+            make_grid_implicit_line_name(placement.identifier().view(), "-end"sv));
+    }
+    return result;
+}
+
+static void* build_grid_group_payload(ComputedProperties const& computed_style)
+{
+    GridGroupBuilderArena arena;
+    ComputedValuesFFI::GridValues values {};
+
+    values.template_columns = build_grid_group_track_list(computed_style.grid_template_columns(), arena);
+    values.template_rows = build_grid_group_track_list(computed_style.grid_template_rows(), arena);
+    values.auto_columns = build_grid_group_track_list(computed_style.grid_auto_columns(), arena);
+    values.auto_rows = build_grid_group_track_list(computed_style.grid_auto_rows(), arena);
+
+    auto const template_areas = computed_style.grid_template_areas();
+    arena.areas.ensure_capacity(template_areas.areas.size());
+    for (auto const& [name, area] : template_areas.areas) {
+        arena.areas.unchecked_append({
+            .name_index = arena.intern_name(name),
+            .implicit_start_name_index = arena.intern_name(make_grid_implicit_line_name(name.view(), "-start"sv)),
+            .implicit_end_name_index = arena.intern_name(make_grid_implicit_line_name(name.view(), "-end"sv)),
+            .row_start = area.row_start,
+            .row_end = area.row_end,
+            .column_start = area.column_start,
+            .column_end = area.column_end,
+        });
+    }
+
+    values.column_start = build_grid_group_placement(computed_style.grid_column_start(), arena);
+    values.column_end = build_grid_group_placement(computed_style.grid_column_end(), arena);
+    values.row_start = build_grid_group_placement(computed_style.grid_row_start(), arena);
+    values.row_end = build_grid_group_placement(computed_style.grid_row_end(), arena);
+
+    auto retained_style_value = [&](PropertyID property_id) {
+        return ComputedValuesFFI::ComputedStyleValueHandle {
+            .pointer = StyleValueFFI::rust_style_value_retain(computed_style.property(property_id).rust_style_value_data()),
+        };
+    };
+    values.grid_template_columns_style_value = retained_style_value(PropertyID::GridTemplateColumns);
+    values.grid_template_rows_style_value = retained_style_value(PropertyID::GridTemplateRows);
+    values.grid_auto_columns_style_value = retained_style_value(PropertyID::GridAutoColumns);
+    values.grid_auto_rows_style_value = retained_style_value(PropertyID::GridAutoRows);
+    values.grid_template_areas_style_value = retained_style_value(PropertyID::GridTemplateAreas);
+    values.grid_column_start_style_value = retained_style_value(PropertyID::GridColumnStart);
+    values.grid_column_end_style_value = retained_style_value(PropertyID::GridColumnEnd);
+    values.grid_row_start_style_value = retained_style_value(PropertyID::GridRowStart);
+    values.grid_row_end_style_value = retained_style_value(PropertyID::GridRowEnd);
+
+    ComputedValuesFFI::rust_replace_computed_fly_string_list(&values.names, arena.name_raws.data(), arena.name_raws.size());
+    ComputedValuesFFI::rust_replace_grid_name_index_list(&values.name_indices, arena.name_indices.data(), arena.name_indices.size());
+    ComputedValuesFFI::rust_replace_grid_track_entry_list(&values.entries, arena.entries.data(), arena.entries.size());
+    ComputedValuesFFI::rust_replace_grid_area_list(&values.areas, arena.areas.data(), arena.areas.size());
+
+    return const_cast<void*>(ComputedValuesFFI::rust_build_grid_group(ComputedValues::GridValues::style_group_index, &values, nullptr));
 }
 
 NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties const& computed_style, DOM::Document const& document, StyleScope const& style_scope, ColorResolutionContext color_resolution_context, ComputedValues const* inherit_parent)
@@ -918,6 +1216,28 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (anchor_adopted)
         computed_values.adopt_anchor_group(const_cast<void*>(anchor_payload));
 
+    // https://drafts.csswg.org/css-anchor-position-1/#position-anchor
+    auto const& position_anchor_value = computed_style.property(PropertyID::PositionAnchor);
+    PositionAnchor position_anchor;
+    if (position_anchor_value.is_custom_ident()) {
+        position_anchor.type = PositionAnchor::Type::Name;
+        position_anchor.name = position_anchor_value.as_custom_ident().custom_ident();
+    } else {
+        switch (position_anchor_value.to_keyword()) {
+        case Keyword::Normal:
+            position_anchor.type = PositionAnchor::Type::Normal;
+            break;
+        case Keyword::None:
+            position_anchor.type = PositionAnchor::Type::None;
+            break;
+        case Keyword::Auto:
+            position_anchor.type = PositionAnchor::Type::Auto;
+            break;
+        default:
+            VERIFY_NOT_REACHED();
+        }
+    }
+
     auto* surround_payload = ComputedValuesFFI::rust_build_surround_group(
         SurroundValues::style_group_index,
         computed_style.property(PropertyID::Top).rust_style_value_data(),
@@ -932,20 +1252,59 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_style.property(PropertyID::PaddingRight).rust_style_value_data(),
         computed_style.property(PropertyID::PaddingBottom).rust_style_value_data(),
         computed_style.property(PropertyID::PaddingLeft).rust_style_value_data(),
+        position_anchor.name.has_value() ? position_anchor.name->to_raw_leaked() : 0,
         inherit_parent ? static_cast<void const*>(inherit_parent->m_noninherited.surround.operator->()) : nullptr);
     VERIFY(surround_payload);
     computed_values.adopt_surround_group(const_cast<void*>(surround_payload));
 
-    Array<ComputedValuesFFI::FfiGroupValueEntry, box_group_properties.size()> box_group_values;
-    gather_group_values(box_group_properties, box_group_values);
-    auto* box_payload = ComputedValuesFFI::rust_build_style_group(
+    auto containment = computed_style.contain();
+    auto container_type = computed_style.container_type();
+    auto z_index = computed_style.z_index();
+    Optional<int> column_count;
+    if (auto const& column_count_value = computed_style.property(PropertyID::ColumnCount); column_count_value.to_keyword() != Keyword::Auto)
+        column_count = int_from_style_value(NonnullRefPtr<StyleValue const> { column_count_value });
+    auto const grid_auto_flow = computed_style.grid_auto_flow();
+    ComputedValuesFFI::BoxValues box_group_values {
+        .display = to_ffi_display(computed_style.display()),
+        .display_before_box_type_transformation = to_ffi_display(computed_style.display_before_box_type_transformation()),
+        .float_ = static_cast<u8>(to_underlying(computed_style.float_())),
+        .clear = static_cast<u8>(to_underlying(computed_style.clear())),
+        .position = static_cast<u8>(to_underlying(computed_style.position())),
+        .overflow_x = static_cast<u8>(to_underlying(computed_style.overflow_x())),
+        .overflow_y = static_cast<u8>(to_underlying(computed_style.overflow_y())),
+        .box_sizing = static_cast<u8>(to_underlying(computed_style.box_sizing())),
+        .resize = static_cast<u8>(to_underlying(computed_style.resize())),
+        .text_overflow = static_cast<u8>(to_underlying(computed_style.text_overflow())),
+        .unicode_bidi = static_cast<u8>(to_underlying(computed_style.unicode_bidi())),
+        .table_layout = static_cast<u8>(to_underlying(computed_style.table_layout())),
+        .grid_auto_flow_row = grid_auto_flow.row,
+        .grid_auto_flow_dense = grid_auto_flow.dense,
+        .column_width = to_ffi_computed_size(computed_style.size_value(PropertyID::ColumnWidth)),
+        .column_count_has_value = column_count.has_value(),
+        .column_count = column_count.value_or(0),
+        .has_z_index = z_index.has_value(),
+        .z_index = z_index.value_or(0),
+        .vertical_align = to_ffi_vertical_align(computed_style.vertical_align()),
+        .aspect_ratio = to_ffi_aspect_ratio(computed_style.aspect_ratio()),
+        .size_containment = containment.size_containment,
+        .inline_size_containment = containment.inline_size_containment,
+        .layout_containment = containment.layout_containment,
+        .style_containment = containment.style_containment,
+        .paint_containment = containment.paint_containment,
+        .is_size_container = container_type.is_size_container,
+        .is_inline_size_container = container_type.is_inline_size_container,
+        .is_scroll_state_container = container_type.is_scroll_state_container,
+        .container_name = { .pointer = nullptr, .length = 0 },
+    };
+    auto leaked_container_name_raws = to_leaked_fly_string_raws(computed_style.container_name());
+    ComputedValuesFFI::rust_replace_computed_fly_string_list(
+        &box_group_values.container_name, leaked_container_name_raws.data(), leaked_container_name_raws.size());
+    auto* box_payload = ComputedValuesFFI::rust_build_box_group(
         BoxValues::style_group_index,
-        box_group_values.data(),
-        box_group_values.size(),
+        &box_group_values,
         inherit_parent ? static_cast<void const*>(inherit_parent->m_noninherited.box.operator->()) : nullptr);
-    bool const box_adopted = box_payload != nullptr;
-    if (box_adopted)
-        computed_values.adopt_box_group(const_cast<void*>(box_payload));
+    VERIFY(box_payload);
+    computed_values.adopt_box_group(const_cast<void*>(box_payload));
 
     auto* alignment_payload = ComputedValuesFFI::rust_build_alignment_group(
         AlignmentValues::style_group_index,
@@ -1098,7 +1457,7 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     computed_values.set_font_style({ font_style.font_style(), move(font_style_angle) });
     computed_values.set_font_optical_sizing(computed_style.font_optical_sizing());
     computed_values.set_font_feature_data(computed_style.font_feature_data());
-    computed_values.set_line_height(computed_style.line_height_data(document.font_computer()));
+    computed_values.set_line_height(computed_style.line_height_data(), computed_style.line_height(document.font_computer()));
     computed_values.set_font_variant_emoji(computed_style.font_variant_emoji());
 
     Array<ComputedValuesFFI::FfiGroupValueEntry, animation_group_properties.size()> animation_group_values;
@@ -1281,6 +1640,7 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         SVGResetValues::style_group_index,
         computed_style.property(PropertyID::Cx).rust_style_value_data(),
         computed_style.property(PropertyID::Cy).rust_style_value_data(),
+        computed_style.property(PropertyID::D).rust_style_value_data(),
         computed_style.property(PropertyID::R).rust_style_value_data(),
         computed_style.property(PropertyID::Rx).rust_style_value_data(),
         computed_style.property(PropertyID::Ry).rust_style_value_data(),
@@ -1431,9 +1791,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_accent_color(move(accent_color));
     }
 
-    if (!box_adopted)
-        computed_values.set_vertical_align(computed_style.vertical_align());
-
     if (!background_adopted) {
         auto background_layers = computed_style.background_layers();
         computed_values.set_background_layers(move(background_layers));
@@ -1505,9 +1862,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (!background_adopted)
         computed_values.set_background_color_clip(computed_style.background_color_clip());
 
-    if (!box_adopted)
-        computed_values.set_box_sizing(computed_style.box_sizing());
-
     if (auto maybe_font_language_override = computed_style.font_language_override(); maybe_font_language_override.has_value())
         computed_values.set_font_language_override(maybe_font_language_override.release_value());
     computed_values.set_font_variation_settings(computed_style.font_variation_settings());
@@ -1535,10 +1889,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_corner_top_left_shape(computed_style.property(CSS::PropertyID::CornerTopLeftShape).as_superellipse().parameter());
     if (!border_adopted)
         computed_values.set_corner_top_right_shape(computed_style.property(CSS::PropertyID::CornerTopRightShape).as_superellipse().parameter());
-    if (!box_adopted)
-        computed_values.set_display(computed_style.display());
-    if (!box_adopted)
-        computed_values.set_display_before_box_type_transformation(computed_style.display_before_box_type_transformation());
 
     if (!effects_adopted)
         computed_values.set_clip(computed_style.clip());
@@ -1553,30 +1903,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (!misc_reset_adopted)
         computed_values.set_computed_appearance(keyword_to_appearance(computed_style.property(PropertyID::Appearance).to_keyword()).release_value());
 
-    if (!box_adopted)
-        computed_values.set_position(computed_style.position());
-
-    // https://drafts.csswg.org/css-anchor-position-1/#position-anchor
-    auto const& position_anchor_value = computed_style.property(CSS::PropertyID::PositionAnchor);
-    CSS::PositionAnchor position_anchor;
-    if (position_anchor_value.is_custom_ident()) {
-        position_anchor.type = CSS::PositionAnchor::Type::Name;
-        position_anchor.name = position_anchor_value.as_custom_ident().custom_ident();
-    } else {
-        switch (position_anchor_value.to_keyword()) {
-        case CSS::Keyword::Normal:
-            position_anchor.type = CSS::PositionAnchor::Type::Normal;
-            break;
-        case CSS::Keyword::None:
-            position_anchor.type = CSS::PositionAnchor::Type::None;
-            break;
-        case CSS::Keyword::Auto:
-            position_anchor.type = CSS::PositionAnchor::Type::Auto;
-            break;
-        default:
-            VERIFY_NOT_REACHED();
-        }
-    }
     if (!anchor_adopted)
         computed_values.set_position_anchor(move(position_anchor));
 
@@ -1774,7 +2100,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_text_align(computed_style.text_align());
     if (!inherited_text_adopted)
         computed_values.set_text_justify(computed_style.text_justify());
-    computed_values.set_text_overflow(computed_style.text_overflow());
     auto const& text_underline_offset_value = computed_style.property(CSS::PropertyID::TextUnderlineOffset);
     CSS::TextUnderlineOffset text_underline_offset;
     text_underline_offset.used_value = computed_style.text_underline_offset();
@@ -1838,9 +2163,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (!inherited_text_adopted)
         computed_values.set_letter_spacing_style_value(computed_style.property(PropertyID::LetterSpacing));
 
-    if (!box_adopted)
-        computed_values.set_float(computed_style.float_());
-
     if (!inherited_table_adopted) {
         computed_values.set_border_spacing_horizontal(computed_style.border_spacing_horizontal());
         computed_values.set_border_spacing_vertical(computed_style.border_spacing_vertical());
@@ -1848,12 +2170,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
 
     if (!inherited_table_adopted)
         computed_values.set_caption_side(computed_style.caption_side());
-    if (!box_adopted)
-        computed_values.set_clear(computed_style.clear());
-    if (!box_adopted)
-        computed_values.set_overflow_x(computed_style.overflow_x());
-    if (!box_adopted)
-        computed_values.set_overflow_y(computed_style.overflow_y());
     if (!inherited_box_adopted)
         computed_values.set_content_visibility(computed_style.content_visibility());
     auto cursor = computed_style.cursor();
@@ -1908,8 +2224,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (!inherited_text_adopted)
         computed_values.set_text_shadow(computed_style.text_shadow(color_resolution_context));
 
-    if (!box_adopted)
-        computed_values.set_z_index(computed_style.z_index());
     if (!effects_adopted)
         computed_values.set_opacity(computed_style.opacity());
 
@@ -2032,40 +2346,16 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_outline_width(max(CSSPixels { 0 }, computed_style.length(CSS::PropertyID::OutlineWidth).absolute_length_to_px()));
 
     if (!grid_adopted)
-        computed_values.set_grid_auto_columns(computed_style.grid_auto_columns());
-    if (!grid_adopted)
-        computed_values.set_grid_auto_rows(computed_style.grid_auto_rows());
-    if (!grid_adopted)
-        computed_values.set_grid_template_columns(computed_style.grid_template_columns());
-    if (!grid_adopted)
-        computed_values.set_grid_template_rows(computed_style.grid_template_rows());
-    if (!grid_adopted)
-        computed_values.set_grid_column_end(computed_style.grid_column_end());
-    if (!grid_adopted)
-        computed_values.set_grid_column_start(computed_style.grid_column_start());
-    if (!grid_adopted)
-        computed_values.set_grid_row_end(computed_style.grid_row_end());
-    if (!grid_adopted)
-        computed_values.set_grid_row_start(computed_style.grid_row_start());
-    if (!grid_adopted)
-        computed_values.set_grid_template_areas(computed_style.grid_template_areas());
-    if (!grid_adopted)
-        computed_values.set_grid_auto_flow(computed_style.grid_auto_flow());
+        computed_values.adopt_grid_group(build_grid_group_payload(computed_style));
 
     if (!inherited_svg_adopted)
         computed_values.set_fill(computed_style.fill(color_resolution_context));
     if (!inherited_svg_adopted)
         computed_values.set_stroke(computed_style.stroke(color_resolution_context));
 
-    auto const& stroke_width = computed_style.property(CSS::PropertyID::StrokeWidth);
-    // FIXME: Converting to pixels isn't really correct - values should be in "user units"
-    //        https://svgwg.org/svg2-draft/coords.html#TermUserUnits
-    if (!inherited_svg_adopted) {
-        if (stroke_width.is_number())
-            computed_values.set_stroke_width(CSS::Length::make_px(CSSPixels::nearest_value_for(stroke_width.as_number().number())));
-        else
-            computed_values.set_stroke_width(CSS::LengthPercentage::from_style_value(stroke_width));
-    }
+    if (!inherited_svg_adopted)
+        computed_values.set_stroke_width(computed_style.stroke_width());
+
     if (!inherited_svg_adopted) {
         computed_values.set_paint_order(computed_style.paint_order());
         auto const& paint_order = computed_style.property(PropertyID::PaintOrder);
@@ -2114,15 +2404,8 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (!inherited_svg_adopted)
         computed_values.set_stroke_dasharray(computed_style.stroke_dasharray());
 
-    auto const& stroke_dashoffset = computed_style.property(CSS::PropertyID::StrokeDashoffset);
-    // FIXME: Converting to pixels isn't really correct - values should be in "user units"
-    //        https://svgwg.org/svg2-draft/coords.html#TermUserUnits
-    if (!inherited_svg_adopted) {
-        if (stroke_dashoffset.is_number())
-            computed_values.set_stroke_dashoffset(CSS::Length::make_px(CSSPixels::nearest_value_for(stroke_dashoffset.as_number().number())));
-        else
-            computed_values.set_stroke_dashoffset(CSS::LengthPercentage::from_style_value(stroke_dashoffset));
-    }
+    if (!inherited_svg_adopted)
+        computed_values.set_stroke_dashoffset(computed_style.stroke_dashoffset());
 
     if (!inherited_svg_adopted)
         computed_values.set_stroke_linecap(computed_style.stroke_linecap());
@@ -2139,14 +2422,9 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (!inherited_svg_adopted)
         computed_values.set_dominant_baseline(computed_style.dominant_baseline());
 
-    if (auto const& column_count = computed_style.property(CSS::PropertyID::ColumnCount); !misc_reset_adopted && column_count.to_keyword() != Keyword::Auto)
-        computed_values.set_column_count(CSS::ColumnCount::make_integer(int_from_style_value(NonnullRefPtr<StyleValue const> { column_count })));
-
     if (!misc_reset_adopted)
         computed_values.set_column_span(computed_style.column_span());
 
-    if (!misc_reset_adopted)
-        computed_values.set_column_width(computed_style.size_value(CSS::PropertyID::ColumnWidth));
     if (!misc_reset_adopted)
         computed_values.set_column_height(computed_style.size_value(CSS::PropertyID::ColumnHeight));
 
@@ -2155,34 +2433,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
 
     if (!inherited_table_adopted)
         computed_values.set_empty_cells(computed_style.empty_cells());
-
-    if (!misc_reset_adopted)
-        computed_values.set_table_layout(computed_style.table_layout());
-
-    auto const& aspect_ratio = computed_style.property(CSS::PropertyID::AspectRatio);
-    if (box_adopted) {
-        // The constraint left the constructor's auto default standing.
-    } else if (aspect_ratio.is_value_list()) {
-        auto const& values_list = aspect_ratio.as_value_list().values();
-        if (values_list.size() == 2
-            && values_list[0]->is_keyword() && values_list[0]->as_keyword().keyword() == CSS::Keyword::Auto
-            && values_list[1]->is_ratio()) {
-            auto ratio = values_list[1]->as_ratio().resolved();
-            if (ratio.is_degenerate())
-                computed_values.set_aspect_ratio({ true, {}, true, ratio });
-            else
-                computed_values.set_aspect_ratio({ true, ratio, true, ratio });
-        }
-    } else if (aspect_ratio.is_keyword() && aspect_ratio.as_keyword().keyword() == CSS::Keyword::Auto) {
-        computed_values.set_aspect_ratio({ true, {}, true, {} });
-    } else if (aspect_ratio.is_ratio()) {
-        // https://drafts.csswg.org/css-sizing-4/#aspect-ratio
-        // If the <ratio> is degenerate, the property instead behaves as auto.
-        if (aspect_ratio.as_ratio().resolved().is_degenerate())
-            computed_values.set_aspect_ratio({ true, {}, false, aspect_ratio.as_ratio().resolved() });
-        else
-            computed_values.set_aspect_ratio({ false, aspect_ratio.as_ratio().resolved(), false, aspect_ratio.as_ratio().resolved() });
-    }
 
     if (!misc_reset_adopted)
         computed_values.set_touch_action(computed_style.touch_action());
@@ -2211,7 +2461,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_object_position(computed_style.object_position());
     if (!inherited_box_adopted)
         computed_values.set_direction(computed_style.direction());
-    computed_values.set_unicode_bidi(computed_style.unicode_bidi());
     if (!misc_reset_adopted)
         computed_values.set_scroll_behavior(CSS::keyword_to_scroll_behavior(computed_style.property(CSS::PropertyID::ScrollBehavior).to_keyword()).release_value());
     if (!inherited_ui_adopted)
@@ -2254,15 +2503,8 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_mix_blend_mode(computed_style.mix_blend_mode());
     if (!misc_reset_adopted)
         computed_values.set_view_transition_name(computed_style.view_transition_name());
-    if (!box_adopted)
-        computed_values.set_contain(computed_style.contain());
-    if (!box_adopted)
-        computed_values.set_container_name(computed_style.container_name());
-    if (!box_adopted)
-        computed_values.set_container_type(computed_style.container_type());
-    if (!box_adopted)
+    if (!misc_reset_adopted)
         computed_values.set_will_change(computed_style.will_change());
-
     if (!inherited_ui_adopted) {
         auto const& caret_color_value = computed_style.property(CSS::PropertyID::CaretColor);
         CSS::ColorOrAuto caret_color;
@@ -2275,9 +2517,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_color_interpolation(computed_style.color_interpolation());
     if (!inherited_svg_adopted)
         computed_values.set_color_interpolation_filters(computed_style.color_interpolation_filters());
-    if (!box_adopted)
-        computed_values.set_resize(computed_style.resize());
-
     for (auto i = to_underlying(first_longhand_property_id); i <= to_underlying(last_longhand_property_id); ++i) {
         auto property_id = static_cast<PropertyID>(i);
         computed_values.set_property_important(property_id, computed_style.is_property_important(property_id));

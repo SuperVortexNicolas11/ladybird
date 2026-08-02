@@ -40,19 +40,17 @@ static_assert(offsetof(RustFFI::NodeData, containing_block) == 20);
 static_assert(offsetof(RustFFI::NodeData, inline_containing_block) == 24);
 static_assert(offsetof(RustFFI::NodeData, kind) == 28);
 static_assert(offsetof(RustFFI::NodeData, generated_for) == 29);
+static_assert(offsetof(RustFFI::NodeData, intrinsic_cache_epoch) == 30);
 static_assert(offsetof(RustFFI::NodeData, flags) == 32);
 static_assert(offsetof(RustFFI::NodeData, initial_quote_nesting_level) == 36);
-static_assert(offsetof(RustFFI::NodeData, layout_index) == 40);
-static_assert(offsetof(RustFFI::NodeData, table_display) == 44);
-static_assert(offsetof(RustFFI::NodeData, table_display_before) == 45);
-static_assert(offsetof(RustFFI::NodeData, display_bits) == 46);
+static_assert(offsetof(RustFFI::NodeData, slot_generation) == 40);
+static_assert(offsetof(RustFFI::NodeData, table_column_span) == 42);
+static_assert(offsetof(RustFFI::NodeData, table_row_span) == 44);
 static_assert(offsetof(RustFFI::NodeData, style) == 48);
 static_assert(offsetof(RustFFI::NodeData, shell) == 56);
 
 static_assert(sizeof(RustFFI::NodeKind) == sizeof(u8));
 static_assert(sizeof(RustFFI::NodeFlag) == sizeof(u32));
-static_assert(sizeof(RustFFI::NodeDisplayFlag) == sizeof(u8));
-static_assert(sizeof(RustFFI::FfiTableDisplay) == sizeof(u8));
 
 class NodeKindSetter;
 
@@ -74,17 +72,6 @@ class InlineNode;
 enum class LayoutUpdatePropagation : u8 {
     ThroughAncestors,
     BoundarySelfOnly,
-};
-
-enum class LayoutMode {
-    // Normal layout. No min-content or max-content constraints applied.
-    Normal,
-
-    // Intrinsic size determination.
-    // Boxes honor min-content and max-content constraints (set via LayoutState::UsedValues::{width,height}_constraint)
-    // by considering their containing block to be 0-sized or infinitely large in the relevant axis.
-    // https://drafts.csswg.org/css-sizing-3/#intrinsic-sizing
-    IntrinsicSizing,
 };
 
 class NodeArenaAllocation {
@@ -113,7 +100,9 @@ public:
     virtual StringView class_name() const { return "Node"sv; }
 
     static RustFFI::NodeSlotId slot_id(Node const*);
+    u32 arena_slot_index() const { return m_slot.index; }
     void* arena_handle() const;
+    NodeArena& node_arena() const { return *m_arena; }
 
     bool is_anonymous() const { return has_flag(RustFFI::NodeFlag::Anonymous); }
     DOM::Node const* dom_node() const;
@@ -186,8 +175,6 @@ public:
     bool is_fragmented_inline() const;
     NodeWithStyleAndBoxModelMetrics const* nearest_fragmented_inline_ancestor() const;
 
-    bool is_out_of_flow(FormattingContext const&) const;
-
     // An element is called out of flow if it is floated, absolutely positioned, or is the root element.
     // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
     bool is_out_of_flow() const;
@@ -212,9 +199,7 @@ public:
     virtual bool is_svg_svg_box() const { return false; }
     virtual bool is_svg_graphics_box() const { return false; }
     virtual bool is_svg_foreign_object_box() const { return false; }
-    virtual bool is_label() const { return false; }
     virtual bool is_replaced_box() const { return false; }
-    virtual bool is_textarea_box() const { return false; }
     virtual bool is_list_item_box() const { return false; }
     virtual bool is_list_item_marker_box() const { return false; }
     virtual bool is_fieldset_box() const { return false; }
@@ -229,10 +214,8 @@ public:
     bool fast_is() const = delete;
 
     bool is_flex_item() const { return has_flag(RustFFI::NodeFlag::IsFlexItem); }
-    void set_flex_item(bool value) { set_flag(RustFFI::NodeFlag::IsFlexItem, value); }
 
     bool is_grid_item() const { return has_flag(RustFFI::NodeFlag::IsGridItem); }
-    void set_grid_item(bool value) { set_flag(RustFFI::NodeFlag::IsGridItem, value); }
 
     bool vertical_align_applies() const
     {
@@ -256,7 +239,6 @@ public:
     // positioned element, if applicable. This is needed because m_containing_block can only hold
     // a Box*, but CSS allows inline elements (like a <span> with position:relative) to establish
     // containing blocks for their absolutely positioned descendants.
-    // See the large FIXME comment in FormattingContext.cpp for full context.
     [[nodiscard]] InlineNode const* inline_containing_block_if_applicable() const { return m_inline_containing_block_if_applicable; }
 
     void recompute_containing_block(Badge<DOM::Document>);
@@ -277,12 +259,11 @@ public:
     NodeWithStyle* parent();
     NodeWithStyle const* parent() const;
 
-    void inserted_into(Node&) { }
-    void removed_from(Node&) { }
-    void children_changed() { }
-
     bool children_are_inline() const { return has_flag(RustFFI::NodeFlag::ChildrenAreInline); }
     void set_children_are_inline(bool value) { set_flag(RustFFI::NodeFlag::ChildrenAreInline, value); }
+
+    bool is_editing_host() const { return has_flag(RustFFI::NodeFlag::IsEditingHost); }
+    void set_is_editing_host(bool value) { set_flag(RustFFI::NodeFlag::IsEditingHost, value); }
 
     u32 initial_quote_nesting_level() const { return m_data->initial_quote_nesting_level; }
     void set_initial_quote_nesting_level(u32 value) { m_data->initial_quote_nesting_level = value; }
@@ -399,9 +380,6 @@ public:
     bool is_fixed_position() const;
     bool is_sticky_position() const;
 
-    // https://www.w3.org/TR/css-display-3/#out-of-flow
-    bool is_out_of_flow(FormattingContext const&) const;
-
     // An element is called out of flow if it is floated, absolutely positioned, or is the root element.
     // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
     bool is_out_of_flow() const { return is_floating() || is_absolutely_positioned(); }
@@ -441,6 +419,7 @@ public:
     void clear_image_observers();
     void apply_style(NonnullRefPtr<CSS::ComputedValues const>);
     void attach_style_resources();
+    void synchronize_table_span_data();
 
     Gfx::Font const& first_available_font() const;
     Vector<CSS::BackgroundLayerData> const& background_layers() const { return computed_values().background_layers(); }
@@ -460,9 +439,6 @@ public:
     void set_content(CSS::ContentData const&);
     void set_overflow(CSS::Overflow overflow_x, CSS::Overflow overflow_y);
 
-    u32 layout_index() const { return node_data().layout_index; }
-    void set_layout_index(u32 index) { node_data().layout_index = index; }
-
 protected:
     NodeWithStyle(DOM::Document&, DOM::Node*, NonnullRefPtr<CSS::ComputedValues const>);
 
@@ -472,7 +448,7 @@ private:
     void reset_table_box_computed_values_used_by_wrapper_to_init_values();
     void propagate_non_inherit_values(CSS::ComputedValues::Builder&) const;
     void propagate_style_to_anonymous_wrappers();
-    void mirror_computed_values_to_node_data();
+    void publish_style_container_to_node_data();
 
     void rebuild_image_observers();
 

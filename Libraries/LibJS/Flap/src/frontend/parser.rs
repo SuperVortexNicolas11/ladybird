@@ -330,15 +330,32 @@ impl<'a> Parser<'a> {
     fn parse_program(&mut self) -> Result<Program, Diagnostic> {
         let mut declarations = Vec::new();
         while self.current().kind != TokenKind::End {
-            if self.at_keyword("inline") {
+            if self.at_keyword("specialize") {
+                if self.index > 0 && self.tokens[self.index - 1].span.end.line == self.current().span.start.line {
+                    return self.error("a specialization declaration must begin on a new line");
+                }
+                self.skip_specialization_declaration()?;
+            } else if self.at_keyword("inline") {
                 declarations.push(Declaration::InlineFunction(self.parse_inline_function()?));
             } else if self.at_keyword("handler") {
                 declarations.push(Declaration::Handler(self.parse_handler()?));
             } else {
-                return self.error("expected 'inline fn' or 'handler'");
+                return self.error("expected 'specialize', 'inline fn', or 'handler'");
             }
         }
         Ok(Program { declarations })
+    }
+
+    fn skip_specialization_declaration(&mut self) -> Result<(), Diagnostic> {
+        self.consume_keyword("specialize")?;
+        while self.current().kind != TokenKind::Semicolon {
+            if self.current().kind == TokenKind::End {
+                return self.error("expected ';'");
+            }
+            self.advance();
+        }
+        self.advance();
+        Ok(())
     }
 
     fn parse_inline_function(&mut self) -> Result<InlineFunctionDeclaration, Diagnostic> {
@@ -383,13 +400,22 @@ impl<'a> Parser<'a> {
         if parameters.iter().any(|parameter| parameter.is_else) {
             return self.error("a handler cannot declare an else parameter");
         }
-        let temperature = if self.current().kind == TokenKind::At {
+        let mut temperature = BlockTemperature::Default;
+        while self.current().kind == TokenKind::At {
             self.advance();
-            self.consume_keyword("cold")?;
-            BlockTemperature::Cold
-        } else {
-            BlockTemperature::Default
-        };
+            let (annotation, span) = self.consume_identifier("handler annotation")?;
+            match annotation.as_str() {
+                "cold" => temperature = BlockTemperature::Cold,
+                "terminator" => {}
+                _ => {
+                    return Err(Diagnostic::new(
+                        self.filename,
+                        span,
+                        format!("unknown handler annotation '@{annotation}'"),
+                    ));
+                }
+            }
+        }
         let body = if self.current().kind == TokenKind::Equals {
             self.advance();
             let expression = self.parse_expression()?;
@@ -448,9 +474,10 @@ impl<'a> Parser<'a> {
         }
         self.consume(TokenKind::RightParen, "')'")?;
         if let Some(index) = parameters.iter().position(|parameter| parameter.is_else)
-            && index + 1 != parameters.len() {
-                return self.error("an else parameter must be last");
-            }
+            && index + 1 != parameters.len()
+        {
+            return self.error("an else parameter must be last");
+        }
         Ok(parameters)
     }
 
@@ -502,34 +529,65 @@ impl<'a> Parser<'a> {
             return Ok(Type::Tuple(elements));
         }
         let (name, span) = self.consume_identifier("type")?;
-        if let Some(ty) = Type::from_source_name(&name) {
-            return Ok(ty);
-        }
-        if name == "Value" && self.current().kind != TokenKind::LeftAngle {
-            return Ok(Type::Value);
-        }
-        let constructor = match name.as_str() {
-            "Label" => return Ok(Type::label()),
-            "Value"
-            | "ptr"
-            | "Sequence"
-            | "Field"
-            | "BinaryOperation"
-            | "CheckedBinaryOperation" => name,
-            _ => return Err(Diagnostic::new(self.filename, span, format!("unknown type '{name}'"))),
+        let mut ty = if let Some(ty) = Type::from_source_name(&name) {
+            ty
+        } else if name == "Value" && self.current().kind != TokenKind::LeftAngle {
+            Type::Value
+        } else if name == "Label" {
+            Type::label()
+        } else if name == "Completion" {
+            self.consume(TokenKind::Colon, "':'")?;
+            self.consume(TokenKind::Colon, "':'")?;
+            self.consume_keyword("Type")?;
+            Type::U32
+        } else if matches!(
+            name.as_str(),
+            "ArgumentsKind"
+                | "EnvironmentMode"
+                | "FunctionNamePrefix"
+                | "IdentifierTableIndex"
+                | "IteratorHint"
+                | "ObjectPropertyIteratorCacheIndex"
+                | "ObjectShapeCacheIndex"
+                | "PropertyKeyTableIndex"
+                | "RegexTableIndex"
+                | "StringTableIndex"
+                | "TemplateObjectCacheIndex"
+        ) {
+            Type::U32
+        } else if name == "PutKind" {
+            Type::U8
+        } else {
+            let constructor = match name.as_str() {
+                "Optional" | "Value" | "ptr" | "Sequence" | "Field" | "BinaryOperation" | "CheckedBinaryOperation" => {
+                    name
+                }
+                _ => return Err(Diagnostic::new(self.filename, span, format!("unknown type '{name}'"))),
+            };
+            self.consume(TokenKind::LeftAngle, "'<'")?;
+            let inner = Box::new(self.parse_type()?);
+            self.consume(TokenKind::RightAngle, "'>'")?;
+            match constructor.as_str() {
+                "Optional" if *inner == Type::label() => Type::BytecodeOffset,
+                "Optional" => *inner,
+                "Value" => Type::Boxed(inner),
+                "ptr" => Type::Pointer(inner),
+                "Sequence" => Type::Sequence(inner),
+                "Field" => Type::Field(inner),
+                "BinaryOperation" => Type::BinaryOperation(inner),
+                "CheckedBinaryOperation" => Type::CheckedBinaryOperation(inner),
+                _ => unreachable!(),
+            }
         };
-        self.consume(TokenKind::LeftAngle, "'<'")?;
-        let inner = Box::new(self.parse_type()?);
-        self.consume(TokenKind::RightAngle, "'>'")?;
-        Ok(match constructor.as_str() {
-            "Value" => Type::Boxed(inner),
-            "ptr" => Type::Pointer(inner),
-            "Sequence" => Type::Sequence(inner),
-            "Field" => Type::Field(inner),
-            "BinaryOperation" => Type::BinaryOperation(inner),
-            "CheckedBinaryOperation" => Type::CheckedBinaryOperation(inner),
-            _ => unreachable!(),
-        })
+        if self.current().kind == TokenKind::LeftBracket {
+            self.advance();
+            self.consume(TokenKind::RightBracket, "']'")?;
+            if ty == Type::Operand {
+                ty = Type::U32;
+            }
+            ty = Type::Sequence(Box::new(ty));
+        }
+        Ok(ty)
     }
 
     fn parse_block(&mut self) -> Result<Block, Diagnostic> {
@@ -586,7 +644,10 @@ impl<'a> Parser<'a> {
             self.consume_keyword("else")?;
             let failure = self.parse_else_continuation()?;
             let end = self.consume(TokenKind::Semicolon, "';'")?.span.end;
-            return Ok(Statement::new(StatementKind::Guard { condition, failure }, SourceSpan { start, end }));
+            return Ok(Statement::new(
+                StatementKind::Guard { condition, failure },
+                SourceSpan { start, end },
+            ));
         }
         if self.at_keyword("goto") {
             self.advance();
@@ -597,7 +658,10 @@ impl<'a> Parser<'a> {
                 Vec::new()
             };
             let end = self.consume(TokenKind::Semicolon, "';'")?.span.end;
-            return Ok(Statement::new(StatementKind::ContinuationJump { target, arguments }, SourceSpan { start, end }));
+            return Ok(Statement::new(
+                StatementKind::ContinuationJump { target, arguments },
+                SourceSpan { start, end },
+            ));
         }
         if self.at_keyword("let") {
             self.advance();
@@ -745,7 +809,11 @@ impl<'a> Parser<'a> {
             let body = self.parse_block()?;
             let end = body.span.end;
             return Ok(Statement::new(
-                StatementKind::While { condition, body, post_tested: false },
+                StatementKind::While {
+                    condition,
+                    body,
+                    post_tested: false,
+                },
                 SourceSpan { start, end },
             ));
         }
@@ -756,12 +824,19 @@ impl<'a> Parser<'a> {
             let condition = self.parse_expression()?;
             let end = self.consume(TokenKind::Semicolon, "';'")?.span.end;
             return Ok(Statement::new(
-                StatementKind::While { condition, body, post_tested: true },
+                StatementKind::While {
+                    condition,
+                    body,
+                    post_tested: true,
+                },
                 SourceSpan { start, end },
             ));
         }
         if matches!(&self.current().kind, TokenKind::Identifier(_))
-            && self.tokens.get(self.index + 1).is_some_and(|token| token.kind == TokenKind::LeftBracket)
+            && self
+                .tokens
+                .get(self.index + 1)
+                .is_some_and(|token| token.kind == TokenKind::LeftBracket)
         {
             let base = self.parse_primary_expression()?;
             self.consume(TokenKind::LeftBracket, "'['")?;
@@ -770,7 +845,10 @@ impl<'a> Parser<'a> {
             self.consume(TokenKind::Equals, "'='")?;
             let value = self.parse_expression()?;
             let end = self.consume(TokenKind::Semicolon, "';'")?.span.end;
-            return Ok(Statement::new(StatementKind::IndexAssign { base, index, value }, SourceSpan { start, end }));
+            return Ok(Statement::new(
+                StatementKind::IndexAssign { base, index, value },
+                SourceSpan { start, end },
+            ));
         }
 
         if matches!(&self.current().kind, TokenKind::Identifier(_))
@@ -783,7 +861,10 @@ impl<'a> Parser<'a> {
             self.advance();
             let initializer = self.parse_expression()?;
             let end = self.consume(TokenKind::Semicolon, "';'")?.span.end;
-            return Ok(Statement::new(StatementKind::Assign { name, initializer }, SourceSpan { start, end }));
+            return Ok(Statement::new(
+                StatementKind::Assign { name, initializer },
+                SourceSpan { start, end },
+            ));
         }
 
         let expression = self.parse_expression()?;
@@ -804,7 +885,10 @@ impl<'a> Parser<'a> {
             ));
         }
         let end = self.consume(TokenKind::Semicolon, "';'")?.span.end;
-        Ok(Statement::new(StatementKind::Expression(expression), SourceSpan { start, end }))
+        Ok(Statement::new(
+            StatementKind::Expression(expression),
+            SourceSpan { start, end },
+        ))
     }
 
     fn parse_tuple_pattern(&mut self) -> Result<Pattern, Diagnostic> {
@@ -1057,9 +1141,7 @@ impl<'a> Parser<'a> {
                         return self.error("scalar match arms must use the same body style");
                     }
                     style = Some(current_style);
-                    if current_style == ScalarMatchArmStyle::Target
-                        && temperature != BlockTemperature::Default
-                    {
+                    if current_style == ScalarMatchArmStyle::Target && temperature != BlockTemperature::Default {
                         return self.error("a target match arm cannot have a block layout annotation");
                     }
                     let body = if current_style == ScalarMatchArmStyle::Block {
@@ -1080,24 +1162,19 @@ impl<'a> Parser<'a> {
                 }
                 self.advance();
                 self.consume(TokenKind::FatArrow, "'=>'")?;
-                let fallback = if style == Some(ScalarMatchArmStyle::Target)
-                    && self.current().kind == TokenKind::LeftBrace
-                {
-                    self.parse_block()?
-                } else {
-                    let (target, span) = self.consume_identifier("fallback label or closure")?;
-                    Self::jump_block(target, span)
-                };
+                let fallback =
+                    if style == Some(ScalarMatchArmStyle::Target) && self.current().kind == TokenKind::LeftBrace {
+                        self.parse_block()?
+                    } else {
+                        let (target, span) = self.consume_identifier("fallback label or closure")?;
+                        Self::jump_block(target, span)
+                    };
                 if self.current().kind == TokenKind::Comma {
                     self.advance();
                 }
                 let end = self.consume(TokenKind::RightBrace, "'}'")?.span.end;
                 return Ok(Statement::new(
-                    StatementKind::ScalarMatch {
-                        value,
-                        arms,
-                        fallback,
-                    },
+                    StatementKind::ScalarMatch { value, arms, fallback },
                     SourceSpan { start, end },
                 ));
             }
@@ -1229,10 +1306,7 @@ impl<'a> Parser<'a> {
         self.parse_binary_expression(0)
     }
 
-    fn parse_binary_expression(
-        &mut self,
-        minimum_precedence: u8,
-    ) -> Result<Expression, Diagnostic> {
+    fn parse_binary_expression(&mut self, minimum_precedence: u8) -> Result<Expression, Diagnostic> {
         let mut expression = self.parse_unary_expression()?;
         while let Some(precedence) = self.infix_precedence()
             && precedence >= minimum_precedence
@@ -1280,30 +1354,14 @@ impl<'a> Parser<'a> {
         Some(match self.current().kind {
             TokenKind::DoubleAmpersand => 1,
             TokenKind::DoubleEquals => 2,
-            TokenKind::Bang
-                if matches!(
-                    self.peek(1).kind,
-                    TokenKind::Equals | TokenKind::DoubleEquals
-                ) =>
-            {
-                2
-            }
-            TokenKind::Identifier(_)
-                if self.at_keyword("has")
-                    || self.at_keyword("lacks")
-                    || self.at_keyword("is") =>
-            {
+            TokenKind::Bang if matches!(self.peek(1).kind, TokenKind::Equals | TokenKind::DoubleEquals) => 2,
+            TokenKind::Identifier(_) if self.at_keyword("has") || self.at_keyword("lacks") || self.at_keyword("is") => {
                 2
             }
             TokenKind::Pipe => 3,
             TokenKind::Caret => 4,
             TokenKind::Ampersand => 5,
-            TokenKind::LeftAngle | TokenKind::RightAngle
-                if self.peek(1).kind
-                    == self.current().kind =>
-            {
-                7
-            }
+            TokenKind::LeftAngle | TokenKind::RightAngle if self.peek(1).kind == self.current().kind => 7,
             TokenKind::LeftAngle | TokenKind::RightAngle => 6,
             TokenKind::Plus | TokenKind::Minus => 8,
             TokenKind::Star | TokenKind::Slash | TokenKind::Percent => 9,
@@ -1311,10 +1369,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn consume_infix_operator(
-        &mut self,
-        precedence: u8,
-    ) -> Result<InfixOperator, Diagnostic> {
+    fn consume_infix_operator(&mut self, precedence: u8) -> Result<InfixOperator, Diagnostic> {
         let binary = |operator| Ok(InfixOperator::Binary(operator));
         if self.at_keyword("has") || self.at_keyword("lacks") {
             let set = self.at_keyword("has");
@@ -1327,17 +1382,15 @@ impl<'a> Parser<'a> {
             if negated {
                 self.advance();
             }
-            if self.at_keyword("Value")
-                && self.peek(1).kind == TokenKind::LeftAngle
-            {
+            if self.at_keyword("Value") && self.peek(1).kind == TokenKind::LeftAngle {
                 self.advance();
                 self.consume(TokenKind::LeftAngle, "'<'")?;
-                let (type_name, _) =
-                    self.consume_identifier("Value representation type")?;
+                let (type_name, _) = self.consume_identifier("Value representation type")?;
                 self.consume(TokenKind::RightAngle, "'>'")?;
-                return Ok(InfixOperator::ValueTypeTest(
-                    UnaryOperator::ValueTypeTest { type_name, negated },
-                ));
+                return Ok(InfixOperator::ValueTypeTest(UnaryOperator::ValueTypeTest {
+                    type_name,
+                    negated,
+                }));
             }
             return binary(BinaryOperator::Identity { negated });
         }
@@ -1362,23 +1415,15 @@ impl<'a> Parser<'a> {
                 }
                 match (token, or_equal) {
                     (TokenKind::LeftAngle, false) => BinaryOperator::LessThan,
-                    (TokenKind::RightAngle, false) => {
-                        BinaryOperator::GreaterThan
-                    }
-                    (TokenKind::LeftAngle, true) => {
-                        BinaryOperator::LessThanOrEqual
-                    }
-                    (TokenKind::RightAngle, true) => {
-                        BinaryOperator::GreaterThanOrEqual
-                    }
+                    (TokenKind::RightAngle, false) => BinaryOperator::GreaterThan,
+                    (TokenKind::LeftAngle, true) => BinaryOperator::LessThanOrEqual,
+                    (TokenKind::RightAngle, true) => BinaryOperator::GreaterThanOrEqual,
                     _ => unreachable!(),
                 }
             }
             (7, TokenKind::LeftAngle | TokenKind::RightAngle) => {
                 self.advance();
-                if token == TokenKind::RightAngle
-                    && self.current().kind == TokenKind::RightAngle
-                {
+                if token == TokenKind::RightAngle && self.current().kind == TokenKind::RightAngle {
                     self.advance();
                     BinaryOperator::UnsignedRightShift
                 } else if token == TokenKind::LeftAngle {
@@ -1632,7 +1677,7 @@ handler Mod(lhs: Value, rhs: Value) {
     #[test]
     fn rejects_legacy_declaration_and_binding_syntax() {
         let cases = [
-            ("macro check() {}", "expected 'inline fn' or 'handler'"),
+            ("macro check() {}", "expected 'specialize', 'inline fn', or 'handler'"),
             (
                 "handler Check(value: Value) { let Value<i32>(integer) = value else .slow; }",
                 "refutable bindings use 'guard let'",
@@ -1667,6 +1712,27 @@ handler Mod(lhs: Value, rhs: Value) {
                 ..
             }) if callee == "call_slow_path"
         ));
+    }
+
+    #[test]
+    fn accepts_specialization_declarations() {
+        let program = parse(
+            "test.flap",
+            "
+specialize Increment() + JumpLessThan(rhs: Int32);
+handler Increment(dst: inout Operand) { dispatch_next; }
+",
+        )
+        .unwrap();
+
+        assert_eq!(program.declarations.len(), 1);
+    }
+
+    #[test]
+    fn rejects_specialization_declarations_after_other_source() {
+        let error = parse("test.flap", "handler Nop() { dispatch_next; } specialize Nop();").unwrap_err();
+
+        assert_eq!(error.message, "a specialization declaration must begin on a new line");
     }
 
     #[test]
@@ -1706,7 +1772,11 @@ handler Mod(lhs: Value, rhs: Value) {
         let declaration = parse_inline_function(
             "inline fn scalars(a: i8, b: i16, c: i32, d: i64, e: u8, f: u16, g: u32, h: u64, i: f32, j: f64) {}",
         );
-        let types: Vec<_> = declaration.parameters.iter().map(|parameter| parameter.ty.clone()).collect();
+        let types: Vec<_> = declaration
+            .parameters
+            .iter()
+            .map(|parameter| parameter.ty.clone())
+            .collect();
 
         assert_eq!(
             types,
@@ -1841,9 +1911,8 @@ inline fn convert(value: Value, else failure: Label) -> i32 {
 
     #[test]
     fn parses_two_armed_if_statements() {
-        let handler = parse_handler(
-            "handler Choose(value: u32) { if value == 0 { dispatch_next; } else { dispatch_next; } }",
-        );
+        let handler =
+            parse_handler("handler Choose(value: u32) { if value == 0 { dispatch_next; } else { dispatch_next; } }");
 
         assert!(matches!(
             &handler.body.statements[0].kind,
@@ -1858,9 +1927,8 @@ inline fn convert(value: Value, else failure: Label) -> i32 {
 
     #[test]
     fn parses_value_if_as_an_inline_function_tail_expression() {
-        let declaration = parse_inline_function(
-            "inline fn max(lhs: u32, rhs: u32) -> u32 { if lhs >= rhs { lhs } else { rhs } }",
-        );
+        let declaration =
+            parse_inline_function("inline fn max(lhs: u32, rhs: u32) -> u32 { if lhs >= rhs { lhs } else { rhs } }");
 
         assert!(matches!(
             declaration.body.statements.as_slice(),
@@ -1937,9 +2005,7 @@ inline fn convert(value: Value, else failure: Label) -> i32 {
 
     #[test]
     fn parses_typed_bytecode_fields() {
-        let declaration = parse_handler(
-            "handler Call(argument_count: Field<u32>) { dispatch_next; }",
-        );
+        let declaration = parse_handler("handler Call(argument_count: Field<u32>) { dispatch_next; }");
 
         assert_eq!(declaration.parameters[0].ty, Type::Field(Box::new(Type::U32)));
     }
@@ -1955,9 +2021,7 @@ inline fn convert(value: Value, else failure: Label) -> i32 {
 
     #[test]
     fn parses_readable_integer_literals() {
-        let tokens = Lexer::new("integers.flap", "0xffff_ffff 4_294_967_295")
-            .lex()
-            .unwrap();
+        let tokens = Lexer::new("integers.flap", "0xffff_ffff 4_294_967_295").lex().unwrap();
 
         assert_eq!(tokens[0].kind, TokenKind::Integer(0xffff_ffff));
         assert_eq!(tokens[1].kind, TokenKind::Integer(0xffff_ffff));
@@ -2003,6 +2067,26 @@ handler Sub(lhs: i32, rhs: i32) {
         let error = parse("bad.flap", "handler Add(value: Value) { let result: i32 = value }").unwrap_err();
 
         assert_eq!(error.to_string(), "bad.flap:1:53: error: expected ';'");
+    }
+
+    #[test]
+    fn rejects_apostrophes_during_lexing() {
+        let error = parse("bad.flap", "handler Add() { ' }").unwrap_err();
+
+        assert_eq!(error.to_string(), "bad.flap:1:17: error: unexpected character '''");
+    }
+
+    #[test]
+    fn parses_single_byte_mutations_without_panicking() {
+        let seed = b"handler Add(lhs: i32, rhs: i32) { let value = lhs + rhs; assert_nonzero(value); dispatch_next; }";
+        for index in 0..seed.len() {
+            for replacement in [b' ', b'\n', b'{', b'}', b'(', b')', b';', b'0', b'a'] {
+                let mut mutated = seed.to_vec();
+                mutated[index] = replacement;
+                let source = std::str::from_utf8(&mutated).unwrap();
+                let _ = parse("mutated.flap", source);
+            }
+        }
     }
 
     #[test]

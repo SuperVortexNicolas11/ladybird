@@ -79,6 +79,8 @@ ComputedValues::ComputedValues()
 
 ComputedValues::~ComputedValues()
 {
+    if (m_style_container)
+        ComputedValuesFFI::rust_style_container_unref(m_style_container, to_underlying(StyleGroupIndex::Count));
     --s_statistics.live_instance_count;
 }
 
@@ -155,6 +157,12 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
     };
     auto length_style_value = [](CSSPixels length) {
         return LengthStyleValue::create(Length::make_px(length));
+    };
+    auto grid_style_value_or_initial = [&](ComputedValuesFFI::ComputedStyleValueHandle const& handle) -> NonnullRefPtr<StyleValue const> {
+        static_assert(sizeof(RustStyleValueHandle) == sizeof(handle));
+        if (auto value = style_value_from_handle(property_id, reinterpret_cast<RustStyleValueHandle const&>(handle)))
+            return value.release_nonnull();
+        return property_initial_value(property_id);
     };
     auto border_image_slice_style_value = [](BorderImageSliceValue const& value) -> NonnullRefPtr<StyleValue const> {
         return value.visit(
@@ -1072,6 +1080,8 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
         return length_percentage_style_value(cx());
     case PropertyID::Cy:
         return length_percentage_style_value(cy());
+    case PropertyID::D:
+        return d();
     case PropertyID::Direction:
         return KeywordStyleValue::create(to_keyword(direction()));
     case PropertyID::EmptyCells:
@@ -1095,27 +1105,27 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
     case PropertyID::Filter:
         return filter_style_value(filter());
     case PropertyID::GridAutoColumns:
-        return GridTrackSizeListStyleValue::create(grid_auto_columns());
+        return grid_style_value_or_initial(m_noninherited.grid->grid_auto_columns_style_value);
     case PropertyID::GridAutoFlow:
         return GridAutoFlowStyleValue::create(
             grid_auto_flow().row ? GridAutoFlowStyleValue::Axis::Row : GridAutoFlowStyleValue::Axis::Column,
             grid_auto_flow().dense ? GridAutoFlowStyleValue::Dense::Yes : GridAutoFlowStyleValue::Dense::No);
     case PropertyID::GridAutoRows:
-        return GridTrackSizeListStyleValue::create(grid_auto_rows());
+        return grid_style_value_or_initial(m_noninherited.grid->grid_auto_rows_style_value);
     case PropertyID::GridColumnEnd:
-        return GridTrackPlacementStyleValue::create(grid_column_end());
+        return grid_style_value_or_initial(m_noninherited.grid->grid_column_end_style_value);
     case PropertyID::GridColumnStart:
-        return GridTrackPlacementStyleValue::create(grid_column_start());
+        return grid_style_value_or_initial(m_noninherited.grid->grid_column_start_style_value);
     case PropertyID::GridRowEnd:
-        return GridTrackPlacementStyleValue::create(grid_row_end());
+        return grid_style_value_or_initial(m_noninherited.grid->grid_row_end_style_value);
     case PropertyID::GridRowStart:
-        return GridTrackPlacementStyleValue::create(grid_row_start());
+        return grid_style_value_or_initial(m_noninherited.grid->grid_row_start_style_value);
     case PropertyID::GridTemplateAreas:
-        return GridTemplateAreaStyleValue::create(grid_template_areas().areas, grid_template_areas().row_count, grid_template_areas().column_count);
+        return grid_style_value_or_initial(m_noninherited.grid->grid_template_areas_style_value);
     case PropertyID::GridTemplateColumns:
-        return GridTrackSizeListStyleValue::create(grid_template_columns());
+        return grid_style_value_or_initial(m_noninherited.grid->grid_template_columns_style_value);
     case PropertyID::GridTemplateRows:
-        return GridTrackSizeListStyleValue::create(grid_template_rows());
+        return grid_style_value_or_initial(m_noninherited.grid->grid_template_rows_style_value);
     case PropertyID::FontVariantEmoji:
         return KeywordStyleValue::create(to_keyword(font_variant_emoji()));
     case PropertyID::ImageRendering:
@@ -2230,10 +2240,10 @@ CSSPixels ComputedProperties::line_height(FontComputer const& font_computer) con
     VERIFY_NOT_REACHED();
 }
 
-LineHeightData ComputedProperties::line_height_data(FontComputer const& font_computer) const
+LineHeightData ComputedProperties::line_height_data() const
 {
     auto const& value = property(PropertyID::LineHeight);
-    LineHeightData data { .used_value = line_height(font_computer) };
+    LineHeightData data;
 
     if (value.is_keyword() && value.to_keyword() == Keyword::Normal) {
         data.computed_value = LineHeightData::Normal {};
@@ -2285,6 +2295,19 @@ Optional<SVGPaint> ComputedProperties::stroke(ColorResolutionContext const& colo
     return SVGPaint::from_style_value(value, color_resolution_context);
 }
 
+LengthPercentage ComputedProperties::stroke_width() const
+{
+    auto const& value = property(PropertyID::StrokeWidth);
+
+    if (value.is_number() || (value.is_calculated() && value.as_calculated().resolves_to_number())) {
+        // FIXME: Converting to pixels isn't really correct - values should be in "user units"
+        //        https://svgwg.org/svg2-draft/coords.html#TermUserUnits
+        return CSS::Length::make_px(CSSPixels::nearest_value_for(number_from_style_value(value, {})));
+    }
+
+    return CSS::LengthPercentage::from_style_value(value);
+}
+
 Vector<Variant<LengthPercentage, float>> ComputedProperties::stroke_dasharray() const
 {
     auto const& value = property(PropertyID::StrokeDasharray);
@@ -2319,6 +2342,19 @@ Vector<Variant<LengthPercentage, float>> ComputedProperties::stroke_dasharray() 
     }
 
     return dashes;
+}
+
+LengthPercentage ComputedProperties::stroke_dashoffset() const
+{
+    auto const& value = property(PropertyID::StrokeDashoffset);
+
+    if (value.is_number() || (value.is_calculated() && value.as_calculated().resolves_to_number())) {
+        // FIXME: Converting to pixels isn't really correct - values should be in "user units"
+        //        https://svgwg.org/svg2-draft/coords.html#TermUserUnits
+        return CSS::Length::make_px(CSSPixels::nearest_value_for(number_from_style_value(value, {})));
+    }
+
+    return CSS::LengthPercentage::from_style_value(value);
 }
 
 StrokeLinecap ComputedProperties::stroke_linecap() const
@@ -2527,15 +2563,15 @@ BorderImageData ComputedProperties::border_image() const
         .source = source.is_abstract_image() ? RefPtr { source.as_abstract_image() } : nullptr,
         .slice = { convert_slice(slice.top()), convert_slice(slice.right()), convert_slice(slice.bottom()), convert_slice(slice.left()) },
         .width = expand_sides(property(PropertyID::BorderImageWidth), [](StyleValue const& value) -> BorderImageWidthValue {
-            if (value.is_number())
-                return value.as_number().number();
+            if (value.is_number() || (value.is_calculated() && value.as_calculated().resolves_to_number()))
+                return number_from_style_value(value, {});
             if (value.to_keyword() == Keyword::Auto)
                 return BorderImageWidthAuto {};
             return LengthPercentage::from_style_value(value);
         }),
         .outset = expand_sides(property(PropertyID::BorderImageOutset), [](StyleValue const& value) -> BorderImageOutsetValue {
-            if (value.is_number())
-                return value.as_number().number();
+            if (value.is_number() || (value.is_calculated() && value.as_calculated().resolves_to_number()))
+                return number_from_style_value(value, {});
             return Length::from_style_value(value, {});
         }),
         .width_value_count = component_count(property(PropertyID::BorderImageWidth)),
@@ -3822,6 +3858,35 @@ TouchActionData ComputedProperties::touch_action() const
         return touch_action_data;
     }
     return TouchActionData {};
+}
+
+AspectRatio ComputedProperties::aspect_ratio() const
+{
+    auto const& value = property(PropertyID::AspectRatio);
+
+    if (value.is_value_list()) {
+        auto const& values = value.as_value_list().values();
+        if (values.size() == 2
+            && values[0]->is_keyword() && values[0]->as_keyword().keyword() == Keyword::Auto
+            && values[1]->is_ratio()) {
+            auto ratio = values[1]->as_ratio().resolved();
+            if (ratio.is_degenerate())
+                return { true, {}, true, ratio };
+            return { true, ratio, true, ratio };
+        }
+        return InitialValues::aspect_ratio();
+    }
+
+    if (value.is_ratio()) {
+        // https://drafts.csswg.org/css-sizing-4/#aspect-ratio
+        // If the <ratio> is degenerate, the property instead behaves as auto.
+        auto ratio = value.as_ratio().resolved();
+        if (ratio.is_degenerate())
+            return { true, {}, false, ratio };
+        return { false, ratio, false, ratio };
+    }
+
+    return InitialValues::aspect_ratio();
 }
 
 Containment ComputedProperties::contain() const

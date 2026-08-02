@@ -387,6 +387,7 @@ void PageClient::set_window_size(Web::DevicePixelSize size)
 void PageClient::compositor_process_lost()
 {
     page().notify_all_webgl_contexts_lost();
+    page().detach_all_media_element_video_sinks_after_compositor_lost();
 }
 
 void PageClient::compositor_process_reconnected()
@@ -400,7 +401,7 @@ void PageClient::compositor_process_reconnected()
     page().top_level_traversable()->repaint_after_compositor_process_reconnect();
     page().notify_all_canvas_elements_of_lost_backing_storage();
     page().prepare_canvas_contexts_for_compositing();
-    page().update_all_media_element_video_sinks();
+    page().restore_all_media_element_video_sinks();
     Web::HTML::main_thread_event_loop().queue_task_to_update_the_rendering();
 }
 
@@ -1202,6 +1203,31 @@ void PageClient::page_did_update_session_history_entry_navigation_api_state(Web:
 void PageClient::page_did_update_session_history_entry_scroll_restoration_mode(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, Web::HTML::ScrollRestorationMode scroll_restoration_mode)
 {
     client().async_did_update_session_history_entry_scroll_restoration_mode(m_id, navigable_id, navigation_api_key, scroll_restoration_mode);
+}
+
+void PageClient::page_did_update_session_history_entry_scroll_position_data(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, Web::HTML::SessionHistoryEntryScrollPositionData const& scroll_position_data)
+{
+    client().async_did_update_session_history_entry_scroll_position_data(m_id, navigable_id, navigation_api_key, scroll_position_data);
+}
+
+void PageClient::page_did_update_session_history_entry_document_state_navigable_target_name(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, Utf16String const& navigable_target_name)
+{
+    client().async_did_update_session_history_entry_document_state_navigable_target_name(m_id, navigable_id, navigation_api_key, navigable_target_name);
+}
+
+void PageClient::page_did_set_session_history_entry_document_state_reload_pending(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, bool reload_pending)
+{
+    client().async_did_set_session_history_entry_document_state_reload_pending(m_id, navigable_id, navigation_api_key, reload_pending);
+}
+
+void PageClient::page_did_append_nested_history(Web::HTML::CrossProcessId parent_navigable_id, Web::HTML::SessionHistoryNestedHistoryDescriptor const& nested_history)
+{
+    client().async_did_append_nested_history(m_id, parent_navigable_id, nested_history);
+}
+
+void PageClient::page_did_remove_nested_history(Web::HTML::CrossProcessId parent_navigable_id, Web::HTML::CrossProcessId child_navigable_id)
+{
+    client().async_did_remove_nested_history(m_id, parent_navigable_id, child_navigable_id);
 }
 
 String PageClient::page_did_request_ui_process_session_history_for_testing()
