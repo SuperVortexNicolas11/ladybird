@@ -7,9 +7,8 @@
 #include <AK/Utf16View.h>
 #include <LibGfx/CanvasCommandList.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/HTML/Canvas/CanvasHost.h>
 #include <LibWeb/HTML/Canvas/DrawingState.h>
-#include <LibWeb/HTML/HTMLCanvasElement.h>
-#include <LibWeb/HTML/OffscreenCanvas.h>
 
 #pragma once
 
@@ -17,8 +16,7 @@ namespace Web::HTML {
 
 class AbstractCanvasMixin {
 protected:
-    virtual Variant<GC::Ref<HTMLCanvasElement>, GC::Ref<OffscreenCanvas>> canvas_element() = 0;
-    virtual Variant<GC::Ref<HTMLCanvasElement>, GC::Ref<OffscreenCanvas>> canvas_element() const = 0;
+    virtual CanvasHost& canvas_host() const = 0;
     virtual DrawingState& drawing_state() = 0;
     virtual DrawingState const& drawing_state() const = 0;
     virtual JS::Realm& my_realm() = 0;
@@ -28,6 +26,19 @@ protected:
     virtual void set_font(Utf16View font) = 0;
     virtual float resolved_letter_spacing() const = 0;
     Optional<Color> parse_a_css_color_value(Utf16View value) const;
+
+private:
+    // Context-independent simple colors store a resolved color. Other colors store their parsed style value so they
+    // can be resolved against the current canvas context on every use. A cache entry with neither is a parse failure.
+    struct ColorCacheEntry {
+        Utf16String input;
+        RefPtr<CSS::StyleValue const> parsed_value;
+        Optional<Color> resolved_color;
+    };
+
+    static constexpr size_t max_color_cache_size = 8;
+    static constexpr size_t max_color_cache_input_length = 128;
+    mutable Vector<ColorCacheEntry> m_color_cache;
 };
 
 }

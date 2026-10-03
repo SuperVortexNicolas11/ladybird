@@ -20,6 +20,7 @@
 #include <LibURL/Parser.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/CookieJar.h>
+#include <LibWebView/FaviconStore.h>
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Profile.h>
@@ -159,21 +160,26 @@ TEST_CASE(profile_settings_and_bookmarks_are_isolated)
     auto second_profile = MUST(WebView::Profile::create({ .name = "second" }, roots()));
 
     auto first_settings_path = LexicalPath::join(first_profile.paths().config, "Settings.json"sv).string();
-    auto second_settings_path = LexicalPath::join(second_profile.paths().config, "Settings.json"sv).string();
     auto first_settings = WebView::Settings::create(first_settings_path);
-    first_settings.set_show_menu_bar(true);
+    auto first_settings_background_networking_enabled = !first_settings.background_networking_enabled();
+    first_settings.set_background_networking_enabled(first_settings_background_networking_enabled);
+
+    auto second_settings_path = LexicalPath::join(second_profile.paths().config, "Settings.json"sv).string();
     auto second_settings = WebView::Settings::create(second_settings_path);
-    EXPECT(!second_settings.show_menu_bar());
-    EXPECT(WebView::Settings::create(first_settings_path).show_menu_bar());
+    EXPECT_NE(first_settings_background_networking_enabled, second_settings.background_networking_enabled());
+    EXPECT_EQ(first_settings_background_networking_enabled, WebView::Settings::create(first_settings_path).background_networking_enabled());
 
     auto first_bookmarks_path = LexicalPath::join(first_profile.paths().config, "Bookmarks.json"sv).string();
     auto second_bookmarks_path = LexicalPath::join(second_profile.paths().config, "Bookmarks.json"sv).string();
     auto url = URL::Parser::basic_parse("https://profile-isolation.example/"sv).release_value();
     auto first_bookmarks = WebView::BookmarkStore::create(first_bookmarks_path);
-    first_bookmarks.add_bookmark(url, {}, {});
+    first_bookmarks.add_bookmark(url, {}, "favicon-hash"_string);
+    EXPECT(first_bookmarks.favicon_hashes().contains("favicon-hash"sv));
     auto second_bookmarks = WebView::BookmarkStore::create(second_bookmarks_path);
     EXPECT(!second_bookmarks.is_bookmarked(url));
-    EXPECT(WebView::BookmarkStore::create(first_bookmarks_path).is_bookmarked(url));
+    auto reloaded_first_bookmarks = WebView::BookmarkStore::create(first_bookmarks_path);
+    EXPECT(reloaded_first_bookmarks.is_bookmarked(url));
+    EXPECT(reloaded_first_bookmarks.favicon_hashes().contains("favicon-hash"sv));
     remove_test_root();
 }
 
@@ -231,6 +237,7 @@ TEST_CASE(profile_databases_are_isolated)
 
     {
         auto database = TRY_OR_FAIL(Database::Database::create(first_profile.paths().data, "History"sv));
+        EXPECT_EQ(TRY_OR_FAIL(WebView::FaviconStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
         EXPECT_EQ(TRY_OR_FAIL(WebView::HistoryStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
         auto history_store = TRY_OR_FAIL(WebView::HistoryStore::create(*database));
         history_store->record_visit(url, "First profile"_string, UnixDateTime::from_seconds_since_epoch(1));
@@ -238,6 +245,7 @@ TEST_CASE(profile_databases_are_isolated)
 
     {
         auto database = TRY_OR_FAIL(Database::Database::create(second_profile.paths().data, "History"sv));
+        EXPECT_EQ(TRY_OR_FAIL(WebView::FaviconStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
         EXPECT_EQ(TRY_OR_FAIL(WebView::HistoryStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
         auto history_store = TRY_OR_FAIL(WebView::HistoryStore::create(*database));
         EXPECT(!history_store->entry_for_url(url).has_value());

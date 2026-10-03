@@ -13,11 +13,12 @@
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibJS/Runtime/DataView.h>
 #include <LibJS/Runtime/TypedArray.h>
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/WebGL/Types.h>
 #include <LibWeb/WebIDL/Buffers.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 #define SET_ERROR_VALUE_IF_ERROR(expression, error_value) \
     ({                                                    \
@@ -41,8 +42,11 @@ static constexpr int MAX_CLIENT_WAIT_TIMEOUT_WEBGL = 0x9247;
 // NOTE: This is the Variant created by the IDL wrapper generator, and needs to be updated accordingly.
 using TexImageSource = Variant<GC::Ref<HTML::ImageBitmap>, GC::Ref<HTML::ImageData>, GC::Ref<HTML::HTMLImageElement>, GC::Ref<HTML::HTMLCanvasElement>, GC::Ref<HTML::OffscreenCanvas>, GC::Ref<HTML::HTMLVideoElement>>;
 
-class WebGLRenderingContextBase : public Bindings::PlatformObject {
-    WEB_NON_IDL_PLATFORM_OBJECT(WebGLRenderingContextBase, Bindings::PlatformObject);
+using CanvasOwner = Variant<GC::Ref<HTML::HTMLCanvasElement>, GC::Ref<HTML::OffscreenCanvas>>;
+HTML::CanvasHost& canvas_host_for(CanvasOwner const&);
+
+class WebGLRenderingContextBase : public Bindings::GCAllocatedWrappable {
+    WEB_NON_IDL_WRAPPABLE(WebGLRenderingContextBase, Bindings::GCAllocatedWrappable);
 
 public:
     using Float32List = Variant<GC::Ref<JS::Float32Array>, Vector<float>>;
@@ -50,9 +54,11 @@ public:
     using Uint32List = Variant<GC::Ref<JS::Uint32Array>, Vector<WebIDL::UnsignedLong>>;
 
     virtual WebGLContextProxy& context() = 0;
-    virtual GC::Ref<HTML::HTMLCanvasElement> canvas_for_binding() const = 0;
+    virtual CanvasOwner canvas_for_binding() const = 0;
+    HTML::CanvasHost& canvas_host() const { return canvas_host_for(canvas_for_binding()); }
 
     u64 context_generation() const { return m_context_generation; }
+    JS::Realm& realm() const { return *m_realm; }
 
     bool is_context_lost() const;
 
@@ -73,7 +79,7 @@ public:
     GC::Ref<WebIDL::Promise> make_xr_compatible();
 
     Optional<Vector<Utf16String>> get_supported_extensions();
-    JS::Object* get_extension(Utf16String const& name);
+    GC::Ptr<JS::Object> get_extension(JS::Realm&, Utf16String const& name);
 
     void enable_compressed_texture_format(WebIDL::UnsignedLong format);
 
@@ -86,6 +92,7 @@ protected:
     WebGLRenderingContextBase(JS::Realm&);
 
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual GC::Ptr<Bindings::Wrappable> relevant_global_impl() const override;
 
     // Builds a fresh transport and host context against the reconnected compositor and
     // rebinds the proxy to it. Returns false if no compositor is available. WebGL1/2
@@ -96,6 +103,8 @@ protected:
     // FIXME: Make this and any another instance of extension names a FlyString, similarly to HTML::TagNames
     bool extension_enabled(StringView extension) const;
     ReadonlySpan<WebIDL::UnsignedLong> enabled_compressed_texture_formats() const;
+
+    ErrorOr<ReadonlyBytes> texture_data_for_2d_upload(ReadonlyBytes, GLsizei width, GLsizei height, GLenum format, GLenum type) const;
 
     template<typename T>
     static ErrorOr<Span<T>> get_offset_span(Span<T> src_span, WebIDL::UnsignedLongLong src_offset, WebIDL::UnsignedLong src_length_override = 0)
@@ -116,6 +125,15 @@ protected:
     template<typename Callback>
     static ErrorOr<void> with_buffer_source_bytes(WebIDL::BufferSource src_data, WebIDL::UnsignedLongLong src_offset, WebIDL::UnsignedLong src_length_override, Callback&& callback)
     {
+        auto invoke_callback = [&](ReadonlyBytes bytes) -> ErrorOr<void> {
+            if constexpr (IsSame<decltype(callback(bytes)), void>) {
+                callback(bytes);
+                return {};
+            } else {
+                return callback(bytes);
+            }
+        };
+
         auto array_buffer = src_data.viewed_array_buffer();
         if (!array_buffer || array_buffer->is_detached()) [[unlikely]]
             return Error::from_errno(EINVAL);
@@ -123,8 +141,7 @@ protected:
         if (src_data.is_out_of_bounds()) {
             if (src_offset != 0 || src_length_override != 0) [[unlikely]]
                 return Error::from_errno(EINVAL);
-            callback(ReadonlyBytes {});
-            return {};
+            return invoke_callback({});
         }
 
         auto element_size = src_data.element_size();
@@ -152,10 +169,7 @@ protected:
         if (byte_length > array_buffer->byte_length() - byte_offset_in_buffer.value()) [[unlikely]]
             return Error::from_errno(EINVAL);
 
-        array_buffer->with_readonly_bytes(byte_offset_in_buffer.value(), byte_length, [&](ReadonlyBytes bytes) {
-            callback(bytes);
-        });
-        return {};
+        return array_buffer->with_readonly_bytes(byte_offset_in_buffer.value(), byte_length, invoke_callback);
     }
 
     template<typename T>
@@ -295,6 +309,8 @@ protected:
     void set_error(GLenum error);
     void reset_context_state_after_loss();
 
+    PixelUnpackState m_unpack_state;
+
     // UNPACK_FLIP_Y_WEBGL of type boolean
     //      If set, then during any subsequent calls to texImage2D or texSubImage2D, the source data is flipped along
     //      the vertical axis, so that conceptually the last row is the first one transferred. The initial value is false.
@@ -331,10 +347,12 @@ private:
     u64 m_context_generation { 0 };
 
     Vector<WebIDL::UnsignedLong> m_enabled_compressed_texture_formats;
+    GC::Ref<JS::Realm> m_realm;
 
     // Extensions
     // "Multiple calls to getExtension with the same extension string, taking into account case-insensitive comparison, must return the same object as long as the extension is enabled."
-    HashMap<String, GC::Ref<JS::Object>, AK::ASCIICaseInsensitiveStringTraits> m_enabled_extensions;
+    HashMap<String, GC::Ref<Bindings::Wrappable>, AK::ASCIICaseInsensitiveStringTraits> m_enabled_extensions;
+    HashMap<String, OwnPtr<Bindings::WrapperWorldWeakValueCache<JS::Object>>, AK::ASCIICaseInsensitiveStringTraits> m_enabled_empty_extensions;
 };
 
 }

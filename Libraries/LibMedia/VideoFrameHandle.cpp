@@ -45,7 +45,7 @@ VideoFrameHandle VideoFrameHandle::for_frame(VideoFrame const& frame)
     u32 slot_index = 0;
     u64 slot_acquisition_id = 0;
     if (auto const* pool_slot = frame.pool_slot()) {
-        pool_id = pool_slot->pool().id();
+        pool_id = pool_slot->ledger().id();
         slot_index = pool_slot->slot_index();
         slot_acquisition_id = pool_slot->slot_acquisition_id();
     } else {
@@ -56,47 +56,22 @@ VideoFrameHandle VideoFrameHandle::for_frame(VideoFrame const& frame)
         slot_acquisition_id = resolved_slot->slot_acquisition_id();
     }
 
-    auto const& yuv_data = frame.yuv_data();
     return VideoFrameHandle {
         .pool_id = pool_id,
         .slot_index = slot_index,
         .slot_acquisition_id = slot_acquisition_id,
         .timestamp = frame.timestamp(),
         .duration = frame.duration(),
-        .size = yuv_data.size(),
-        .bit_depth = yuv_data.bit_depth(),
-        .subsampling = yuv_data.subsampling(),
-        .cicp = yuv_data.cicp(),
+        .size = frame.size().to_type<int>(),
+        .bit_depth = frame.bit_depth(),
+        .subsampling = frame.subsampling(),
+        .cicp = frame.cicp(),
     };
 }
 
 }
 
 namespace IPC {
-
-static bool color_primaries_ipc_value_valid(Media::ColorPrimaries color_primaries)
-{
-    return color_primaries == Media::ColorPrimaries::Unspecified
-        || Media::color_primaries_valid(color_primaries);
-}
-
-static bool transfer_characteristics_ipc_value_valid(Media::TransferCharacteristics transfer_characteristics)
-{
-    return transfer_characteristics == Media::TransferCharacteristics::Unspecified
-        || Media::transfer_characteristics_valid(transfer_characteristics);
-}
-
-static bool matrix_coefficients_ipc_value_valid(Media::MatrixCoefficients matrix_coefficients)
-{
-    return matrix_coefficients == Media::MatrixCoefficients::Unspecified
-        || Media::matrix_coefficients_valid(matrix_coefficients);
-}
-
-static bool video_full_range_flag_ipc_value_valid(Media::VideoFullRangeFlag video_full_range_flag)
-{
-    return video_full_range_flag == Media::VideoFullRangeFlag::Unspecified
-        || Media::video_full_range_flag_valid(video_full_range_flag);
-}
 
 template<>
 ErrorOr<void> encode(Encoder& encoder, Media::VideoFrameHandle const& handle)
@@ -110,10 +85,7 @@ ErrorOr<void> encode(Encoder& encoder, Media::VideoFrameHandle const& handle)
     TRY(encoder.encode(handle.bit_depth));
     TRY(encoder.encode(handle.subsampling.x()));
     TRY(encoder.encode(handle.subsampling.y()));
-    TRY(encoder.encode(handle.cicp.color_primaries()));
-    TRY(encoder.encode(handle.cicp.transfer_characteristics()));
-    TRY(encoder.encode(handle.cicp.matrix_coefficients()));
-    TRY(encoder.encode(handle.cicp.video_full_range_flag()));
+    TRY(encoder.encode(handle.cicp));
     return {};
 }
 
@@ -132,19 +104,7 @@ ErrorOr<Media::VideoFrameHandle> decode(Decoder& decoder)
         TRY(decoder.decode<bool>()),
         TRY(decoder.decode<bool>()),
     };
-    handle.cicp = Media::CodingIndependentCodePoints {
-        TRY(decoder.decode<Media::ColorPrimaries>()),
-        TRY(decoder.decode<Media::TransferCharacteristics>()),
-        TRY(decoder.decode<Media::MatrixCoefficients>()),
-        TRY(decoder.decode<Media::VideoFullRangeFlag>()),
-    };
-
-    if (!color_primaries_ipc_value_valid(handle.cicp.color_primaries())
-        || !transfer_characteristics_ipc_value_valid(handle.cicp.transfer_characteristics())
-        || !matrix_coefficients_ipc_value_valid(handle.cicp.matrix_coefficients())
-        || !video_full_range_flag_ipc_value_valid(handle.cicp.video_full_range_flag()))
-        return Error::from_string_literal("IPC: VideoFrameHandle contained invalid CICP metadata");
-
+    handle.cicp = TRY(decoder.decode<Media::CodingIndependentCodePoints>());
     return handle;
 }
 

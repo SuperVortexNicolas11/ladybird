@@ -41,3 +41,40 @@ TEST_CASE(parsing_a_reserved_label_length_fails)
     auto result = DNS::Messages::Message::from_raw(stream);
     EXPECT(result.is_error());
 }
+
+TEST_CASE(parsing_an_extended_rsa_exponent_length_uses_network_order)
+{
+    auto public_key = MUST(ByteBuffer::create_uninitialized(3 + 256 + 2));
+    public_key[0] = 0;
+    public_key[1] = 1;
+    public_key[2] = 0;
+    for (size_t i = 3; i < public_key.size(); ++i)
+        public_key[i] = i < 3 + 256 ? 0xee : 0xaa;
+
+    DNS::Messages::Records::DNSKEY key {
+        257, 3, DNS::Messages::DNSSEC::Algorithm::RSASHA256, move(public_key), 0
+    };
+    auto components = MUST(key.rsa_public_key_components());
+    EXPECT_EQ(components.exponent, ReadonlyBytes(key.public_key.data() + 3, 256));
+    EXPECT_EQ(components.modulus, ReadonlyBytes(key.public_key.data() + 259, 2));
+}
+
+TEST_CASE(domain_name_validity)
+{
+    EXPECT(DNS::Messages::DomainName::from_string(""sv).is_valid());
+    EXPECT(DNS::Messages::DomainName::from_string("."sv).is_valid());
+    EXPECT(DNS::Messages::DomainName::from_string("."sv).labels.is_empty());
+    EXPECT(DNS::Messages::DomainName::from_string("example.com"sv).is_valid());
+    EXPECT(DNS::Messages::DomainName::from_string("example.com."sv).is_valid());
+    EXPECT_EQ(DNS::Messages::DomainName::from_string("example.com."sv).labels.size(), 2u);
+    EXPECT(!DNS::Messages::DomainName::from_string("example.com.."sv).is_valid());
+    EXPECT(!DNS::Messages::DomainName::from_string("example..com"sv).is_valid());
+    EXPECT(!DNS::Messages::DomainName::from_string(".example.com"sv).is_valid());
+    EXPECT(!DNS::Messages::DomainName::from_string(ByteString::repeated('a', 64)).is_valid());
+
+    StringBuilder overlong;
+    for (size_t i = 0; i < 5; ++i)
+        overlong.appendff("{}.", ByteString::repeated('a', 63));
+    overlong.append('a');
+    EXPECT(!DNS::Messages::DomainName::from_string(overlong.string_view()).is_valid());
+}

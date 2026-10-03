@@ -7,8 +7,11 @@
 #pragma once
 
 #include <QColor>
-#include <QPalette>
 #include <QString>
+
+class QAbstractButton;
+class QPainter;
+class QPalette;
 
 namespace Ladybird::ChromeStyle {
 
@@ -33,13 +36,23 @@ QString style_sheet_color(QColor const&);
 QString application_style_sheet(QPalette const&);
 QString toolbar_container_style_sheet(QPalette const&);
 QString menu_bar_style_sheet(QPalette const&);
+QString hamburger_style_sheet(QPalette const&);
 QString location_edit_style_sheet(QPalette const&);
 QString bookmarks_bar_style_sheet(QPalette const&);
 QString find_in_page_style_sheet(QPalette const&);
+QString javascript_dialog_style_sheet(QPalette const&);
+QString crash_report_review_style_sheet(QPalette const&);
+QColor crash_report_review_placeholder_text(QPalette const&);
 QString devtools_banner_style_sheet(QPalette const&);
 QString tab_widget_style_sheet(QPalette const&);
 QString autocomplete_popup_style_sheet(QPalette const&);
 QString downloads_popover_style_sheet(QPalette const&);
 QString private_session_popover_style_sheet(QPalette const&);
+
+enum class CircularControlFrameStyle {
+    InteractionOnly,
+    ActiveTabOverlay,
+};
+void paint_circular_control_frame(QPainter&, QAbstractButton const&, CircularControlFrameStyle = CircularControlFrameStyle::InteractionOnly);
 
 }

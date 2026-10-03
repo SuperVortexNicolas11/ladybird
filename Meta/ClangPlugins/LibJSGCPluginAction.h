@@ -17,6 +17,7 @@ struct LibJSCellMacro {
         JSEnvironment,
         JSPrototypeObject,
         WebPlatformObject,
+        WebWrappable,
     };
 
     struct Arg {
@@ -62,6 +63,7 @@ public:
 
     bool VisitCXXRecordDecl(clang::CXXRecordDecl*);
     bool VisitCXXMethodDecl(clang::CXXMethodDecl*);
+    bool VisitCXXConstructExpr(clang::CXXConstructExpr*);
 
 private:
     struct CellMacroExpectation {

@@ -164,7 +164,7 @@ def signature(function: dict, payload_used: bool) -> str:
     payload = "ReadonlyBytes payload" if payload_used else "ReadonlyBytes"
     return (
         f"ErrorOr<void> replay_webgl_command(OpenGLContext& gl, {objects}, "
-        f"Web::WebGL::Commands::{command_name(function)} {command}, {payload})"
+        f"Compositing::WebGL::Commands::{command_name(function)} {command}, {payload})"
     )
 
 
@@ -258,7 +258,11 @@ def sync_signature(function: dict, payload_used: bool, objects_used: bool) -> st
     objects = "WebGLObjectMap& objects" if objects_used else "WebGLObjectMap&"
     payload = "ReadonlyBytes payload" if payload_used else "ReadonlyBytes"
     return (
-        f"static ByteBuffer handle_one(OpenGLContext& gl, {objects}, SyncCalls::{name}::Request {request}, {payload})"
+        # The dispatcher invokes these through a templated callback. Some compilers do not
+        # count that dependent call as a reference for -Wunused-function, even though the
+        # overload is required at runtime for its sync-call type. Keep the generated local
+        # handlers and make that intent explicit.
+        f"[[maybe_unused]] static ByteBuffer handle_one(OpenGLContext& gl, {objects}, SyncCalls::{name}::Request {request}, {payload})"
     )
 
 
@@ -268,7 +272,7 @@ def write_header_file(out: TextIO, functions: list) -> None:
 #include <AK/Error.h>
 #include <Compositor/WebGLObjectMap.h>
 #include <Compositor/OpenGLContext.h>
-#include <LibWeb/WebGL/WebGLCommandList.h>
+#include <LibCompositing/WebGL/WebGLCommandList.h>
 
 namespace Compositor {
 """)
@@ -277,7 +281,7 @@ namespace Compositor {
             continue
         out.write(
             f"ErrorOr<void> replay_webgl_command(OpenGLContext&, WebGLObjectMap&, "
-            f"Web::WebGL::Commands::{command_name(function)} const&, ReadonlyBytes);\n"
+            f"Compositing::WebGL::Commands::{command_name(function)} const&, ReadonlyBytes);\n"
         )
     out.write("""
 // Wire-specified ops; defined manually in HostWebGLContext.cpp. Builtin commands carry
@@ -288,13 +292,13 @@ namespace Compositor {
         if function["category"] == "custom" and is_wire_command(function):
             out.write(
                 f"ErrorOr<void> replay_webgl_command(OpenGLContext&, WebGLObjectMap&, "
-                f"Web::WebGL::Commands::{command_name(function)} const&, ReadonlyBytes);\n"
+                f"Compositing::WebGL::Commands::{command_name(function)} const&, ReadonlyBytes);\n"
             )
     for function in functions:
         if is_wire_sync(function):
             out.write(
                 f"ErrorOr<ByteBuffer> handle_one(OpenGLContext&, WebGLObjectMap&, "
-                f"Web::WebGL::SyncCalls::{command_name(function)}::Request const&, ReadonlyBytes);\n"
+                f"Compositing::WebGL::SyncCalls::{command_name(function)}::Request const&, ReadonlyBytes);\n"
             )
     out.write("""
 ErrorOr<ByteBuffer> handle_webgl_sync_call(OpenGLContext&, WebGLObjectMap&, ReadonlyBytes request);
@@ -310,7 +314,7 @@ def write_implementation_file(out: TextIO, functions: list) -> None:
 
 namespace Compositor {
 
-using namespace Web::WebGL;
+using namespace Compositing::WebGL;
 
 """)
     for function in functions:

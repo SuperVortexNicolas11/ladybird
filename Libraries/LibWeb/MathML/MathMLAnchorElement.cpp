@@ -20,12 +20,6 @@ MathMLAnchorElement::MathMLAnchorElement(DOM::Document& document, DOM::Qualified
 
 MathMLAnchorElement::~MathMLAnchorElement() = default;
 
-void MathMLAnchorElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(MathMLAnchorElement);
-    Base::initialize(realm);
-}
-
 // https://w3c.github.io/mathml-core/#dom-mathmlanchorelement-href
 Utf16String MathMLAnchorElement::href() const
 {
@@ -58,7 +52,7 @@ void MathMLAnchorElement::set_href(Utf16String const& href)
 void MathMLAnchorElement::set_the_url()
 {
     // 1. If this element's href content attribute is absent, then return.
-    auto href = get_attribute_value_view(MathML::AttributeNames::href);
+    auto href = attribute(MathML::AttributeNames::href);
     if (!href.has_value())
         return;
 

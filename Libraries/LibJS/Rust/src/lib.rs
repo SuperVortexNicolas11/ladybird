@@ -52,8 +52,12 @@
 //! - `bytecode/` — Bytecode generator, instruction types, and FFI
 //! - `scope_collector.rs` — Scope analysis
 
+/// cbindgen:ignore
 #[path = "../../../RustAllocator.rs"]
 mod rust_allocator;
+
+#[path = "../../../RustPanic.rs"]
+mod rust_panic;
 
 /// Compile-time conversion of an ASCII string literal to `&'static [u16]`.
 ///
@@ -97,6 +101,7 @@ pub(crate) fn u32_from_usize(value: usize) -> u32 {
     u32::try_from(value).expect("value exceeds u32::MAX")
 }
 
+use crate::rust_panic::abort_on_panic;
 use ast::StatementKind;
 use bytecode::generator::PendingSharedFunctionData;
 use parser::ParseError;
@@ -105,8 +110,6 @@ use parser::ProgramType;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::panic::AssertUnwindSafe;
-use std::panic::catch_unwind;
 use std::rc::Rc;
 
 // Compile-time assertion: `ParsedProgram` travels between the parse worker
@@ -184,25 +187,6 @@ unsafe impl Send for CompiledFunction {}
 // =============================================================================
 // Internal helpers
 // =============================================================================
-
-/// Catch any Rust panics to prevent undefined behavior from unwinding across
-/// the FFI boundary. Aborts the process on panic.
-fn abort_on_panic<F: FnOnce() -> R, R>(f: F) -> R {
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(result) => result,
-        Err(payload) => {
-            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            eprintln!("Rust panic at FFI boundary: {msg}");
-            std::process::abort();
-        }
-    }
-}
 
 /// Write an AST dump string to FFI output pointers.
 ///
@@ -309,9 +293,11 @@ fn convert_local_variables(scope: &ast::ScopeData) -> Vec<bytecode::generator::L
         .local_variables
         .iter()
         .map(|lv| bytecode::generator::LocalVariable {
-            name: lv.name.clone(),
+            name: ak::Utf16FlyString::from_utf16(&lv.name),
             is_lexically_declared: lv.kind == ast::LocalVarKind::LetOrConst,
             is_initialized_during_declaration_instantiation: false,
+            is_mutable: lv.is_mutable,
+            scope_range: lv.scope_range,
         })
         .collect()
 }
@@ -344,9 +330,16 @@ fn compile_program_body_to_bytecode(
 ) -> bytecode::generator::AssembledBytecode {
     let arena_clone = generator.arena.clone();
     generator.local_variables = convert_local_variables(&arena_clone.scopes[scope_id]);
+    if let StatementKind::Program(data) = &program.inner
+        && data.program_type == ProgramType::Module
+    {
+        generator.enclosing_environment_scope =
+            Some(module_environment_scope(&arena_clone.scopes[scope_id], &arena_clone));
+    }
 
     let entry_block = generator.make_block();
     generator.switch_to_basic_block(entry_block);
+    generator.emit(bytecode::instruction::Instruction::Enter {});
     generator.capture_saved_lexical_environment();
 
     let result = bytecode::codegen::generate_statement(program, generator, None);
@@ -408,6 +401,7 @@ fn precompile_functions(generator: &mut bytecode::generator::Generator, mode: Fu
             data: *function_data,
             function_table: subtable,
             arena: arena.clone(),
+            enclosing_environment_scope: pending.enclosing_environment_scope.clone(),
         };
         let (function_data, precompiled) = compile_function_payload_to_bytecode(
             payload,
@@ -467,6 +461,7 @@ fn precompile_script_declaration_functions(
             declaration_functions.push(precompile_declaration_function(
                 function.function_id,
                 None,
+                None,
                 generator,
                 mode,
             ));
@@ -486,6 +481,7 @@ fn precompile_module_declaration_functions(
     let arena = generator.arena.clone();
     let scope = &arena.scopes[scope_id];
     let default_name: ast::Utf16String = utf16!("*default*").into();
+    let module_environment_scope = module_environment_scope(scope, &arena);
     let mut declaration_functions = Vec::new();
     for child in &scope.children {
         let (declaration, is_exported) = match &child.inner {
@@ -512,6 +508,7 @@ fn precompile_module_declaration_functions(
             declaration_functions.push(precompile_declaration_function(
                 function.function_id,
                 name_override,
+                Some(module_environment_scope.clone()),
                 generator,
                 mode,
             ));
@@ -524,6 +521,7 @@ fn precompile_module_declaration_functions(
 fn precompile_declaration_function(
     function_id: ast::FunctionId,
     name_override: Option<ast::Utf16String>,
+    enclosing_environment_scope: Option<std::sync::Arc<bytecode::generator::EnclosingEnvironmentScope>>,
     generator: &mut bytecode::generator::Generator,
     mode: FunctionPrecompileMode,
 ) -> PendingSharedFunctionData {
@@ -536,6 +534,7 @@ fn precompile_declaration_function(
         data: *function_data,
         function_table: subtable,
         arena: arena.clone(),
+        enclosing_environment_scope: enclosing_environment_scope.clone(),
     };
     let (function_data, precompiled_function) = compile_function_payload_to_bytecode(
         payload,
@@ -553,6 +552,7 @@ fn precompile_declaration_function(
         class_field_initializer_name: None,
         should_eager_compile: false,
         precompiled_function: Some(precompiled_function),
+        enclosing_environment_scope,
     }
 }
 
@@ -618,11 +618,12 @@ pub unsafe extern "C" fn rust_parse_program(
                 return std::ptr::null_mut();
             };
 
-            let mut parser = if pt == ProgramType::Script {
-                Parser::new_with_line_offset(source_slice, pt, u32_from_usize(initial_line_number))
+            let initial_line_number = if pt == ProgramType::Module && initial_line_number == 0 {
+                1
             } else {
-                Parser::new(source_slice, pt)
+                initial_line_number
             };
+            let mut parser = Parser::new_with_line_offset(source_slice, pt, u32_from_usize(initial_line_number));
 
             let program = parser.parse_program(false);
 
@@ -782,6 +783,33 @@ fn compile_parsed_program_off_thread_impl(
     }
 }
 
+/// Retain an independent parse snapshot for background cache generation.
+/// The immutable arena and compiled regex handles are shared; function-table
+/// ownership is independent so either compilation can consume its functions.
+///
+/// # Safety
+/// `parsed` must point to a valid parsed program with no errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_clone_parsed_program(parsed: *const ParsedProgram) -> *mut ParsedProgram {
+    unsafe {
+        abort_on_panic(|| {
+            let parsed = &*parsed;
+            assert!(parsed.errors.is_empty());
+            Box::into_raw(Box::new(ParsedProgram {
+                program: parsed.program.clone(),
+                function_table: parsed.function_table.clone(),
+                arena: parsed.arena.clone(),
+                scope_ref: parsed.scope_ref,
+                program_type: parsed.program_type,
+                is_strict_mode: parsed.is_strict_mode,
+                has_top_level_await: parsed.has_top_level_await,
+                errors: Vec::new(),
+                ast_dump: None,
+            }))
+        })
+    }
+}
+
 /// Compile a parsed program to an off-thread bytecode artifact.
 ///
 /// Consumes and frees the ParsedProgram. The returned CompiledProgram still needs to be materialized on the main thread
@@ -819,7 +847,86 @@ pub unsafe extern "C" fn rust_compile_parsed_program_fully_off_thread(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_free_compiled_program(compiled: *mut CompiledProgram) {
     unsafe {
-        drop(Box::from_raw(compiled));
+        fn free_generator_regexes(generator: &mut bytecode::generator::Generator) {
+            for regex in generator.compiled_regexes.drain(..) {
+                unsafe { crate::ast::free_compiled_regex(regex) };
+            }
+            for shared_data in &mut generator.shared_function_data {
+                if let Some(precompiled) = &mut shared_data.precompiled_function {
+                    free_generator_regexes(&mut precompiled.generator);
+                }
+            }
+        }
+
+        let mut compiled = Box::from_raw(compiled);
+        match &mut compiled.bytecode {
+            CompiledProgramBytecode::Program(bytecode) | CompiledProgramBytecode::AsyncModule(bytecode) => {
+                free_generator_regexes(&mut bytecode.generator);
+            }
+        }
+        for declaration in &mut compiled.declaration_functions {
+            if let Some(precompiled) = &mut declaration.precompiled_function {
+                free_generator_regexes(&mut precompiled.generator);
+            }
+        }
+    }
+}
+
+/// Collect all source-map positions from a fully compiled program.
+///
+/// # Safety
+/// `compiled` must be a valid pointer returned by
+/// `rust_compile_parsed_program_fully_off_thread`, and `callback` must be valid
+/// for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_collect_compiled_program_breakpoint_positions(
+    compiled: *const CompiledProgram,
+    context: *mut c_void,
+    callback: unsafe extern "C" fn(context: *mut c_void, line: u32, column: u32),
+) {
+    fn collect_precompiled_function(
+        precompiled: &bytecode::generator::PrecompiledFunction,
+        context: *mut c_void,
+        callback: unsafe extern "C" fn(context: *mut c_void, line: u32, column: u32),
+    ) {
+        collect_bytecode(&precompiled.generator, &precompiled.assembled, context, callback);
+    }
+
+    fn collect_bytecode(
+        generator: &bytecode::generator::Generator,
+        assembled: &bytecode::generator::AssembledBytecode,
+        context: *mut c_void,
+        callback: unsafe extern "C" fn(context: *mut c_void, line: u32, column: u32),
+    ) {
+        for entry in &assembled.source_map {
+            if entry.line != 0 {
+                unsafe { callback(context, entry.line, entry.column) };
+            }
+        }
+        for shared_data in &generator.shared_function_data {
+            if let Some(precompiled) = &shared_data.precompiled_function {
+                collect_precompiled_function(precompiled, context, callback);
+            }
+        }
+    }
+
+    unsafe {
+        abort_on_panic(|| {
+            if compiled.is_null() {
+                return;
+            }
+            let compiled = &*compiled;
+            match &compiled.bytecode {
+                CompiledProgramBytecode::Program(bytecode) | CompiledProgramBytecode::AsyncModule(bytecode) => {
+                    collect_bytecode(&bytecode.generator, &bytecode.assembled, context, callback);
+                }
+            }
+            for declaration in &compiled.declaration_functions {
+                if let Some(precompiled) = &declaration.precompiled_function {
+                    collect_precompiled_function(precompiled, context, callback);
+                }
+            }
+        });
     }
 }
 
@@ -2242,33 +2349,15 @@ unsafe fn extract_module_metadata(scope: &ast::ScopeData, ctx: *mut c_void, cb: 
             }
         }
 
+        if let Some(name) = module_default_export_binding_name(scope) {
+            (cb.set_default_export_binding)(ctx, name.as_ptr(), name.len());
+        }
+
         // Process export entries (matching SourceTextModule::parse steps 9-10).
         for child in &scope.children {
             let StatementKind::Export(ref export_data) = child.inner else {
                 continue;
             };
-
-            // Handle default export binding name.
-            if export_data.is_default_export && export_data.entries.len() == 1 {
-                let entry = &export_data.entries[0];
-                // If the default export is not a declaration (function/class/etc.),
-                // its binding name is the local_or_import_name.
-                let is_declaration = export_data.statement.as_ref().is_some_and(|s| {
-                    matches!(
-                        s.inner,
-                        StatementKind::FunctionDeclaration(_) | StatementKind::ClassDeclaration(_)
-                    )
-                });
-                let is_specific_import_export = all_import_entries
-                    .iter()
-                    .any(|ie| entry.local_or_import_name.as_ref() == Some(&ie.local_name) && ie.import_name.is_some());
-                if !is_declaration
-                    && !is_specific_import_export
-                    && let Some(ref name) = entry.local_or_import_name
-                {
-                    (cb.set_default_export_binding)(ctx, name.as_ptr(), name.len());
-                }
-            }
 
             for entry in &export_data.entries {
                 if entry.kind == ExportEntryKind::EmptyNamedExport {
@@ -2342,6 +2431,129 @@ unsafe fn extract_module_metadata(scope: &ast::ScopeData, ctx: *mut c_void, cb: 
     }
 }
 
+/// Returns the name of the binding that holds the value of `export default <expression>`, if the module has one.
+fn module_default_export_binding_name(scope: &ast::ScopeData) -> Option<&ast::Utf16String> {
+    use ast::StatementKind;
+
+    for child in &scope.children {
+        let StatementKind::Export(ref export_data) = child.inner else {
+            continue;
+        };
+        if !export_data.is_default_export || export_data.entries.len() != 1 {
+            continue;
+        }
+
+        // If the default export is not a declaration (function/class/etc.),
+        // its binding name is the local_or_import_name.
+        let is_declaration = export_data.statement.as_ref().is_some_and(|s| {
+            matches!(
+                s.inner,
+                StatementKind::FunctionDeclaration(_) | StatementKind::ClassDeclaration(_)
+            )
+        });
+        if is_declaration {
+            continue;
+        }
+
+        let entry = &export_data.entries[0];
+        let is_specific_import_export = scope.children.iter().any(|child| {
+            let StatementKind::Import(ref import_data) = child.inner else {
+                return false;
+            };
+            import_data.entries.iter().any(|import_entry| {
+                entry.local_or_import_name.as_ref() == Some(&import_entry.local_name)
+                    && import_entry.import_name.is_some()
+            })
+        });
+        if !is_specific_import_export {
+            return entry.local_or_import_name.as_ref();
+        }
+    }
+    None
+}
+
+/// Returns the names of a module's own bindings, in the order that `SourceTextModule::initialize_environment()`
+/// creates them in the module environment.
+fn module_environment_binding_names(scope: &ast::ScopeData, arena: &ast::AstArena) -> Vec<ak::Utf16FlyString> {
+    use ast::StatementKind;
+
+    let mut names = Vec::new();
+    let mut var_names = HashSet::new();
+    for child in &scope.children {
+        collect_module_var_names(&child.inner, arena, &mut |name| {
+            if var_names.insert(name.to_vec()) {
+                names.push(ak::Utf16FlyString::from_utf16(name));
+            }
+        });
+    }
+
+    for child in &scope.children {
+        let declaration = match &child.inner {
+            StatementKind::Export(export_data) => match &export_data.statement {
+                Some(statement) => &statement.inner,
+                None => continue,
+            },
+            other => other,
+        };
+
+        match declaration {
+            StatementKind::FunctionDeclaration(function) => {
+                if let Some(name) = function.name {
+                    names.push(ak::Utf16FlyString::from_utf16(arena.name_slice(name)));
+                }
+            }
+            StatementKind::ClassDeclaration(class_data) => {
+                if let Some(name) = class_data.name {
+                    names.push(ak::Utf16FlyString::from_utf16(arena.name_slice(name)));
+                }
+            }
+            StatementKind::VariableDeclaration(vd) if vd.kind != ast::DeclarationKind::Var => {
+                for declaration in &vd.declarations {
+                    for_each_bound_name(&declaration.target, arena, &mut |name| {
+                        names.push(ak::Utf16FlyString::from_utf16(name));
+                    });
+                }
+            }
+            StatementKind::UsingDeclaration(declarations) => {
+                for declaration in declarations.iter() {
+                    for_each_bound_name(&declaration.target, arena, &mut |name| {
+                        names.push(ak::Utf16FlyString::from_utf16(name));
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(name) = module_default_export_binding_name(scope) {
+        names.push(ak::Utf16FlyString::from_utf16(name.as_slice()));
+    }
+    names
+}
+
+/// Returns the local names of a module's import entries, in the order of `SourceTextModule`'s import entries.
+fn module_import_names(scope: &ast::ScopeData) -> Vec<ak::Utf16FlyString> {
+    let mut names = Vec::new();
+    for child in &scope.children {
+        if let StatementKind::Import(ref import_data) = child.inner {
+            for entry in &import_data.entries {
+                names.push(ak::Utf16FlyString::from_utf16(entry.local_name.as_slice()));
+            }
+        }
+    }
+    names
+}
+
+fn module_environment_scope(
+    scope: &ast::ScopeData,
+    arena: &ast::AstArena,
+) -> std::sync::Arc<bytecode::generator::EnclosingEnvironmentScope> {
+    bytecode::generator::EnclosingEnvironmentScope::for_module_environment(
+        module_environment_binding_names(scope, arena),
+        module_import_names(scope),
+    )
+}
+
 /// Extract var declared names and lexical bindings from a module scope.
 unsafe fn extract_module_declarations(
     scope: &ast::ScopeData,
@@ -2355,10 +2567,13 @@ unsafe fn extract_module_declarations(
         use ast::StatementKind;
 
         let default_name: ast::Utf16String = utf16!("*default*").into();
+        let module_environment_scope = module_environment_scope(scope, arena);
 
         // Var declared names (walk all nesting levels).
         for child in &scope.children {
-            collect_module_var_names(&child.inner, ctx, cb.push_var_name, arena);
+            collect_module_var_names(&child.inner, arena, &mut |name| {
+                (cb.push_var_name)(ctx, name.as_ptr(), name.len());
+            });
         }
 
         // Lexical bindings and functions to initialize.
@@ -2384,12 +2599,14 @@ unsafe fn extract_module_declarations(
 
                     let function_data = function_table.take(fd.function_id);
                     let subtable = function_table.extract_reachable(&function_data, &arena.scopes);
-                    let sfd_ptr = bytecode::ffi::create_sfd_for_gdi(
+                    let sfd_ptr = bytecode::ffi::create_shared_function_data(
                         function_data,
                         subtable,
                         shared_function_data_context,
                         true,
+                        None,
                         arena.clone(),
+                        Some(module_environment_scope.clone()),
                     );
                     if sfd_ptr.is_null() {
                         continue;
@@ -2447,31 +2664,22 @@ unsafe fn extract_module_declarations(
 }
 
 /// Recursively collect var declared names for module scope.
-unsafe fn collect_module_var_names(
-    statement: &ast::StatementKind,
-    ctx: *mut c_void,
-    push_var_name: ModuleNameCallback,
-    arena: &ast::AstArena,
-) {
-    unsafe {
-        match statement {
-            ast::StatementKind::VariableDeclaration(vd) if vd.kind == ast::DeclarationKind::Var => {
-                for declaration in &vd.declarations {
-                    for_each_bound_name(&declaration.target, arena, &mut |name| {
-                        push_var_name(ctx, name.as_ptr(), name.len());
-                    });
-                }
+fn collect_module_var_names(statement: &ast::StatementKind, arena: &ast::AstArena, f: &mut dyn FnMut(&[u16])) {
+    match statement {
+        ast::StatementKind::VariableDeclaration(vd) if vd.kind == ast::DeclarationKind::Var => {
+            for declaration in &vd.declarations {
+                for_each_bound_name(&declaration.target, arena, f);
             }
-            ast::StatementKind::Export(export_data) => {
-                if let Some(ref stmt) = export_data.statement {
-                    collect_module_var_names(&stmt.inner, ctx, push_var_name, arena);
-                }
+        }
+        ast::StatementKind::Export(export_data) => {
+            if let Some(ref stmt) = export_data.statement {
+                collect_module_var_names(&stmt.inner, arena, f);
             }
-            _ => {
-                for_each_child_statement(statement, arena, &mut |child| {
-                    collect_module_var_names(child, ctx, push_var_name, arena);
-                });
-            }
+        }
+        _ => {
+            for_each_child_statement(statement, arena, &mut |child| {
+                collect_module_var_names(child, arena, f);
+            });
         }
     }
 }
@@ -2554,9 +2762,11 @@ fn compile_module_as_async_to_bytecode(
     // Extract local variables from the program scope so the executable has the correct registers_and_locals_count.
     // Without this, locals are not saved across await suspension points, causing them to become undefined.
     generator.local_variables = convert_local_variables(scope);
+    generator.enclosing_environment_scope = Some(module_environment_scope(scope, &arena_clone));
 
     let entry_block = generator.make_block();
     generator.switch_to_basic_block(entry_block);
+    generator.emit(Instruction::Enter {});
 
     // Async function start: emit initial Yield before GetLexicalEnvironment.
     let start_block = generator.make_block();
@@ -2566,7 +2776,7 @@ fn compile_module_as_async_to_bytecode(
         value: undef.operand(),
     });
     generator.switch_to_basic_block(start_block);
-    generator.capture_saved_lexical_environment();
+    generator.capture_saved_lexical_environment_with_coordinates(true);
 
     // Generate module body statements.
     let _result = bytecode::codegen::generate_statement(program, generator, None);
@@ -3163,6 +3373,7 @@ fn compile_function_payload_to_bytecode(
     precompile_mode: FunctionPrecompileMode,
 ) -> (Box<ast::FunctionData>, Box<bytecode::generator::PrecompiledFunction>) {
     let function_data = Box::new(payload.data);
+    let enclosing_environment_scope = payload.enclosing_environment_scope;
 
     let body_scope: Option<ast::ScopeId> = match &function_data.body.inner {
         StatementKind::FunctionBody { scope, .. } => Some(*scope),
@@ -3177,11 +3388,27 @@ fn compile_function_payload_to_bytecode(
     let mut generator = bytecode::generator::Generator::new();
     generator.arena = arena;
     generator.strict = function_data.is_strict_mode;
+    generator.contains_direct_call_to_eval_in_non_strict_mode =
+        function_data.parsing_insights.contains_direct_call_to_eval && !function_data.is_strict_mode;
+    generator.enclosing_environment_scope = enclosing_environment_scope;
     generator.this_value_needs_environment_resolution = sfd_metadata.this_value_needs_environment_resolution;
     generator.builtin_abstract_operations_enabled = builtin_abstract_operations_enabled;
     generator.function_table = payload.function_table;
     generator.source_len = source_len;
     generator.enclosing_function_kind = function_data.kind;
+    generator.argument_variable_names = function_data
+        .parameters
+        .iter()
+        .map(|parameter| match parameter.binding {
+            ast::FunctionParameterBinding::Identifier(identifier)
+                if generator.arena.identifiers[identifier].local_type == Some(ast::LocalType::Argument) =>
+            {
+                ak::Utf16FlyString::from_utf16(generator.arena.name_slice(identifier))
+            }
+            ast::FunctionParameterBinding::BindingPattern(_) => ak::Utf16FlyString::default(),
+            _ => ak::Utf16FlyString::default(),
+        })
+        .collect();
 
     if let Some(scope_id) = body_scope {
         let arena_clone = generator.arena.clone();
@@ -3190,6 +3417,7 @@ fn compile_function_payload_to_bytecode(
 
     let entry_block = generator.make_block();
     generator.switch_to_basic_block(entry_block);
+    generator.emit(bytecode::instruction::Instruction::Enter {});
 
     // https://tc39.es/ecma262/#sec-async-functions-abstract-operations-async-function-start
     // For async (non-generator) functions, emit the initial Yield BEFORE
@@ -3205,7 +3433,7 @@ fn compile_function_payload_to_bytecode(
         generator.switch_to_basic_block(start_block);
     }
 
-    generator.capture_saved_lexical_environment_with_coordinates();
+    generator.capture_saved_lexical_environment_with_coordinates(sfd_metadata.function_environment_needed);
 
     if let Some(scope_id) = body_scope {
         let arena_clone = generator.arena.clone();

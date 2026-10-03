@@ -11,10 +11,12 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Fetch/Infrastructure/URL.h>
+#include <LibWeb/HTML/Scripting/EnvironmentSettingsSnapshot.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/ReferrerPolicy/AbstractOperations.h>
-#include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
 #include <LibWeb/SecureContexts/AbstractOperations.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::ReferrerPolicy {
 
@@ -68,13 +70,25 @@ Optional<URL::URL> determine_requests_referrer(Fetch::Infrastructure::Request co
             // Note: If request’s referrer is "no-referrer", Fetch will not call into this algorithm.
             VERIFY(referrer == Fetch::Infrastructure::Request::Referrer::Client);
 
+            // NB: A snapshot of an environment in another process — a navigation's fetch client, once the navigation
+            //     continues in the process hosting its target — has a global object from this process, so it answers
+            //     from the global object it was taken from.
+            if (auto const* snapshot = as_if<HTML::EnvironmentSettingsSnapshot>(*environment)) {
+                if (auto const* window = snapshot->serialized_global().get_pointer<HTML::SerializedWindow>()) {
+                    if (snapshot->origin().is_opaque())
+                        return {};
+                    return window->associated_document.url;
+                }
+                return environment->creation_url;
+            }
+
             // FIXME: Add a const global_object() getter to ESO
             auto& global_object = const_cast<HTML::EnvironmentSettingsObject&>(*environment).global_object();
 
             // 1. If environment’s global object is a Window object, then
-            if (is<HTML::Window>(global_object)) {
+            if (auto const* window = HTML::window_from_global_object(global_object)) {
                 // 1. Let document be the associated Document of environment’s global object.
-                auto const& document = static_cast<HTML::Window const&>(global_object).associated_document();
+                auto const& document = window->associated_document();
 
                 // 2. If document’s origin is an opaque origin, return no referrer.
                 if (document.origin().is_opaque())
@@ -226,7 +240,7 @@ Optional<URL::URL> strip_url_for_use_as_referrer(Optional<URL::URL> url, OriginO
     // 6. If the origin-only flag is true, then:
     if (origin_only == OriginOnly::Yes) {
         // 1. Set url’s path to « the empty string ».
-        url->set_paths({ ""sv });
+        url->set_path(Array { ""sv });
 
         // 2. Set url’s query to null.
         url->set_query({});

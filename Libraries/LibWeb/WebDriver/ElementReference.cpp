@@ -4,9 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/HashMap.h>
-#include <AK/NeverDestroyed.h>
 #include <LibJS/Runtime/Object.h>
+#include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Node.h>
@@ -14,13 +13,14 @@
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/Geometry/DOMRectList.h>
 #include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/HTMLBodyElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/WebDriver/ElementReference.h>
 
 namespace Web::WebDriver {
@@ -33,40 +33,60 @@ static auto const& web_element_identifier_key = *new JS::PropertyKey(Utf16FlyStr
 static auto const& shadow_root_identifier = *new String("shadow-6066-11e4-a52e-4f735466cecf"_string);
 static auto const& shadow_root_identifier_key = *new JS::PropertyKey(Utf16FlyString::from_utf8(shadow_root_identifier));
 
-// https://w3c.github.io/webdriver/#dfn-browsing-context-group-node-map
-static HashMap<GC::RawPtr<HTML::BrowsingContextGroup const>, HashTable<String>>& browsing_context_group_node_map()
+// NB: Every process hosting part of a tab hands out node ids, so the ids of this process share a prefix unique to it.
+static String const& node_id_prefix()
 {
-    static NeverDestroyed<HashMap<GC::RawPtr<HTML::BrowsingContextGroup const>, HashTable<String>>> map;
-    return *map;
+    static auto const& prefix = *new String(Crypto::generate_random_uuid());
+    return prefix;
 }
 
-// https://w3c.github.io/webdriver/#dfn-navigable-seen-nodes-map
-static HashMap<GC::RawPtr<HTML::LocalNavigable>, HashTable<String>>& navigable_seen_nodes_map()
+// NB: A node id also names the navigable the node was seen in, which stands in for the navigable seen nodes map: a
+//     process which later hosts that navigable did not hand out the id, but can still tell it from the ids seen in
+//     other navigables.
+static String node_id_navigable_prefix(HTML::Navigable const& navigable)
 {
-    static NeverDestroyed<HashMap<GC::RawPtr<HTML::LocalNavigable>, HashTable<String>>> map;
-    return *map;
+    return MUST(String::formatted("{}-{}_", navigable.id().namespace_id, navigable.id().local_id));
+}
+
+static String node_id_for_node(HTML::BrowsingContext const& browsing_context, Web::DOM::Node const& node)
+{
+    auto navigable = browsing_context.active_document()->navigable();
+    return MUST(String::formatted("{}{}_{}", node_id_navigable_prefix(*navigable), node_id_prefix(), node.unique_id().value()));
+}
+
+static Optional<UniqueNodeID> unique_id_of_node_id(StringView node_id)
+{
+    auto parts = node_id.split_view('_');
+    if (parts.is_empty())
+        return {};
+    auto unique_id = parts.last().to_number<i64>();
+    if (!unique_id.has_value())
+        return {};
+    return UniqueNodeID(*unique_id);
 }
 
 // https://w3c.github.io/webdriver/#dfn-get-a-node
-GC::Ptr<Web::DOM::Node> get_node(HTML::BrowsingContext const& browsing_context, StringView reference)
+GC::Ptr<Web::DOM::Node> get_node(StringView reference)
 {
     // 1. Let browsing context group node map be session's browsing context group node map.
     // 2. Let browsing context group be browsing context's browsing context group.
-    auto const* browsing_context_group = browsing_context.group();
-
     // 3. If browsing context group node map does not contain browsing context group, return null.
     // 4. Let node id map be browsing context group node map[browsing context group].
-    auto node_id_map = browsing_context_group_node_map().get(browsing_context_group);
-    if (!node_id_map.has_value())
+    // 5. Let node be the entry in node id map whose value is reference, if such an entry exists, or null otherwise.
+    // NB: A node holds its node id, as the entry the weak map keeps for it. The browsing context group keying the map
+    //     narrows nothing: a node reference is known only in the navigable its node was seen in, and a navigable
+    //     changes group only with its active document, whose nodes are then stale.
+    auto unique_id = unique_id_of_node_id(reference);
+    if (!unique_id.has_value())
         return nullptr;
 
-    // 5. Let node be the entry in node id map whose value is reference, if such an entry exists, or null otherwise.
-    GC::Ptr<Web::DOM::Node> node;
+    auto* node = Web::DOM::Node::from_unique_id(*unique_id);
+    if (!node)
+        return nullptr;
 
-    if (node_id_map->contains(reference)) {
-        auto node_id = reference.to_number<i64>().value();
-        node = Web::DOM::Node::from_unique_id(UniqueNodeID(node_id));
-    }
+    auto node_id = node->webdriver_node_id();
+    if (!node_id.has_value() || *node_id != reference)
+        return nullptr;
 
     // 6. Return node.
     return node;
@@ -77,32 +97,23 @@ String get_or_create_a_node_reference(HTML::BrowsingContext const& browsing_cont
 {
     // 1. Let browsing context group node map be session's browsing context group node map.
     // 2. Let browsing context group be browsing context's browsing context group.
-    auto const* browsing_context_group = browsing_context.group();
-
     // 3. If browsing context group node map does not contain browsing context group, set browsing context group node
     //    map[browsing context group] to a new weak map.
     // 4. Let node id map be browsing context group node map[browsing context group].
-    auto& node_id_map = browsing_context_group_node_map().ensure(browsing_context_group);
-
-    auto node_id = String::number(node.unique_id().value());
 
     // 5. If node id map does not contain node:
-    if (!node_id_map.contains(node_id)) {
+    if (!node.webdriver_node_id().has_value()) {
         // 1. Let node id be a new globally unique string.
         // 2. Set node id map[node] to node id.
-        node_id_map.set(node_id);
-
         // 3. Let navigable be browsing context's active document's node navigable.
-        auto navigable = browsing_context.active_document()->navigable();
-
         // 4. Let navigable seen nodes map be session's navigable seen nodes map.
         // 5. If navigable seen nodes map does not contain navigable, set navigable seen nodes map[navigable] to an empty set.
         // 6. Append node id to navigable seen nodes map[navigable].
-        navigable_seen_nodes_map().ensure(navigable).set(node_id);
+        node.set_webdriver_node_id(node_id_for_node(browsing_context, node));
     }
 
     // 6. Return node id map[node].
-    return node_id;
+    return *node.webdriver_node_id();
 }
 
 // https://w3c.github.io/webdriver/#dfn-node-reference-is-known
@@ -116,9 +127,7 @@ bool node_reference_is_known(HTML::BrowsingContext const& browsing_context, Stri
     // 2. Let navigable seen nodes map be session's navigable seen nodes map.
     // 3. If navigable seen nodes map contains navigable and navigable seen nodes map[navigable] contains reference,
     //    return true, otherwise return false.
-    if (auto map = navigable_seen_nodes_map().get(navigable); map.has_value())
-        return map->contains(reference);
-    return false;
+    return reference.starts_with(node_id_navigable_prefix(*navigable));
 }
 
 // https://w3c.github.io/webdriver/#dfn-get-or-create-a-web-element-reference
@@ -229,7 +238,7 @@ ErrorOr<GC::Ref<Web::DOM::Element>, Web::WebDriver::Error> get_known_element(Web
         return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchElement, MUST(String::formatted("Element reference '{}' is not known", reference)));
 
     // 2. Let node be the result of get a node with session, session's current browsing context, and reference.
-    auto node = get_node(browsing_context, reference);
+    auto node = get_node(reference);
 
     // 3. If node is not null and node does not implement Element return error with error code no such element.
     if (node && !node->is_element())
@@ -266,17 +275,16 @@ bool is_element_pointer_interactable(Web::HTML::BrowsingContext const& browsing_
     if (!document)
         return false;
 
-    auto paint_root = document->paintable_box();
-    if (!paint_root)
+    auto const* layout_root = document->layout_node();
+    if (!layout_root || !Painting::has_committed_box(*layout_root))
         return false;
 
-    auto viewport = browsing_context.page().top_level_traversable()->viewport_rect();
-    auto center_point_or_error = in_view_center_point(element, viewport);
+    auto center_point_or_error = in_view_center_point(element);
     if (center_point_or_error.is_error())
         return false;
     auto center_point = center_point_or_error.release_value();
 
-    auto result = const_cast<DOM::Document&>(*document).hit_test(center_point, Painting::HitTestType::Exact);
+    auto result = const_cast<DOM::Document&>(*document).hit_test(center_point);
     if (!result.has_value())
         return false;
 
@@ -380,7 +388,8 @@ bool is_element_in_view(ReadonlySpan<GC::Ref<Web::DOM::Element>> paint_tree, Web
 {
     // An element is in view if it is a member of its own pointer-interactable paint tree, given the pretense that its
     // pointer events are not disabled.
-    if (!element.paintable() || !element.paintable()->is_visible() || !element.paintable()->visible_for_hit_testing())
+    auto const* layout_node = element.layout_node();
+    if (!layout_node || !Painting::has_committed_box(*layout_node) || !Painting::is_visible(*layout_node) || !Painting::visible_for_hit_testing(*layout_node))
         return false;
 
     return paint_tree.contains_slow(GC::Ref { element });
@@ -409,8 +418,7 @@ GC::RootVector<GC::Ref<Web::DOM::Element>> pointer_interactable_tree(Web::HTML::
         return GC::RootVector<GC::Ref<Web::DOM::Element>> {};
 
     // 4. Let center point be the in-view center point of the first indexed element in rectangles.
-    auto viewport = browsing_context.page().top_level_traversable()->viewport_rect();
-    auto center_point_or_error = Web::WebDriver::in_view_center_point(element, viewport);
+    auto center_point_or_error = Web::WebDriver::in_view_center_point(element);
     if (center_point_or_error.is_error())
         return GC::RootVector<GC::Ref<Web::DOM::Element>> {};
     auto center_point = center_point_or_error.release_value();
@@ -507,7 +515,7 @@ ErrorOr<GC::Ref<Web::DOM::ShadowRoot>, Web::WebDriver::Error> get_known_shadow_r
         return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchShadowRoot, MUST(String::formatted("Shadow root reference '{}' is not known", reference)));
 
     // 2. Let node be the result of get a node with session, session's current browsing context, and reference.
-    auto node = get_node(browsing_context, reference);
+    auto node = get_node(reference);
 
     // 3. If node is not null and node does not implement ShadowRoot return error with error code no such shadow root.
     if (node && !node->is_shadow_root())
@@ -542,8 +550,10 @@ String element_rendered_text(DOM::Node& node)
 }
 
 // https://w3c.github.io/webdriver/#dfn-center-point
-ErrorOr<CSSPixelPoint, WebDriver::Error> in_view_center_point(DOM::Element const& element, CSSPixelRect viewport)
+ErrorOr<CSSPixelPoint, WebDriver::Error> in_view_center_point(DOM::Element const& element)
 {
+    auto viewport = element.document().viewport_rect();
+
     // 1. Let rectangle be the first element of the DOMRect sequence returned by calling getClientRects() on element.
     auto rects = element.get_client_rects();
     if (rects.is_empty())

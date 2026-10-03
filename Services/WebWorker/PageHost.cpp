@@ -4,9 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/Runtime/VM.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/HTML/WorkerAgentTypes.h>
+#include <LibGC/Heap.h>
+#include <LibWebCommon/HTML/WorkerAgentTypes.h>
 #include <WebWorker/ConnectionFromClient.h>
 #include <WebWorker/PageHost.h>
 #include <WebWorker/WebWorkerCompositorHost.h>
@@ -15,9 +14,9 @@ namespace WebWorker {
 
 GC_DEFINE_ALLOCATOR(PageHost);
 
-GC::Ref<PageHost> PageHost::create(JS::VM& vm, ConnectionFromClient& client)
+GC::Ref<PageHost> PageHost::create(ConnectionFromClient& client)
 {
-    return vm.heap().allocate<PageHost>(client);
+    return GC::Heap::the().allocate<PageHost>(client);
 }
 
 PageHost::~PageHost() = default;
@@ -94,11 +93,6 @@ HTTP::Cookie::VersionedCookie PageHost::page_did_request_cookie(URL::URL const& 
     return m_client.did_request_cookie(url, source);
 }
 
-void PageHost::page_did_store_hsts_policy(String const& domain, HTTP::HSTS::ParsedHSTSPolicy const& policy)
-{
-    m_client.async_did_store_hsts_policy(domain, policy);
-}
-
 bool PageHost::page_did_is_known_hsts_host(String const& domain)
 {
     return m_client.did_is_known_hsts_host(domain);
@@ -109,7 +103,7 @@ void PageHost::page_did_report_worker_exception(Utf16String const& message, Utf1
     m_client.async_did_report_worker_exception(message, filename, lineno, colno);
 }
 
-void PageHost::page_did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage const& message)
+void PageHost::page_did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage const& message)
 {
     m_client.async_did_post_broadcast_channel_message(message);
 }
@@ -117,6 +111,21 @@ void PageHost::page_did_post_broadcast_channel_message(Web::HTML::BroadcastChann
 void PageHost::request_file(Web::FileRequest request)
 {
     m_client.request_file(move(request));
+}
+
+URL::BlobURLEntry::Token PageHost::page_did_add_blob_url_entry(Web::HTML::EnvironmentSettingsObject const& environment, Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const& entry)
+{
+    return m_client.did_add_blob_url_entry(environment.id, url, entry);
+}
+
+void PageHost::page_did_remove_blob_url_entries(Web::HTML::EnvironmentSettingsObject const& environment, Vector<Utf16String> const& urls)
+{
+    m_client.did_remove_blob_url_entries(environment.id, urls);
+}
+
+Optional<Web::FileAPI::SerializedBlobURLEntry> PageHost::page_did_request_blob_url_entry(Utf16String const& url, Optional<URL::BlobURLEntry::Token> token)
+{
+    return m_client.did_request_blob_url_entry(url, token);
 }
 
 Web::HTML::WorkerAgentId PageHost::start_worker_agent(Web::HTML::WorkerAgentStartRequest&& request)
@@ -153,7 +162,7 @@ void PageHost::did_fail_loading_worker_script()
 
 PageHost::PageHost(ConnectionFromClient& client)
     : m_client(client)
-    , m_page(Web::Page::create(Web::Bindings::main_thread_vm(), *this))
+    , m_page(Web::Page::create(*this))
 {
     setup_palette();
 }

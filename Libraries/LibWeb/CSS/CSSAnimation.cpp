@@ -4,12 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
+#include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Animations/ScrollTimeline.h>
-#include <LibWeb/Bindings/CSSAnimation.h>
-#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 
@@ -17,9 +18,9 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSAnimation);
 
-GC::Ref<CSSAnimation> CSSAnimation::create(JS::Realm& realm)
+GC::Ref<CSSAnimation> CSSAnimation::create(HTML::EnvironmentSettingsObject& environment)
 {
-    return realm.create<CSSAnimation>(realm);
+    return GC::Heap::the().allocate<CSSAnimation>(environment);
 }
 
 // https://www.w3.org/TR/css-animations-2/#animation-composite-order
@@ -57,6 +58,17 @@ int CSSAnimation::class_specific_composite_order(GC::Ref<Animations::Animation> 
     return global_animation_list_order() - other->global_animation_list_order();
 }
 
+void CSSAnimation::set_animation_name_index(size_t index)
+{
+    if (m_animation_name_index == index)
+        return;
+    m_animation_name_index = index;
+    if (auto effect = this->effect(); effect && is<Animations::KeyframeEffect>(*effect)) {
+        if (auto target = static_cast<Animations::KeyframeEffect&>(*effect).target())
+            target->invalidate_associated_animation_composite_order();
+    }
+}
+
 Animations::AnimationClass CSSAnimation::animation_class() const
 {
     if (owning_element().has_value())
@@ -64,27 +76,62 @@ Animations::AnimationClass CSSAnimation::animation_class() const
     return Animations::AnimationClass::CSSAnimationWithoutOwningElement;
 }
 
-// NB: Unrelated style changes shouldn't cause us to recreate anonymous timelines, to achieve this we drop updates
-//     between two equivalent anonymous timelines.
-static bool should_update_timeline(GC::Ptr<Animations::AnimationTimeline> old_timeline, GC::Ptr<Animations::AnimationTimeline> new_timeline)
+static Animations::ScrollTimeline::AnonymousSource anonymous_scroll_source(AnimationTimelineSource const& requested, DOM::AbstractElement target)
 {
-    if (!old_timeline || !new_timeline)
-        return true;
-
-    if (is<Animations::ScrollTimeline>(*old_timeline) && is<Animations::ScrollTimeline>(*new_timeline)) {
-        auto const& old_scroll_timeline = as<Animations::ScrollTimeline>(*old_timeline);
-        auto const& new_scroll_timeline = as<Animations::ScrollTimeline>(*new_timeline);
-
-        if (!old_scroll_timeline.source_internal().has<Animations::ScrollTimeline::AnonymousSource>() || !new_scroll_timeline.source_internal().has<Animations::ScrollTimeline::AnonymousSource>())
-            return true;
-
-        return old_scroll_timeline.source_internal().get<Animations::ScrollTimeline::AnonymousSource>() != new_scroll_timeline.source_internal().get<Animations::ScrollTimeline::AnonymousSource>();
-    }
-
-    return true;
+    return Animations::ScrollTimeline::AnonymousSource {
+        .scroller = requested.scroller,
+        .target = target,
+    };
 }
 
-void CSSAnimation::apply_css_properties(AnimationProperties const& animation_properties)
+// NB: Unrelated style changes shouldn't cause us to recreate anonymous timelines, to achieve this we drop updates
+//     between two equivalent anonymous timelines. The comparison is made against the description of the requested
+//     timeline, so that the timeline a definition names is only ever created when it will replace the one the
+//     animation already has.
+static bool should_update_timeline(GC::Ptr<Animations::AnimationTimeline> old_timeline, AnimationTimelineSource const& requested, DOM::AbstractElement target)
+{
+    switch (requested.kind) {
+    case AnimationTimelineSource::Kind::None:
+        return old_timeline != nullptr;
+    case AnimationTimelineSource::Kind::Document: {
+        GC::Ptr<Animations::AnimationTimeline> const document_timeline = target.document().timeline();
+        return old_timeline != document_timeline;
+    }
+    case AnimationTimelineSource::Kind::Scroll:
+        break;
+    }
+
+    auto const* old_scroll_timeline = as_if<Animations::ScrollTimeline>(old_timeline.ptr());
+    if (!old_scroll_timeline)
+        return true;
+
+    if (old_scroll_timeline->axis() != Animations::scroll_axis_from_css_axis(requested.axis))
+        return true;
+
+    auto old_source = old_scroll_timeline->source_internal();
+    if (!old_source.has<Animations::ScrollTimeline::AnonymousSource>())
+        return true;
+
+    return old_source.get<Animations::ScrollTimeline::AnonymousSource>() != anonymous_scroll_source(requested, target);
+}
+
+static GC::Ptr<Animations::AnimationTimeline> materialize_timeline(AnimationTimelineSource const& requested, DOM::AbstractElement target)
+{
+    switch (requested.kind) {
+    case AnimationTimelineSource::Kind::Document:
+        return target.document().timeline();
+    case AnimationTimelineSource::Kind::None:
+        return {};
+    case AnimationTimelineSource::Kind::Scroll:
+        return Animations::ScrollTimeline::create(
+            target.document(),
+            anonymous_scroll_source(requested, target),
+            Animations::scroll_axis_from_css_axis(requested.axis));
+    }
+    VERIFY_NOT_REACHED();
+}
+
+void CSSAnimation::apply_css_properties(AnimationProperties const& animation_properties, Animations::KeyframeEffect::KeyFrameSet const* keyframe_set, DOM::AbstractElement timeline_target)
 {
     // FIXME: Don't apply overridden properties as defined here: https://drafts.csswg.org/css-animations-2/#animations
 
@@ -92,9 +139,51 @@ void CSSAnimation::apply_css_properties(AnimationProperties const& animation_pro
 
     auto& effect = as<Animations::KeyframeEffect>(*this->effect());
 
-    if (!m_ignored_css_properties.contains(PropertyID::AnimationTimeline) && should_update_timeline(timeline(), animation_properties.timeline)) {
-        HTML::TemporaryExecutionContext context(realm());
-        set_timeline(animation_properties.timeline);
+    // NB: Recorded before the early return below, so that the definition always says what the style
+    //     computation last computed.
+    m_applied_keyframe_set = keyframe_set;
+    m_applied_timing_function_value = animation_properties.timing_function_value;
+    m_applied_definition = {
+        .values = {
+            .duration_is_auto = animation_properties.duration.has<Utf16String>(),
+            .duration = animation_properties.duration.visit(
+                [](double duration) { return duration; },
+                [](Utf16String const&) { return 0.0; }),
+            .iteration_count = animation_properties.iteration_count,
+            .direction = to_underlying(animation_properties.direction),
+            .play_state = to_underlying(animation_properties.play_state),
+            .delay = animation_properties.delay,
+            .fill_mode = to_underlying(animation_properties.fill_mode),
+            .composition = to_underlying(animation_properties.composition),
+            .timeline_kind = to_underlying(animation_properties.timeline.kind),
+            .scroll_scroller = to_underlying(animation_properties.timeline.scroller),
+            .scroll_axis = to_underlying(animation_properties.timeline.axis),
+        },
+        .keyframe_set = m_applied_keyframe_set.ptr(),
+        .timing_function = m_applied_timing_function_value.data(),
+    };
+
+    auto const update_timeline = !m_ignored_css_properties.contains(PropertyID::AnimationTimeline)
+        && should_update_timeline(timeline(), animation_properties.timeline, timeline_target);
+    AppliedCSSProperties applied_properties {
+        .duration = animation_properties.duration,
+        .timing_function = animation_properties.timing_function,
+        .iteration_count = animation_properties.iteration_count,
+        .direction = animation_properties.direction,
+        .play_state = animation_properties.play_state,
+        .delay = animation_properties.delay,
+        .fill_mode = animation_properties.fill_mode,
+        .composition = animation_properties.composition,
+    };
+    // NB: Style feedback can recompute an animation's owning element. Reapplying unchanged
+    //     properties would invalidate the effect and turn that feedback into an endless cycle.
+    if (!update_timeline && m_applied_css_properties == applied_properties)
+        return;
+    m_applied_css_properties = applied_properties;
+
+    if (update_timeline) {
+        HTML::TemporaryExecutionContext context(relevant_settings_object());
+        set_timeline(materialize_timeline(animation_properties.timeline, timeline_target));
     }
 
     effect.set_specified_iteration_duration(animation_properties.duration);
@@ -105,23 +194,109 @@ void CSSAnimation::apply_css_properties(AnimationProperties const& animation_pro
     // timing requires rerunning the procedure to normalize specified timing.
     effect.normalize_specified_timing();
     // NB: animation-timing-function is applied per-keyframe, not as the effect-level timing function.
-    //     The effect-level timing function remains linear.
-    m_default_easing = animation_properties.timing_function;
+    //     The effect-level timing function remains linear. The effect's description for the style engine
+    //     gives it to every keyframe that declares no easing of its own, so a new one describes it again.
+    if (m_default_easing != animation_properties.timing_function) {
+        m_default_easing = animation_properties.timing_function;
+        effect.invalidate_animation_preparation();
+    }
     effect.set_fill_mode(Animations::css_fill_mode_to_bindings_fill_mode(animation_properties.fill_mode));
     effect.set_playback_direction(Animations::css_animation_direction_to_bindings_playback_direction(animation_properties.direction));
-    effect.set_composite(Animations::css_animation_composition_to_bindings_composite_operation(animation_properties.composition));
+    effect.set_composite(Animations::css_animation_composition_to_composite_operation(animation_properties.composition));
 
     if (animation_properties.play_state != last_css_animation_play_state()) {
-        if (animation_properties.play_state == CSS::AnimationPlayState::Running && play_state() != Bindings::AnimationPlayState::Running) {
-            HTML::TemporaryExecutionContext context(realm());
-            play().release_value_but_fixme_should_propagate_errors();
-        } else if (animation_properties.play_state == CSS::AnimationPlayState::Paused && play_state() != Bindings::AnimationPlayState::Paused) {
-            HTML::TemporaryExecutionContext context(realm());
-            pause().release_value_but_fixme_should_propagate_errors();
+        if (!m_script_overrode_play_state) {
+            if (animation_properties.play_state == CSS::AnimationPlayState::Running && play_state() != Animations::AnimationPlayState::Running) {
+                HTML::TemporaryExecutionContext context(relevant_settings_object());
+                play_from_css();
+            } else if (animation_properties.play_state == CSS::AnimationPlayState::Paused && play_state() != Animations::AnimationPlayState::Paused) {
+                HTML::TemporaryExecutionContext context(relevant_settings_object());
+                pause_from_css();
+            }
         }
 
         set_last_css_animation_play_state(animation_properties.play_state);
     }
+}
+
+void CSSAnimation::mark_script_play_state_override()
+{
+    if (!m_applying_css_play_state)
+        m_script_overrode_play_state = true;
+}
+
+void CSSAnimation::play_from_css()
+{
+    m_applying_css_play_state = true;
+    Animations::Animation::play().release_value_but_fixme_should_propagate_errors();
+    m_applying_css_play_state = false;
+}
+
+void CSSAnimation::pause_from_css()
+{
+    m_applying_css_play_state = true;
+    Animations::Animation::pause().release_value_but_fixme_should_propagate_errors();
+    m_applying_css_play_state = false;
+}
+
+WebIDL::ExceptionOr<void> CSSAnimation::set_start_time_for_bindings(Animations::NullableCSSNumberish const& value)
+{
+    auto previous_play_state = play_state();
+    auto result = Animations::Animation::set_start_time_for_bindings(value);
+    if (!result.is_error() && previous_play_state != play_state())
+        mark_script_play_state_override();
+    return result;
+}
+
+WebIDL::ExceptionOr<void> CSSAnimation::set_current_time_for_bindings(Animations::NullableCSSNumberish const& value)
+{
+    auto previous_play_state = play_state();
+    auto result = Animations::Animation::set_current_time_for_bindings(value);
+    if (!result.is_error() && previous_play_state != play_state())
+        mark_script_play_state_override();
+    return result;
+}
+
+WebIDL::ExceptionOr<void> CSSAnimation::set_playback_rate(double value)
+{
+    return Animations::Animation::set_playback_rate(value);
+}
+
+void CSSAnimation::cancel(Animations::Animation::ShouldInvalidate should_invalidate)
+{
+    mark_script_play_state_override();
+    Animations::Animation::cancel(should_invalidate);
+}
+
+WebIDL::ExceptionOr<void> CSSAnimation::play(Animations::Animation::ShouldInvalidate should_invalidate)
+{
+    auto previous_play_state = play_state();
+    auto result = Animations::Animation::play(should_invalidate);
+    if (!result.is_error() && previous_play_state != play_state())
+        mark_script_play_state_override();
+    return result;
+}
+
+WebIDL::ExceptionOr<void> CSSAnimation::pause()
+{
+    auto result = Animations::Animation::pause();
+    if (!result.is_error())
+        mark_script_play_state_override();
+    return result;
+}
+
+WebIDL::ExceptionOr<void> CSSAnimation::update_playback_rate(double value)
+{
+    return Animations::Animation::update_playback_rate(value);
+}
+
+WebIDL::ExceptionOr<void> CSSAnimation::reverse()
+{
+    auto previous_play_state = play_state();
+    auto result = Animations::Animation::reverse();
+    if (!result.is_error() && previous_play_state != play_state())
+        mark_script_play_state_override();
+    return result;
 }
 
 void CSSAnimation::set_timeline_for_bindings(GC::Ptr<Animations::AnimationTimeline> timeline)
@@ -132,8 +307,8 @@ void CSSAnimation::set_timeline_for_bindings(GC::Ptr<Animations::AnimationTimeli
     set_timeline(timeline);
 }
 
-CSSAnimation::CSSAnimation(JS::Realm& realm)
-    : Animations::Animation(realm)
+CSSAnimation::CSSAnimation(HTML::EnvironmentSettingsObject& environment)
+    : Animations::Animation(environment)
 {
     // FIXME:
     // CSS Animations generated using the markup defined in this specification are not added to the global animation
@@ -141,12 +316,6 @@ CSSAnimation::CSSAnimation(JS::Realm& realm)
     // moment when they transition out of the idle play state after being disassociated from their owning element. CSS
     // Animations that have been disassociated from their owning element but are still idle do not have a defined
     // composite order.
-}
-
-void CSSAnimation::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSAnimation);
-    Base::initialize(realm);
 }
 
 }

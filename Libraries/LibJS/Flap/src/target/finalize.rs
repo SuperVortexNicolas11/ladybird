@@ -33,42 +33,26 @@ fn finalize_function_for_target(
 ) -> Result<MachineFunction, CompileError> {
     let backend = backend_for(options.target.architecture);
     let mut emit = Emit::new(runtime, &function.name, function.size, options);
-    let (hot_instructions, mut cold_instructions) = if function.is_cold {
-        let instruction = function
-            .cfg
-            .single_instruction()
-            .ok_or_else(|| finalization_error(&function.name, "cold handler must consist solely of call_slow_path"))?;
-        if instruction.opcode.operation() != Operation::Call(CallKind::SlowPath) {
-            return Err(finalization_error(
-                &function.name,
-                "cold handler must consist solely of call_slow_path",
-            ));
-        }
-        (
-            finalize_instructions(vec![instruction.clone()], backend, &mut emit)?,
-            Vec::new(),
-        )
-    } else {
-        let layout = function
-            .cfg
-            .layout_hot_and_cold()
-            .map_err(|message| finalization_error(&function.name, message))?;
-        // Nothing reads the graph after this, so it hands its instructions over
-        // rather than being copied out of.
-        let (hot, cold) = std::mem::take(&mut function.cfg).linearize_hot_and_cold(&layout);
-        (
-            finalize_instructions(hot, backend, &mut emit)?,
-            finalize_instructions(cold, backend, &mut emit)?,
-        )
-    };
+    let layout = function
+        .cfg
+        .layout_hot_and_cold()
+        .map_err(|message| finalization_error(&function.name, message))?;
+    // Nothing reads the graph after this, so it hands its instructions over
+    // rather than being copied out of. Whole cold handlers use the same layout;
+    // the emitter places both parts together in the cold region.
+    let (hot, cold) = std::mem::take(&mut function.cfg).linearize_hot_and_cold(&layout);
+    let hot_instructions = finalize_instructions(hot, backend, &mut emit)?;
+    let mut cold_instructions = finalize_instructions(cold, backend, &mut emit)?;
 
     cold_instructions.extend(emit.cold);
+    let assertion_traps = emit.assertion_traps;
     let machine = MachineFunction {
         id: function.id,
         name: function.name,
         is_cold: function.is_cold,
         hot_instructions,
         cold_instructions,
+        assertion_traps,
     };
     Ok(machine)
 }
@@ -190,7 +174,7 @@ fn finalize_value_operation(
         }
         Operation::UnboxObject => {
             let [destination, source] = operands.physical_registers();
-            backend.unbox_object(emit, destination, source);
+            backend.unbox_object(emit, destination, source)?;
         }
         _ => unreachable!(),
     }
@@ -206,7 +190,9 @@ fn finalize_float_operation(
 ) {
     if !matches!(
         operation,
-        FloatingPointOperation::Convert(FloatConversion::Float64ToInt32 | FloatConversion::JavaScriptToInt32)
+        FloatingPointOperation::Convert(
+            FloatConversion::Float64ToInt32 | FloatConversion::Float64ToInt64 | FloatConversion::JavaScriptToInt32
+        )
     ) {
         backend.float_operation(emit, opcode, operation, operands);
         return;
@@ -232,8 +218,9 @@ fn finalize_call(
     operands: &[AllocatedOperand],
 ) -> Result<(), CompileError> {
     match kind {
-        CallKind::Helper => backend.helper_call(emit, operands.relocation(0)),
-        CallKind::Interpreter => backend.interpreter_call(emit, operands.relocation(0)),
+        CallKind::Helper => backend.helper_call(emit, operands.relocation(0), 1),
+        CallKind::HelperWithTwoArguments => backend.helper_call(emit, operands.relocation(0), 2),
+        CallKind::Interpreter => backend.interpreter_call(emit, operands.relocation(0))?,
         CallKind::RawNative => backend.raw_native_call(emit, operands),
         CallKind::SlowPath => backend.slow_path_call(emit, operands)?,
         CallKind::BinarySlowPath => backend.binary_slow_path_call(emit, operands)?,
@@ -272,9 +259,51 @@ fn finalize_instruction(
 ) -> Result<(), CompileError> {
     let operation = instruction.opcode.operation();
 
-    if let Operation::Assertion(operation) = operation {
-        let ok_label = emit.enable_assertions.then(|| emit.unique_label("assert_ok"));
-        backend.finalize_assertion(emit, operation, &instruction.operands, ok_label)?;
+    if matches!(operation, Operation::AssertBranch(_) | Operation::AssertFailure) {
+        if !emit.enable_assertions {
+            return Ok(());
+        }
+        let failure = instruction
+            .operands
+            .iter()
+            .find(|operand| matches!(operand, AllocatedOperand::Label(_)))
+            .unwrap()
+            .clone();
+        let (label_opcode, trap_opcode) = match instruction.opcode.architecture() {
+            crate::Architecture::X86_64 => (
+                MachineOpcode::X86_64(super::x86_64::Opcode::Label),
+                MachineOpcode::X86_64(super::x86_64::Opcode::UndefinedInstruction),
+            ),
+            crate::Architecture::Aarch64 => (
+                MachineOpcode::Aarch64(super::aarch64::Opcode::Label),
+                MachineOpcode::Aarch64(super::aarch64::Opcode::Break),
+            ),
+        };
+        emit.assertion_traps.push(MachineInstruction {
+            opcode: label_opcode,
+            operands: vec![failure],
+        });
+        emit.assertion_traps.push(MachineInstruction {
+            opcode: trap_opcode,
+            operands: Vec::new(),
+        });
+        return finalize_instruction(
+            AllocatedInstruction {
+                opcode: instruction.opcode.replacing_operation(match operation {
+                    Operation::AssertBranch(branch) => Operation::Branch(branch),
+                    Operation::AssertFailure => Operation::Control(ControlOperation::JumpLabel),
+                    _ => unreachable!(),
+                }),
+                operands: instruction.operands,
+            },
+            backend,
+            emit,
+        );
+    }
+
+    if operation == Operation::AssertNonzero {
+        let failure_label = emit.enable_assertions.then(|| emit.unique_label("assert_failure"));
+        backend.finalize_nonzero_assertion(emit, &instruction.operands, failure_label)?;
         if emit.enable_assertions {
             emit.last_fp_compare = None;
         }
@@ -404,7 +433,7 @@ fn finalize_instruction(
         Operation::Cold => {
             return emit.error("operation Cold was not expanded into legal machine instructions");
         }
-        Operation::Modulo => backend.finalize_divide(emit, operands),
+        Operation::Modulo(width) => backend.finalize_divide(emit, width, operands),
         _ => emit.output.push(MachineInstruction {
             opcode,
             operands: instruction.operands,
@@ -537,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_terminal_cold_handler() {
+    fn finalizes_cold_handlers_with_instruction_bodies() {
         let function = allocated_function(
             vec![Instruction {
                 opcode: Operation::Control(ControlOperation::DispatchNext),
@@ -546,10 +575,10 @@ mod tests {
             true,
         );
 
-        let error = finalize_function(function, &runtime()).unwrap_err();
-        assert_eq!(error.stage, CompileStage::Finalization);
-        assert_eq!(error.handler.as_deref(), Some("Test"));
-        assert_eq!(error.message, "cold handler must consist solely of call_slow_path");
+        let machine = finalize_function(function, &runtime()).unwrap();
+        assert!(machine.is_cold);
+        assert_eq!(machine.hot_instructions.len(), 3);
+        assert!(machine.cold_instructions.is_empty());
     }
 
     #[test]

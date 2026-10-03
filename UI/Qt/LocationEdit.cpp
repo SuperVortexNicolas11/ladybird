@@ -6,6 +6,7 @@
  */
 
 #include <AK/StringView.h>
+#include <AK/kmalloc.h>
 #include <LibURL/URL.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/URL.h>
@@ -38,6 +39,8 @@ namespace Ladybird {
 
 class LocationActionButton final : public QToolButton {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit LocationActionButton(QWidget* parent)
         : QToolButton(parent)
     {
@@ -181,6 +184,7 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
     };
 
     m_omnibox.on_commit = [this](String const& input) {
+        auto destination_kind = m_omnibox.destination_kind_for_last_commit();
         auto input_text = qstring_from_ak_string(input);
         if (text() != input_text)
             setText(input_text);
@@ -190,10 +194,14 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
         auto ctrl_held = QApplication::keyboardModifiers() & Qt::ControlModifier;
         auto append_tld = ctrl_held ? WebView::AppendTLD::Yes : WebView::AppendTLD::No;
 
-        auto url = WebView::sanitize_url(input, WebView::Application::settings().search_engine(), append_tld);
-        set_url(AK::move(url));
+        auto url = WebView::sanitize_url(input, WebView::Application::settings().search_engine_settings().engine, append_tld);
+        auto classified_input = WebView::classify_user_input(input, append_tld);
+        if (destination_kind == WebView::OmniboxDestinationKind::Search
+            || classified_input.classification != WebView::UserInputClassification::ExternalURL)
+            set_url(url);
 
-        emit returnPressed();
+        if (on_navigation)
+            on_navigation(input, AK::move(url), destination_kind);
     };
 
     connect(m_autocomplete, &Autocomplete::suggestion_clicked, this, [this](int suggestion_index) {
@@ -296,7 +304,7 @@ void LocationEdit::contextMenuEvent(QContextMenuEvent* event)
     auto qt_clipboard_text = QGuiApplication::clipboard()->text();
     auto clipboard_text = ak_string_from_qstring(qt_clipboard_text);
 
-    bool has_search_engine = WebView::Application::settings().search_engine().has_value();
+    bool has_search_engine = WebView::Application::settings().search_engine_settings().engine.has_value();
     auto paste_and_go_text = WebView::Omnibox::text_for_paste_and_go_action(clipboard_text, has_search_engine);
     // Escape any &s so Qt doesn't treat them as mnemonics.
     paste_and_go_text = MUST(paste_and_go_text.replace("&"sv, "&&"sv, ReplaceMode::All));
@@ -485,7 +493,7 @@ void LocationEdit::update_trailing_item_positions()
     m_trailing_action_button->raise();
 }
 
-void LocationEdit::search_engine_changed()
+void LocationEdit::search_engine_settings_changed()
 {
     update_placeholder();
     update_location_icon();
@@ -537,7 +545,7 @@ void LocationEdit::schedule_chrome_style_update()
 
 void LocationEdit::update_placeholder()
 {
-    if (auto const& search_engine = WebView::Application::settings().search_engine(); search_engine.has_value()) {
+    if (auto const& search_engine = WebView::Application::settings().search_engine_settings().engine; search_engine.has_value()) {
         auto prompt = MUST(String::formatted("Search with {} or enter web address", search_engine->name));
         setPlaceholderText(qstring_from_ak_string(prompt));
     } else {
@@ -609,7 +617,7 @@ void LocationEdit::update_location_icon()
         && text() == display_url();
 
     if (text_matches_current_url() || is_showing_current_url_for_display) {
-        auto const& scheme = m_url->scheme();
+        auto scheme = m_url->scheme();
         if (scheme == "http"sv)
             show_not_secure_indicator();
         else
@@ -623,7 +631,7 @@ void LocationEdit::update_location_icon()
         hide_indicator();
     } else if (WebView::location_looks_like_url(query_view)) {
         show_icon(ChromeIcon::Globe, "Go to address");
-    } else if (WebView::Application::settings().search_engine().has_value()) {
+    } else if (WebView::Application::settings().search_engine_settings().engine.has_value()) {
         show_icon(ChromeIcon::Search, "Search");
     } else {
         hide_indicator();
@@ -697,7 +705,7 @@ void LocationEdit::highlight_location()
             auto scheme_and_subdomain = url_parts->scheme_and_subdomain;
             auto remainder = url_parts->remainder;
 
-            auto scheme_prefix_length = m_url->scheme().bytes_as_string_view().length() + "://"sv.length();
+            auto scheme_prefix_length = m_url->scheme().length() + "://"sv.length();
             if (scheme_and_subdomain.length() >= scheme_prefix_length)
                 scheme_and_subdomain = scheme_and_subdomain.substring_view(scheme_prefix_length);
             if (scheme_and_subdomain.starts_with("www."sv, CaseSensitivity::CaseInsensitive))

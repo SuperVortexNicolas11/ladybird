@@ -13,6 +13,7 @@
 #include <AK/NumericLimits.h>
 #include <AK/OwnPtr.h>
 #include <AK/Utf16StringBuilder.h>
+#include <LibCompositing/DisplayList/Canvas2DCommandStream.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/CanvasCommandList.h>
 #include <LibGfx/CompositingAndBlendingOperator.h>
@@ -24,6 +25,7 @@
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/ValueInlines.h>
 #include <LibWeb/Bindings/DOMRectReadOnly.h>
+#include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
@@ -43,15 +45,18 @@
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/HTML/ImageRequest.h>
+#include <LibWeb/HTML/OffscreenCanvas.h>
+#include <LibWeb/HTML/OffscreenCanvasRenderingContext2D.h>
 #include <LibWeb/HTML/Path2D.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/TextMetrics.h>
-#include <LibWeb/Infra/CharacterTypes.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/ImageProvider.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Canvas2DCommandStream.h>
+#include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/SVG/SVGImageElement.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
 
 namespace Web::HTML {
 
@@ -59,10 +64,10 @@ namespace Web::HTML {
 static constexpr size_t max_pending_canvas_commands = 64;
 
 Canvas2DContextBase::Canvas2DContextBase(JS::Realm& realm, Gfx::IntSize initial_size, Bindings::CanvasRenderingContext2DSettings context_attributes)
-    : PlatformObject(realm)
-    , CanvasPath(static_cast<Bindings::PlatformObject&>(*this), *this)
+    : CanvasPath(static_cast<CanvasState const&>(*this))
     , m_size(initial_size)
     , m_context_attributes(move(context_attributes))
+    , m_realm(realm)
 {
 }
 
@@ -78,11 +83,19 @@ void Canvas2DContextBase::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     CanvasState::visit_edges(visitor);
+    visitor.visit(m_realm);
+}
+
+GC::Ptr<Bindings::Wrappable> Canvas2DContextBase::relevant_global_impl() const
+{
+    return canvas_host().canvas_relevant_global_impl();
 }
 
 size_t Canvas2DContextBase::external_memory_size() const
 {
     auto size = Base::external_memory_size();
+    if (m_cached_readback)
+        size = JS::saturating_add_external_memory_size(size, m_cached_readback->size_in_bytes());
     if (!has_backing_storage())
         return size;
 
@@ -203,7 +216,28 @@ WebIDL::ExceptionOr<void> Canvas2DContextBase::draw_image_internal(CanvasImageSo
         scaling_mode = Gfx::ScalingMode::BilinearMipmap;
     }
 
-    if (auto const* source_canvas = image.get_pointer<GC::Ref<HTMLCanvasElement>>()) {
+    auto draw_canvas_by_id = [&](Compositing::CanvasId source_canvas_id, bool source_is_2d) {
+        if (auto* canvas_command_list = this->canvas_command_list()) {
+            canvas_command_list->append(Gfx::CanvasCommands::DrawCanvas {
+                .source_canvas_id = source_canvas_id.value(),
+                .dst_rect = destination_rect,
+                .src_rect = source_rect.to_rounded<int>(),
+                .scaling_mode = scaling_mode,
+                .filter = drawing_state().filter,
+                .global_alpha = drawing_state().global_alpha,
+                .compositing_and_blending_operator = drawing_state().current_compositing_and_blending_operator,
+            });
+            did_draw(destination_rect);
+            if (!source_is_2d)
+                m_transport->flush_shared_stream();
+        }
+
+        // 7. If image is not origin-clean, then set the CanvasRenderingContext2D's origin-clean flag to false.
+        if (image_is_not_origin_clean(image))
+            m_origin_clean = false;
+    };
+
+    if (auto const* source_canvas = image.get_pointer<GC::Ref<HTMLCanvasElement>>(); source_canvas && !(*source_canvas)->is_placeholder()) {
         // A 2D source needs no eager synchronization: its recorded commands
         // precede this DrawCanvas in the shared ordered stream, so the replay
         // sees them by construction. WebGL frames are presented by a separate
@@ -215,26 +249,18 @@ WebIDL::ExceptionOr<void> Canvas2DContextBase::draw_image_internal(CanvasImageSo
         if (!source_is_2d)
             (*source_canvas)->prepare_for_compositing();
         if (auto source_canvas_id = (*source_canvas)->canvas_id(); source_canvas_id.has_value()) {
-            if (auto* canvas_command_list = this->canvas_command_list()) {
-                canvas_command_list->append(Gfx::CanvasCommands::DrawCanvas {
-                    .source_canvas_id = source_canvas_id->value(),
-                    .dst_rect = destination_rect,
-                    .src_rect = source_rect.to_rounded<int>(),
-                    .scaling_mode = scaling_mode,
-                    .filter = drawing_state().filter,
-                    .global_alpha = drawing_state().global_alpha,
-                    .compositing_and_blending_operator = drawing_state().current_compositing_and_blending_operator,
-                });
-                did_draw(destination_rect);
-                if (!source_is_2d)
-                    m_transport->flush_shared_stream();
-            }
-
-            // 7. If image is not origin-clean, then set the CanvasRenderingContext2D's origin-clean flag to false.
-            if (image_is_not_origin_clean(image))
-                m_origin_clean = false;
-
+            draw_canvas_by_id(*source_canvas_id, source_is_2d);
             return {};
+        }
+    }
+
+    if (auto const* source_canvas = image.get_pointer<GC::Ref<OffscreenCanvas>>()) {
+        if (auto const* source_context = (*source_canvas)->context().get_pointer<GC::Ref<OffscreenCanvasRenderingContext2D>>()) {
+            (*source_context)->ensure_backing_storage();
+            if (auto source_canvas_id = (*source_context)->canvas_id(); source_canvas_id.has_value()) {
+                draw_canvas_by_id(*source_canvas_id, true);
+                return {};
+            }
         }
     }
 
@@ -266,8 +292,9 @@ WebIDL::ExceptionOr<void> Canvas2DContextBase::draw_image_internal(CanvasImageSo
 
 void Canvas2DContextBase::did_draw(Gfx::FloatRect const&)
 {
+    m_cached_readback = nullptr;
     // FIXME: Make use of the rect to reduce the invalidated area when possible.
-    did_draw_hook();
+    canvas_host().did_change_canvas_content();
 }
 
 Gfx::CanvasCommandList* Canvas2DContextBase::canvas_command_list()
@@ -288,10 +315,10 @@ bool Canvas2DContextBase::ensure_remote_canvas_context()
     if (m_transport)
         return true;
 
-    auto* page = page_for_compositor();
-    if (!page || !page->has_compositor_host())
+    auto& page = canvas_host().canvas_page();
+    if (!page.has_compositor_host())
         return false;
-    auto transport = page->compositor_host().create_canvas_2d_transport();
+    auto transport = page.compositor_host().create_canvas_2d_transport();
     if (!transport)
         return false;
 
@@ -309,8 +336,19 @@ RefPtr<Gfx::Bitmap> Canvas2DContextBase::read_pixels(Gfx::IntRect const& rect)
 {
     if (!has_backing_storage())
         return nullptr;
+
+    // OPTIMIZATION: A remote readback requires a synchronous compositor IPC.
+    // Reuse the snapshot while no drawing command has changed its pixels.
+    if (m_cached_readback && m_cached_readback_rect == rect)
+        return m_cached_readback;
+
     m_transport->flush_shared_stream();
-    return m_transport->read_back_pixels(rect);
+    auto pixels = m_transport->read_back_pixels(rect);
+    if (pixels) {
+        m_cached_readback = pixels;
+        m_cached_readback_rect = rect;
+    }
+    return pixels;
 }
 
 void Canvas2DContextBase::set_size(Gfx::IntSize const& size)
@@ -328,7 +366,7 @@ void Canvas2DContextBase::prepare_for_compositing()
     m_transport->shared_stream().record_present(*m_transport->canvas_id());
 }
 
-Optional<Painting::CanvasId> Canvas2DContextBase::canvas_id() const
+Optional<Compositing::CanvasId> Canvas2DContextBase::canvas_id() const
 {
     if (!m_transport)
         return {};
@@ -340,11 +378,12 @@ void Canvas2DContextBase::notify_backing_storage_lost()
 {
     if (!has_backing_storage())
         return;
+    m_cached_readback = nullptr;
 
     // When the user agent detects that the backing storage associated with a canvas context has been lost, then it
     // must queue a global task on the DOM manipulation task source given canvas's relevant global object to run
     // these steps:
-    queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*this), GC::create_function(heap(), [this] {
+    queue_global_task(HTML::Task::Source::DOMManipulation, realm().global_object(), GC::create_function(heap(), [this] {
         // 1. Let canvas be context's canvas element.
         // 2. If context's context lost is true, then abort these steps.
         if (is_context_lost())
@@ -361,9 +400,9 @@ void Canvas2DContextBase::notify_backing_storage_lost()
 
         // 5. Let shouldRestore be the result of firing an event named contextlost at canvas, with the cancelable
         //    attribute initialized to true.
-        Bindings::EventInit context_lost_event_init;
+        DOM::EventInit context_lost_event_init;
         context_lost_event_init.cancelable = true;
-        bool should_restore = context_event_target().dispatch_event(DOM::Event::create(realm(), HTML::EventNames::contextlost, context_lost_event_init));
+        bool should_restore = canvas_host().canvas_event_target().dispatch_event(DOM::Event::create(realm().global_object(), HTML::EventNames::contextlost, context_lost_event_init));
 
         // 6. If shouldRestore is false, then abort these steps.
         if (!should_restore)
@@ -379,7 +418,7 @@ void Canvas2DContextBase::notify_backing_storage_lost()
         set_context_lost(false);
 
         // 9. Fire an event named contextrestored at canvas.
-        context_event_target().dispatch_event(DOM::Event::create(realm(), HTML::EventNames::contextrestored));
+        canvas_host().canvas_event_target().dispatch_event(DOM::Event::create(realm().global_object(), HTML::EventNames::contextrestored));
     }));
 }
 
@@ -390,11 +429,12 @@ void Canvas2DContextBase::ensure_backing_storage()
     if (!ensure_remote_canvas_context())
         return;
 
-    backing_storage_created_hook();
+    canvas_host().did_create_canvas_backing_storage();
 }
 
 void Canvas2DContextBase::discard_backing_storage()
 {
+    m_cached_readback = nullptr;
     if (m_transport) {
         // Flush the shared stream before destroying the context: it may still
         // hold commands targeting this canvas, and DrawCanvas commands from
@@ -410,10 +450,7 @@ Gfx::Path Canvas2DContextBase::text_path(Utf16View text, float x, float y, Optio
     if (max_width.has_value() && max_width.value() <= 0)
         return {};
 
-    auto& drawing_state = this->drawing_state();
-
     auto const& font_cascade_list = this->font_cascade_list();
-    auto const& font = font_cascade_list->first();
     auto glyph_runs = Gfx::shape_text({ x, y }, text, *font_cascade_list, resolved_letter_spacing());
     Gfx::Path path;
     float text_width = 0;
@@ -421,6 +458,13 @@ Gfx::Path Canvas2DContextBase::text_path(Utf16View text, float x, float y, Optio
         path.glyph_run(glyph_run);
         text_width += glyph_run->width();
     }
+    return path.copy_transformed(text_transform(text_width, max_width));
+}
+
+Gfx::AffineTransform Canvas2DContextBase::text_transform(float text_width, Optional<double> max_width)
+{
+    auto const& drawing_state = this->drawing_state();
+    auto const& font = font_cascade_list()->first();
     Gfx::AffineTransform transform = {};
 
     // https://html.spec.whatwg.org/multipage/canvas.html#text-preparation-algorithm:
@@ -492,7 +536,7 @@ Gfx::Path Canvas2DContextBase::text_path(Utf16View text, float x, float y, Optio
     if (baseline_y_offset != 0.f)
         transform = Gfx::AffineTransform {}.set_translation({ 0, baseline_y_offset }).multiply(transform);
 
-    return path.copy_transformed(transform);
+    return transform;
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-filltext
@@ -501,7 +545,46 @@ void Canvas2DContextBase::fill_text(Utf16View text, float x, float y, Optional<d
     if (!isfinite(x) || !isfinite(y) || (max_width.has_value() && !isfinite(max_width.value())))
         return;
 
-    fill_internal(text_path(text, x, y, max_width), Gfx::WindingRule::Nonzero);
+    auto& state = drawing_state();
+    // Complex text effects continue to use the combined outline so they are applied
+    // once to the entire text, including runs that use different fallback fonts.
+    if (max_width.has_value() || state.shadow_blur != 0 || state.shadow_offset_x != 0 || state.shadow_offset_y != 0) {
+        fill_internal(text_path(text, x, y, max_width), Gfx::WindingRule::Nonzero);
+        return;
+    }
+
+    auto font_cascade = font_cascade_list();
+    auto glyph_runs = Gfx::shape_text({}, text, *font_cascade, resolved_letter_spacing());
+    if (glyph_runs.size() != 1 || glyph_runs.first()->font().is_invisible()) {
+        fill_internal(text_path(text, x, y, max_width), Gfx::WindingRule::Nonzero);
+        return;
+    }
+
+    auto* command_list = canvas_command_list();
+    if (!command_list)
+        return;
+    auto paint_style = state.fill_style.to_gfx_paint_style();
+    if (!paint_style->is_visible() && state.current_compositing_and_blending_operator == Gfx::CompositingAndBlendingOperator::SourceOver)
+        return;
+    auto const& glyph_run = glyph_runs.first();
+    Vector<Gfx::CanvasGlyph> glyphs;
+    glyphs.ensure_capacity(glyph_run->glyphs().size());
+    for (auto const& glyph : glyph_run->glyphs()) {
+        if (glyph.should_paint)
+            glyphs.unchecked_append({ .position = glyph.position, .glyph_id = glyph.glyph_id });
+    }
+    auto font_id = m_transport->shared_stream().add_font(glyph_run->font());
+    auto translation = text_transform(glyph_run->width(), {}).map(Gfx::FloatPoint { x, y });
+    command_list->append(Gfx::CanvasCommands::DrawGlyphRun {
+        .font_id = font_id.value(),
+        .glyphs = move(glyphs),
+        .translation = translation,
+        .style = Gfx::to_canvas_paint_style(*paint_style),
+        .filter = state.filter,
+        .global_alpha = state.global_alpha,
+        .compositing_and_blending_operator = state.current_compositing_and_blending_operator,
+    });
+    did_draw({});
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-stroketext
@@ -607,14 +690,15 @@ void Canvas2DContextBase::stroke(Path2D const& path)
     stroke_internal(path.path().clone());
 }
 
-static Gfx::WindingRule parse_fill_rule(Utf16FlyString const& fill_rule)
+static constexpr Gfx::WindingRule bindings_to_gfx_fill_rule(Bindings::CanvasFillRule fill_rule)
 {
-    if (fill_rule == u"evenodd"sv)
-        return Gfx::WindingRule::EvenOdd;
-    if (fill_rule == u"nonzero"sv)
+    switch (fill_rule) {
+    case Bindings::CanvasFillRule::Nonzero:
         return Gfx::WindingRule::Nonzero;
-    dbgln("Unrecognized fillRule for CRC2D.fill() - this problem goes away once we pass an enum instead of a string");
-    return Gfx::WindingRule::Nonzero;
+    case Bindings::CanvasFillRule::Evenodd:
+        return Gfx::WindingRule::EvenOdd;
+    }
+    VERIFY_NOT_REACHED();
 }
 
 void Canvas2DContextBase::fill_internal(Gfx::Path path, Gfx::WindingRule winding_rule)
@@ -643,14 +727,14 @@ void Canvas2DContextBase::fill_internal(Gfx::Path path, Gfx::WindingRule winding
     did_draw(bounding_box);
 }
 
-void Canvas2DContextBase::fill(Utf16FlyString const& fill_rule)
+void Canvas2DContextBase::fill(Bindings::CanvasFillRule fill_rule)
 {
-    fill_internal(path().clone(), parse_fill_rule(fill_rule));
+    fill_internal(path().clone(), bindings_to_gfx_fill_rule(fill_rule));
 }
 
-void Canvas2DContextBase::fill(Path2D& path, Utf16FlyString const& fill_rule)
+void Canvas2DContextBase::fill(Path2D& path, Bindings::CanvasFillRule fill_rule)
 {
-    fill_internal(path.path().clone(), parse_fill_rule(fill_rule));
+    fill_internal(path.path().clone(), bindings_to_gfx_fill_rule(fill_rule));
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-createimagedata
@@ -775,7 +859,7 @@ WebIDL::ExceptionOr<void> Canvas2DContextBase::put_pixels_from_an_image_data_ont
 
     // 2. If IsDetachedBuffer(buffer) is true, then throw an "InvalidStateError" DOMException
     if (buffer->is_detached())
-        return WebIDL::InvalidStateError::create(image_data.realm(), "ImageData's underlying buffer is detached"_utf16);
+        return WebIDL::InvalidStateError::create("ImageData's underlying buffer is detached"_utf16);
 
     // 3. If dirtyWidth is negative, then let dirtyX be dirtyX+dirtyWidth, and let dirtyWidth be equal to the
     //    absolute magnitude of dirtyWidth.
@@ -830,7 +914,7 @@ WebIDL::ExceptionOr<void> Canvas2DContextBase::put_pixels_from_an_image_data_ont
     auto source_rect = Gfx::IntRect { dirty_x, dirty_y, dirty_width, dirty_height };
     auto source_bitmap_or_error = image_data.bitmap();
     if (source_bitmap_or_error.is_error())
-        return WebIDL::InvalidStateError::create(image_data.realm(), "ImageData's underlying buffer is detached or out-of-bounds"_utf16);
+        return WebIDL::InvalidStateError::create("ImageData's underlying buffer is detached or out-of-bounds"_utf16);
     auto source_bitmap = source_bitmap_or_error.release_value();
     auto bitmap_snapshot = MUST(Gfx::Bitmap::create_shareable(source_bitmap->format(), source_bitmap->alpha_type(), source_rect.size()));
     for (int y = 0; y < source_rect.height(); ++y)
@@ -887,7 +971,7 @@ GC::Ref<TextMetrics> Canvas2DContextBase::measure_text(Utf16View text)
     // TextMetrics object with members behaving as described in the following
     // list:
     auto prepared_text = prepare_text(text);
-    auto metrics = TextMetrics::create(realm());
+    auto metrics = TextMetrics::create();
     // FIXME: Use the font that was used to create the glyphs in prepared_text.
     auto const& font = font_cascade_list()->first();
     auto const& font_pixel_metrics = font.pixel_metrics();
@@ -950,7 +1034,13 @@ RefPtr<Gfx::FontCascadeList const> Canvas2DContextBase::font_cascade_list()
         set_font(u"10px sans-serif"sv);
     }
 
-    // Get current loaded font
+    // NB: Drawing states, including saved states, retain their cascades across font loads and font-display
+    //     transitions. Refresh them lazily so cached invisible fallback glyphs and metrics cannot outlive
+    //     the font environment that selected them.
+    if (drawing_state().font_environment_generation != canvas_host().canvas_font_computer().environment_generation()) {
+        auto font = drawing_state().font_style_value->to_utf16_string(CSS::SerializationMode::ResolvedValue);
+        set_font(font);
+    }
     return drawing_state().current_font_cascade_list;
 }
 
@@ -1026,22 +1116,22 @@ void Canvas2DContextBase::clip_internal(Gfx::Path& path, Gfx::WindingRule windin
     canvas_command_list->append(Gfx::CanvasCommands::ClipPath { .path = path.clone(), .winding_rule = winding_rule });
 }
 
-void Canvas2DContextBase::clip(Utf16FlyString const& fill_rule)
+void Canvas2DContextBase::clip(Bindings::CanvasFillRule fill_rule)
 {
-    clip_internal(path(), parse_fill_rule(fill_rule));
+    clip_internal(path(), bindings_to_gfx_fill_rule(fill_rule));
 }
 
-void Canvas2DContextBase::clip(Path2D& path, Utf16FlyString const& fill_rule)
+void Canvas2DContextBase::clip(Path2D& path, Bindings::CanvasFillRule fill_rule)
 {
-    clip_internal(path.path(), parse_fill_rule(fill_rule));
+    clip_internal(path.path(), bindings_to_gfx_fill_rule(fill_rule));
 }
 
-static bool is_point_in_path_internal(Gfx::Path path, Gfx::AffineTransform const& transform, double x, double y, Utf16FlyString const& fill_rule)
+static bool is_point_in_path_internal(Gfx::Path path, Gfx::AffineTransform const& transform, double x, double y, Bindings::CanvasFillRule fill_rule)
 {
     auto point = Gfx::FloatPoint(x, y);
     if (auto inverse_transform = transform.inverse(); inverse_transform.has_value())
         point = inverse_transform->map(point);
-    return path.contains(point, parse_fill_rule(fill_rule));
+    return path.contains(point, bindings_to_gfx_fill_rule(fill_rule));
 }
 
 static bool image_provider_is_usable_for_canvas(Layout::ImageProvider const& image_provider)
@@ -1055,12 +1145,12 @@ static bool image_provider_is_usable_for_canvas(Layout::ImageProvider const& ima
         && *intrinsic_width > 0 && *intrinsic_height > 0;
 }
 
-bool Canvas2DContextBase::is_point_in_path(double x, double y, Utf16FlyString const& fill_rule)
+bool Canvas2DContextBase::is_point_in_path(double x, double y, Bindings::CanvasFillRule fill_rule)
 {
     return is_point_in_path_internal(path(), drawing_state().transform, x, y, fill_rule);
 }
 
-bool Canvas2DContextBase::is_point_in_path(Path2D const& path, double x, double y, Utf16FlyString const& fill_rule)
+bool Canvas2DContextBase::is_point_in_path(Path2D const& path, double x, double y, Bindings::CanvasFillRule fill_rule)
 {
     return is_point_in_path_internal(path.path(), drawing_state().transform, x, y, fill_rule);
 }
@@ -1074,7 +1164,7 @@ WebIDL::ExceptionOr<CanvasImageSourceUsability> check_usability_of_image(CanvasI
         [](GC::Ref<HTMLImageElement> image_element) -> WebIDL::ExceptionOr<Optional<CanvasImageSourceUsability>> {
             // If image's current request's state is broken, then throw an "InvalidStateError" DOMException.
             if (image_element->current_request().state() == HTML::ImageRequest::State::Broken)
-                return WebIDL::InvalidStateError::create(image_element->realm(), "Image element state is broken"_utf16);
+                return WebIDL::InvalidStateError::create("Image element state is broken"_utf16);
 
             // If image is not fully decodable, or has an intrinsic width or intrinsic height
             // (or both) equal to zero, then return bad.
@@ -1105,14 +1195,14 @@ WebIDL::ExceptionOr<CanvasImageSourceUsability> check_usability_of_image(CanvasI
         [](GC::Ref<OffscreenCanvas> offscreen_canvas) -> WebIDL::ExceptionOr<Optional<CanvasImageSourceUsability>> {
             // If image has either a horizontal dimension or a vertical dimension equal to zero, then throw an "InvalidStateError" DOMException.
             if (offscreen_canvas->width() == 0 || offscreen_canvas->height() == 0)
-                return WebIDL::InvalidStateError::create(offscreen_canvas->realm(), "OffscreenCanvas width or height is zero"_utf16);
+                return WebIDL::InvalidStateError::create("OffscreenCanvas width or height is zero"_utf16);
             return Optional<CanvasImageSourceUsability> {};
         },
         // HTMLCanvasElement
         [](GC::Ref<HTMLCanvasElement> canvas_element) -> WebIDL::ExceptionOr<Optional<CanvasImageSourceUsability>> {
             // If image has either a horizontal dimension or a vertical dimension equal to zero, then throw an "InvalidStateError" DOMException.
             if (canvas_element->width() == 0 || canvas_element->height() == 0)
-                return WebIDL::InvalidStateError::create(canvas_element->realm(), "Canvas width or height is zero"_utf16);
+                return WebIDL::InvalidStateError::create("Canvas width or height is zero"_utf16);
             return Optional<CanvasImageSourceUsability> {};
         },
 
@@ -1120,7 +1210,7 @@ WebIDL::ExceptionOr<CanvasImageSourceUsability> check_usability_of_image(CanvasI
         // FIXME: VideoFrame
         [](GC::Ref<ImageBitmap> image_bitmap) -> WebIDL::ExceptionOr<Optional<CanvasImageSourceUsability>> {
             if (image_bitmap->is_detached())
-                return WebIDL::InvalidStateError::create(image_bitmap->realm(), "Image bitmap is detached"_utf16);
+                return WebIDL::InvalidStateError::create("Image bitmap is detached"_utf16);
             return Optional<CanvasImageSourceUsability> {};
         }));
     if (usability.has_value())
@@ -1148,8 +1238,13 @@ bool image_is_not_origin_clean(CanvasImageSource const& image)
             // FIXME: image's media data is CORS-cross-origin.
             return false;
         },
-        // HTMLCanvasElement, ImageBitmap or OffscreenCanvas
-        [](OneOf<GC::Ref<HTMLCanvasElement>, GC::Ref<ImageBitmap>, GC::Ref<OffscreenCanvas>> auto const&) {
+        // HTMLCanvasElement or OffscreenCanvas
+        [](OneOf<GC::Ref<HTMLCanvasElement>, GC::Ref<OffscreenCanvas>> auto const& canvas) {
+            // image's bitmap's origin-clean flag is false.
+            return !canvas->is_origin_clean();
+        },
+        // ImageBitmap
+        [](GC::Ref<ImageBitmap> const&) {
             // FIXME: image's bitmap's origin-clean flag is false.
             return false;
         });
@@ -1424,18 +1519,19 @@ void Canvas2DContextBase::set_filter(Utf16View filter)
         return;
     }
 
-    auto parser = CSS::Parser::Parser::create(CSS::Parser::ParsingParams { CSS::Parser::SpecialContext::CanvasContextGenericValue }, filter);
+    CSS::Parser::Parser parser { CSS::Parser::ParsingParams { CSS::Parser::SpecialContext::CanvasContextGenericValue } };
 
     // 2. Let parsedValue be the result of parsing the given values as a <filter-value-list>.
     //    If any property-independent style sheet syntax like 'inherit' or 'initial' is present,
     //    then this parsing must return failure.
-    auto style_value = parser.parse_as_css_value(CSS::PropertyID::Filter);
+    auto style_value = parser.parse_as_css_value(filter, CSS::PropertyID::Filter);
 
     if (style_value && style_value->is_value_list()) {
         auto absolutized_style_value = style_value->absolutized(computation_context_for_drawing_state());
         auto filter_value_list = absolutized_style_value->as_value_list().values();
 
         // 4. Set this's current filter to the given value.
+        Vector<Compositing::RustFFI::FfiFilterFunction> functions;
         for (auto& item : filter_value_list) {
             if (item->is_url()) {
                 // FIXME: Resolve the SVG filter
@@ -1444,57 +1540,41 @@ void Canvas2DContextBase::set_filter(Utf16View filter)
             }
 
             auto const& filter_value = item->as_filter();
+            Compositing::RustFFI::FfiFilterFunction function {};
             switch (filter_value.kind()) {
             case CSS::FilterStyleValue::Kind::Blur: {
                 auto const& blur_filter = static_cast<CSS::BlurFilterStyleValue const&>(filter_value);
-                float radius = blur_filter.resolved_radius();
-                auto new_filter = Gfx::Filter::blur(radius, radius);
-
-                drawing_state().filter = drawing_state().filter.has_value()
-                    ? Gfx::Filter::compose(new_filter, *drawing_state().filter)
-                    : new_filter;
+                function.kind = Compositing::RustFFI::FfiFilterFunctionKind::Blur;
+                function.amount = blur_filter.resolved_radius();
                 break;
             }
             case CSS::FilterStyleValue::Kind::Color: {
                 auto const& color = static_cast<CSS::ColorFilterStyleValue const&>(filter_value);
-                float amount = color.resolved_amount();
-                auto new_filter = Gfx::Filter::color(color.operation(), amount);
-
-                drawing_state().filter = drawing_state().filter.has_value()
-                    ? Gfx::Filter::compose(new_filter, *drawing_state().filter)
-                    : new_filter;
+                function.kind = Compositing::RustFFI::FfiFilterFunctionKind::Color;
+                function.color_operation = color.operation();
+                function.amount = color.resolved_amount();
                 break;
             }
             case CSS::FilterStyleValue::Kind::HueRotate: {
                 auto const& hue_rotate = static_cast<CSS::HueRotateFilterStyleValue const&>(filter_value);
-                float angle = hue_rotate.angle_degrees();
-                auto new_filter = Gfx::Filter::hue_rotate(angle);
-
-                drawing_state().filter = drawing_state().filter.has_value()
-                    ? Gfx::Filter::compose(new_filter, *drawing_state().filter)
-                    : new_filter;
+                function.kind = Compositing::RustFFI::FfiFilterFunctionKind::HueRotate;
+                function.amount = hue_rotate.angle_degrees();
                 break;
             }
             case CSS::FilterStyleValue::Kind::DropShadow: {
                 auto const& drop_shadow = static_cast<CSS::DropShadowFilterStyleValue const&>(filter_value);
-                float offset_x = static_cast<float>(CSS::Length::from_style_value(drop_shadow.offset_x(), {}).absolute_length_to_px());
-                float offset_y = static_cast<float>(CSS::Length::from_style_value(drop_shadow.offset_y(), {}).absolute_length_to_px());
-
-                float radius = 0.0f;
-                if (drop_shadow.radius()) {
-                    radius = static_cast<float>(CSS::Length::from_style_value(*drop_shadow.radius(), {}).absolute_length_to_px());
-                };
-
-                auto color = resolve_drop_shadow_color(drop_shadow);
-                auto new_filter = Gfx::Filter::drop_shadow(offset_x, offset_y, radius, color);
-
-                drawing_state().filter = drawing_state().filter.has_value()
-                    ? Gfx::Filter::compose(new_filter, *drawing_state().filter)
-                    : new_filter;
+                function.kind = Compositing::RustFFI::FfiFilterFunctionKind::DropShadow;
+                function.offset_x = static_cast<float>(CSS::Length::from_style_value(drop_shadow.offset_x(), {}).absolute_length_to_px());
+                function.offset_y = static_cast<float>(CSS::Length::from_style_value(drop_shadow.offset_y(), {}).absolute_length_to_px());
+                if (drop_shadow.radius())
+                    function.amount = static_cast<float>(CSS::Length::from_style_value(*drop_shadow.radius(), {}).absolute_length_to_px());
+                function.color = drop_shadow.color() ? drop_shadow.color()->to_color(canvas_host().canvas_color_resolution_context()).value_or(Gfx::Color::Black) : Gfx::Color::Black;
                 break;
             }
             }
+            functions.append(function);
         }
+        drawing_state().filter = Painting::filter_from_functions(functions);
 
         drawing_state().filter_string = Utf16String::from_utf16(filter);
     }

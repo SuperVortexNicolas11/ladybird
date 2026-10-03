@@ -5,10 +5,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLTableCellElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -31,12 +29,6 @@ HTMLTableCellElement::HTMLTableCellElement(DOM::Document& document, DOM::Qualifi
 }
 
 HTMLTableCellElement::~HTMLTableCellElement() = default;
-
-void HTMLTableCellElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLTableCellElement);
-    Base::initialize(realm);
-}
 
 bool HTMLTableCellElement::is_presentational_hint(Utf16FlyString const& name) const
 {
@@ -108,10 +100,12 @@ void HTMLTableCellElement::apply_presentational_hints(Vector<CSS::StyleProperty>
 
     if (!border)
         return;
+    // INTEROP: Like Chromium, a bordered table's cells inherit their border colour, which the
+    //          table's sections and rows inherit from the table in turn.
     auto apply_border_style = [&](CSS::PropertyID style_property, CSS::PropertyID width_property, CSS::PropertyID color_property) {
         properties.append({ .property_id = style_property, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Inset) });
         properties.append({ .property_id = width_property, .value = CSS::LengthStyleValue::create(CSS::Length::make_px(1)) });
-        properties.append({ .property_id = color_property, .value = table_element->computed_values()->computed_style_value(color_property).release_nonnull() });
+        properties.append({ .property_id = color_property, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Inherit) });
     };
     apply_border_style(CSS::PropertyID::BorderLeftStyle, CSS::PropertyID::BorderLeftWidth, CSS::PropertyID::BorderLeftColor);
     apply_border_style(CSS::PropertyID::BorderTopStyle, CSS::PropertyID::BorderTopWidth, CSS::PropertyID::BorderTopColor);
@@ -202,7 +196,7 @@ WebIDL::Long HTMLTableCellElement::cell_index() const
 
     auto rows = parent->cells()->collect_matching_elements();
     for (size_t i = 0; i < rows.size(); ++i) {
-        if (rows[i] == this)
+        if (rows[i].ptr() == this)
             return i;
     }
     return -1;

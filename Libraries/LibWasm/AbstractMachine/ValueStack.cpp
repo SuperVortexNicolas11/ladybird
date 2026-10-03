@@ -5,6 +5,7 @@
  */
 
 #include <AK/Vector.h>
+#include <AK/kmalloc.h>
 #include <LibWasm/AbstractMachine/ValueStack.h>
 
 #if defined(AK_OS_WINDOWS)
@@ -40,6 +41,8 @@ void free_region(void* region)
 
 // The pool is intentionally leaked at thread exit to avoid unmapping during teardown.
 struct RegionPool {
+    AK_ALLOC_WITH_KMALLOC;
+
     static constexpr size_t max_pooled_regions = 4;
     Vector<void*, max_pooled_regions> regions;
 };
@@ -68,6 +71,13 @@ ValueStack::~ValueStack()
         pool.regions.unchecked_append(m_base);
     else
         free_region(m_base);
+}
+
+void ValueStack::reset_and_clear()
+{
+    m_top = m_base;
+    for (size_t i = 0; i < conservative_scan_slack; ++i)
+        m_base[i] = Value(0);
 }
 
 }

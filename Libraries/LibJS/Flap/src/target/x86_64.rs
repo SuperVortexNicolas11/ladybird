@@ -23,7 +23,6 @@ use super::ir::{
     MachineOperand as Operand, MachineProgram as Program, RuntimeConstants,
 };
 use super::machine_verify::{define_machine_opcodes, operands_match};
-use super::registers::x86_64 as registers;
 use crate::frontend::layout::KnownLayoutConstant;
 use crate::{Architecture, CompileOptions, ObjectFormat};
 use std::fmt::Write;
@@ -306,6 +305,8 @@ define_machine_opcodes! {
         immediate(1).is_some_and(|value| (0..64).contains(&value))
     } printing simple!("btr"; native(0), SimpleOperand::Immediate(1));
     [SignExtendEaxToEdx] => Self::SignExtendEaxToEdx => [[]] printing simple!("cdq");
+    [SignExtendRaxToRdx] => Self::SignExtendRaxToRdx => [[]] printing simple!("cqo");
+    [SignedDivide64Register] => Self::SignedDivide64Register => [[R]] printing simple!("idiv"; native(0));
     [SignedDivide32Register] => Self::SignedDivide32Register => [[R]] printing simple!("idiv"; integer(0, IntegerWidth::U32));
 }
 
@@ -400,9 +401,9 @@ impl Opcode {
                 FloatingPointOperation::Convert(IntrinsicFloatConversion::Int32ToFloat64) => {
                     Self::FloatConversion(FloatConversion::Signed32ToDouble)
                 }
-                FloatingPointOperation::Convert(IntrinsicFloatConversion::Uint32ToFloat64) => {
-                    Self::FloatConversion(FloatConversion::Signed64ToDouble)
-                }
+                FloatingPointOperation::Convert(
+                    IntrinsicFloatConversion::Uint32ToFloat64 | IntrinsicFloatConversion::Int64ToFloat64,
+                ) => Self::FloatConversion(FloatConversion::Signed64ToDouble),
                 FloatingPointOperation::Convert(IntrinsicFloatConversion::Float32ToFloat64) => {
                     Self::FloatConversion(FloatConversion::FloatToDouble)
                 }
@@ -410,7 +411,9 @@ impl Opcode {
                     Self::FloatConversion(FloatConversion::DoubleToFloat)
                 }
                 FloatingPointOperation::Convert(
-                    IntrinsicFloatConversion::Float64ToInt32 | IntrinsicFloatConversion::JavaScriptToInt32,
+                    IntrinsicFloatConversion::Float64ToInt32
+                    | IntrinsicFloatConversion::Float64ToInt64
+                    | IntrinsicFloatConversion::JavaScriptToInt32,
                 )
                 | FloatingPointOperation::CanonicalizeNan => Self::Pseudo,
             },
@@ -420,6 +423,8 @@ impl Opcode {
 
     pub(crate) fn select(operation: super::description::Operation) -> Self {
         match operation {
+            Operation::AssertBranch(branch) => Self::select(Operation::Branch(branch)),
+            Operation::AssertFailure => Self::select(Operation::Control(crate::intrinsic::ControlOperation::JumpLabel)),
             Operation::Label => Self::Label,
             Operation::Control(crate::intrinsic::ControlOperation::JumpLabel) => Self::Jump,
             Operation::Control(crate::intrinsic::ControlOperation::Exit) => Self::JumpToExit,
@@ -507,8 +512,8 @@ fn emit_restored_registers(out: &mut String, fmt: ObjectFormat, abi: X86_64Abi) 
     }
 }
 
-const SYSV_VM_SLOT: &str = "[rbp - 48]";
-const WIN64_VM_SLOT: &str = "[rbp - 64]";
+pub(crate) const SYSV_VM_SLOT_OFFSET: i32 = -48;
+pub(crate) const WIN64_VM_SLOT_OFFSET: i32 = -64;
 pub(crate) const WIN64_RAW_NATIVE_RETURN_SLOT: i64 = -80;
 pub(crate) const WIN64_RAW_NATIVE_VARIANT_SLOT: i64 = -72;
 
@@ -592,19 +597,43 @@ fn generate_entry_point(out: &mut String, program: &Program, abi: X86_64Abi) {
     w!(out, "    mov r13d, {entry_point}         # pc = entry_point");
     let values_padding = if abi.is_win64() { "           " } else { "          " };
     w!(out, "    mov rbx, {values}{values_padding}# values");
-    let int32_tag_shifted = runtime(program)[KnownLayoutConstant::Int32TagShifted];
-    let int32_tag_shifted_register = int32_tag_shifted_register();
+    let heap_region_base = runtime(program)[KnownLayoutConstant::VmHeapRegionBase];
     w!(
         out,
-        "    movabs {int32_tag_shifted_register}, {int32_tag_shifted}  # INT32_TAG_SHIFTED"
+        "    mov r15, QWORD PTR [{vm} + {heap_region_base}]  # heap region base"
     );
     w!(out, "    mov QWORD PTR {}, {vm}  # save VM*", vm_slot(abi));
-    w!(out, "    lea r12, [rip + asm_dispatch_table]  # dispatch table");
+    let vm_breakpoint_controller = runtime(program)[KnownLayoutConstant::VmBreakpointController];
+    w!(out, "    cmp QWORD PTR [{vm} + {vm_breakpoint_controller}], 0");
+    w!(out, "    lea r12, [rip + asm_dispatch_table]");
+    w!(out, "    je .Ldispatch_table_ready");
+    w!(out, "    lea r12, [rip + asm_debug_dispatch_table]");
+    w!(out, ".Ldispatch_table_ready:");
+    w!(out, "    # r12 = dispatch table");
     emit_dispatch(out);
     w!(out);
 }
 
 fn generate_fallback_handler(out: &mut String, program: &Program, abi: X86_64Abi) {
+    w!(out, ".p2align 4");
+    w!(out, "asm_debugger_trampoline:");
+    emit_sync_pc_to_execution_context(out, program);
+    emit_vm_pc_args(out, abi);
+    w!(out, "    call CSYM(asm_debugger_check_breakpoint)");
+    emit_state_reload(out, program, abi);
+    // The reload may have picked up a different execution context, so reload its program counter
+    // instead of dispatching from the value that r13 held across the C++ call.
+    let program_counter = runtime(program)[KnownLayoutConstant::ExecutionContextProgramCounter];
+    w!(
+        out,
+        "    mov r13d, DWORD PTR [rbx + {}]",
+        program_counter - values_offset(program)
+    );
+    w!(out, "    movzx eax, BYTE PTR [r14 + r13]");
+    w!(out, "    lea rcx, [rip + asm_dispatch_table]");
+    w!(out, "    jmp [rcx + rax * 8]");
+    w!(out);
+
     // The fallback handler calls into C++ for any unhandled instruction.
     // extern "C" i64 asm_fallback_handler(VM* vm, u32 pc, u8 const* instruction);
     // Returns >= 0: new pc to dispatch to. Returns < 0: exit.
@@ -649,8 +678,13 @@ fn emit_state_reload(out: &mut String, program: &Program, abi: X86_64Abi) {
     w!(out, "    mov r14, QWORD PTR [rcx + {exec_bytecode}]");
 }
 
-fn vm_slot(abi: X86_64Abi) -> &'static str {
-    if abi.is_win64() { WIN64_VM_SLOT } else { SYSV_VM_SLOT }
+fn vm_slot(abi: X86_64Abi) -> String {
+    let offset = if abi.is_win64() {
+        WIN64_VM_SLOT_OFFSET
+    } else {
+        SYSV_VM_SLOT_OFFSET
+    };
+    format!("[rbp - {}]", -offset)
 }
 
 fn emit_load_vm(out: &mut String, dst: &str, abi: X86_64Abi) {
@@ -706,10 +740,6 @@ fn resolve_op(op: &Operand, _handler: &Handler, _program: &Program) -> String {
 
 fn values_offset(program: &Program) -> i64 {
     runtime(program)[KnownLayoutConstant::SizeOfExecutionContext]
-}
-
-fn int32_tag_shifted_register() -> &'static str {
-    registers::R15.as_str()
 }
 
 fn format_x86_address(terms: &str, offset: i64) -> String {
@@ -794,7 +824,7 @@ mod tests {
     fn test_program() -> Program {
         Program {
             runtime: RuntimeConstants::from_values([
-                (KnownLayoutConstant::Int32TagShifted, 0x7ffa_0000_0000_0000u64 as i64),
+                (KnownLayoutConstant::VmHeapRegionBase, 16664),
                 (KnownLayoutConstant::SizeOfExecutionContext, 120),
             ]),
             dispatch_handlers: Vec::new(),
@@ -813,6 +843,7 @@ mod tests {
             is_cold: false,
             hot_instructions: Vec::new(),
             cold_instructions: Vec::new(),
+            assertion_traps: Vec::new(),
         }
     }
 
@@ -890,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn boxes_clean_int32_values_with_the_pinned_tag() {
+    fn formats_or_with_a_physical_register() {
         let output = emit([instruction(
             Opcode::Or64Register,
             vec![

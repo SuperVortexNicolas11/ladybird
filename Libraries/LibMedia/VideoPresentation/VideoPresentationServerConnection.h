@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/ThreadSafeWeakable.h>
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/PlaybackManager.h>
@@ -14,7 +15,6 @@
 #include <LibMedia/VideoPresentation/VideoPresentationClientEndpoint.h>
 #include <LibMedia/VideoPresentation/VideoPresentationServerEndpoint.h>
 #include <LibMedia/VideoSinkHandle.h>
-#include <LibSync/Weakable.h>
 
 namespace Media {
 
@@ -23,11 +23,15 @@ namespace Media {
 // the edge's shared-memory handles to the presentation client, and routes the consumer's demands to the pump.
 class MEDIA_API VideoPresentationServerConnection final
     : public IPC::ConnectionFromClient<VideoPresentationClientEndpoint, VideoPresentationServerEndpoint>
-    , public Sync::Weakable<VideoPresentationServerConnection> {
+    , public ThreadSafeWeakable<VideoPresentationServerConnection> {
     C_OBJECT(VideoPresentationServerConnection);
 
 public:
     virtual ~VideoPresentationServerConnection() override;
+
+    // The presentation client may ask for an edge before the handle's registration reaches this process over another
+    // connection; such requests wait here until the host reports a registration.
+    void retry_pending_video_edges();
 
 private:
     explicit VideoPresentationServerConnection(NonnullOwnPtr<IPC::Transport>);
@@ -42,7 +46,6 @@ private:
     virtual void notify_space_available(u64 edge_id) override;
     virtual void notify_sink_status(u64 edge_id, PipelineStatus status, u32 requested_seek_id) override;
     virtual void notify_sink_resize(u64 edge_id, u32 width, u32 height) override;
-    virtual void set_sink_ticking(u64 edge_id, bool ticking) override;
 
     struct EdgeState {
         NonnullRefPtr<RemoteVideoSink> pump;
@@ -50,7 +53,10 @@ private:
         u32 actual_requested_seek_id { 0 };
     };
 
+    void create_registered_video_edge(VideoSinkHandle, u64 edge_id);
+
     HashMap<u64, EdgeState> m_edge_states;
+    HashMap<u64, VideoSinkHandle> m_pending_edge_handles_by_edge_id;
 };
 
 }

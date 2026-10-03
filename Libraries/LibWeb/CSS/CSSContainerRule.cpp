@@ -5,9 +5,7 @@
  */
 
 #include "CSSContainerRule.h"
-#include <LibJS/Runtime/Realm.h>
-#include <LibWeb/Bindings/CSSContainerRule.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/ContainerQuery.h>
 #include <LibWeb/CSS/Serialize.h>
 #include <LibWeb/DOM/AbstractElement.h>
@@ -17,39 +15,20 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSContainerRule);
 
-GC::Ref<CSSContainerRule> CSSContainerRule::create(JS::Realm& realm, Vector<Condition>&& conditions, CSSRuleList& rules)
+GC::Ref<CSSContainerRule> CSSContainerRule::create(RustRule rule, CSSRuleList& rules)
 {
-    return realm.create<CSSContainerRule>(realm, move(conditions), rules);
+    return GC::Heap::the().allocate<CSSContainerRule>(move(rule), rules);
 }
 
-CSSContainerRule::CSSContainerRule(JS::Realm& realm, Vector<Condition>&& conditions, CSSRuleList& rules)
-    : CSSConditionRule(realm, rules, Type::Container)
-    , m_conditions(move(conditions))
+CSSContainerRule::CSSContainerRule(RustRule rule, CSSRuleList& rules)
+    : CSSConditionRule(rules, move(rule))
+    , m_conditions(ContainerConditions::create(native_rule().payload().container))
 {
 }
 
 CSSContainerRule::~CSSContainerRule() = default;
 
-void CSSContainerRule::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSContainerRule);
-    Base::initialize(realm);
-}
-
-void CSSContainerRule::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_cached_parent_container_rule);
-}
-
-void CSSContainerRule::clear_caches()
-{
-    Base::clear_caches();
-    m_cached_parent_container_rule = nullptr;
-    m_parent_container_rule_cache_valid = false;
-}
-
-static Utf16String serialized_condition_name(CSSContainerRule::Condition const& condition)
+static Utf16String serialized_condition_name(ContainerConditions::Condition const& condition)
 {
     if (!condition.container_name.has_value())
         return {};
@@ -59,12 +38,12 @@ static Utf16String serialized_condition_name(CSSContainerRule::Condition const& 
     return builder.to_string();
 }
 
-static Utf16String serialized_condition_query(CSSContainerRule::Condition const& condition)
+static Utf16String serialized_condition_query(ContainerConditions::Condition const& condition)
 {
     return condition.container_query ? condition.container_query->to_string() : Utf16String {};
 }
 
-static void append_condition_text(Utf16StringBuilder& result, CSSContainerRule::Condition const& condition)
+static void append_condition_text(Utf16StringBuilder& result, ContainerConditions::Condition const& condition)
 {
     auto name = serialized_condition_name(condition);
     auto query = serialized_condition_query(condition);
@@ -86,7 +65,7 @@ Utf16String CSSContainerRule::serialized_condition_text() const
     // follows:
 
     // 1. Let conditions be the result of getting the conditions attribute.
-    auto const& conditions = m_conditions;
+    auto const& conditions = m_conditions->entries();
 
     // 2. Let first be true.
     auto first = true;
@@ -113,102 +92,6 @@ Utf16String CSSContainerRule::serialized_condition_text() const
 
     // 5. Return result.
     return result.to_string();
-}
-
-bool CSSContainerRule::condition_matches() const
-{
-    // NB: @container is processed differently from other CSSConditionRules. As such this is never called.
-    VERIFY_NOT_REACHED();
-}
-
-static bool has_ancestor_container_with_name(DOM::AbstractElement const& element, Utf16FlyString const& container_name)
-{
-    Optional<Utf16FlyString> optional_container_name { container_name };
-    for (auto const* container = element.flat_tree_parent_element(); container; container = container->flat_tree_parent_element()) {
-        if (container_name_matches(*container, optional_container_name))
-            return true;
-    }
-
-    return false;
-}
-
-bool CSSContainerRule::conditions_match(DOM::AbstractElement const& element) const
-{
-    for (auto const& condition : m_conditions) {
-        if (condition.container_query) {
-            if (condition.container_query->evaluate(element, condition.container_name) == MatchResult::True)
-                return true;
-            continue;
-        }
-
-        if (condition.container_name.has_value() && has_ancestor_container_with_name(element, *condition.container_name))
-            return true;
-    }
-
-    return false;
-}
-
-CSSContainerRule const* CSSContainerRule::find_parent_container_rule() const
-{
-    if (m_parent_container_rule_cache_valid)
-        return m_cached_parent_container_rule.ptr();
-
-    m_cached_parent_container_rule = nullptr;
-    for (auto const* rule = parent_rule(); rule; rule = rule->parent_rule()) {
-        if (auto const* container_rule = as_if<CSSContainerRule>(*rule)) {
-            m_cached_parent_container_rule = container_rule;
-            break;
-        }
-    }
-    m_parent_container_rule_cache_valid = true;
-
-    return m_cached_parent_container_rule.ptr();
-}
-
-bool CSSContainerRule::matches(DOM::AbstractElement const& element) const
-{
-    if (!conditions_match(element))
-        return false;
-
-    if (auto const* parent_container_rule = find_parent_container_rule())
-        return parent_container_rule->matches(element);
-
-    return true;
-}
-
-bool CSSContainerRule::contains_size_feature() const
-{
-    for (auto const& condition : m_conditions) {
-        if (condition.container_query && condition.container_query->contains_size_feature())
-            return true;
-    }
-
-    if (auto const* parent_container_rule = find_parent_container_rule())
-        return parent_container_rule->contains_size_feature();
-
-    return false;
-}
-
-bool CSSContainerRule::contains_style_feature() const
-{
-    for (auto const& condition : m_conditions) {
-        if (condition.container_query && condition.container_query->contains_style_feature())
-            return true;
-    }
-
-    if (auto const* parent_container_rule = find_parent_container_rule())
-        return parent_container_rule->contains_style_feature();
-
-    return false;
-}
-
-void CSSContainerRule::mark_element_style_dependencies(DOM::AbstractElement& abstract_element) const
-{
-    if (contains_size_feature())
-        abstract_element.element().set_style_depends_on_size_container_query();
-
-    if (contains_style_feature())
-        abstract_element.element().set_style_depends_on_style_container_query();
 }
 
 // https://drafts.csswg.org/cssom-1/#serialize-a-css-rule
@@ -245,7 +128,7 @@ Utf16String CSSContainerRule::container_name() const
     // The containerName attribute, on getting, must return a value as follows:
 
     // 1. Let conditions be the result of getting the conditions attribute.
-    auto const& conditions = m_conditions;
+    auto const& conditions = m_conditions->entries();
 
     // 2. If the length of conditions is 1:
     if (conditions.size() == 1) {
@@ -263,7 +146,7 @@ Utf16String CSSContainerRule::container_query() const
     // The containerQuery attribute, on getting, must return a value as follows:
 
     // 1. Let conditions be the result of getting the conditions attribute.
-    auto const& conditions = m_conditions;
+    auto const& conditions = m_conditions->entries();
 
     // 2. If the length of conditions is 1:
     if (conditions.size() == 1) {
@@ -284,8 +167,8 @@ Vector<CSSContainerCondition> CSSContainerRule::conditions() const
     Vector<CSSContainerCondition> result;
 
     // 2. For each <container-condition> condition specified in the rule:
-    result.ensure_capacity(m_conditions.size());
-    for (auto const& condition : m_conditions) {
+    result.ensure_capacity(m_conditions->entries().size());
+    for (auto const& condition : m_conditions->entries()) {
         // 1. Let dict be a new CSSContainerCondition with name set to the serialized <container-name> of condition if
         //    specified, or "" otherwise, and query set to the <container-query> specified in condition without any
         //    logical simplifications, so that the returned query will evaluate to the same result as the specified
@@ -305,17 +188,6 @@ Vector<CSSContainerCondition> CSSContainerRule::conditions() const
 
     // 3. Return result.
     return result;
-}
-
-void CSSContainerRule::for_each_effective_rule(TraversalOrder order, Function<void(CSSRule const&)> const& callback) const
-{
-    // https://drafts.csswg.org/css-conditional-5/#container-rule
-    // Global, name-defining at-rules such as @keyframes or @font-face or @layer that are defined inside container
-    // queries are not constrained by the container query conditions.
-    //
-    // NB: For other rules, we always treat them as effective now, and reject them later when our @container conditions
-    //     are evaluated.
-    CSSGroupingRule::for_each_effective_rule(order, callback);
 }
 
 }

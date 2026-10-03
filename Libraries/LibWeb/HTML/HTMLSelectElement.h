@@ -14,15 +14,15 @@
 #include <LibWeb/HTML/AutocompleteElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/HTMLOptionsCollection.h>
-#include <LibWeb/HTML/SelectItem.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/HTML/SelectItem.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
 
 class WEB_API HTMLSelectElement final
     : public HTMLElement
     , public AutocompleteElement {
-    WEB_PLATFORM_OBJECT(HTMLSelectElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLSelectElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLSelectElement);
     AUTOCOMPLETE_ELEMENT(HTMLElement, HTMLSelectElement);
 
@@ -30,8 +30,6 @@ public:
     virtual ~HTMLSelectElement() override;
 
     virtual bool is_html_select_element() const final { return true; }
-
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     WebIDL::UnsignedLong size() const;
     void set_size(WebIDL::UnsignedLong);
@@ -41,10 +39,9 @@ public:
     WebIDL::UnsignedLong length();
     WebIDL::ExceptionOr<void> set_length(WebIDL::UnsignedLong);
     HTMLOptionElement* item(WebIDL::UnsignedLong index);
-    virtual Optional<JS::Value> item_value(size_t index) const override;
-    HTMLOptionElement* named_item(Utf16View name);
+    HTMLOptionElement* named_item(Utf16String const& name);
     WebIDL::ExceptionOr<void> add(HTMLOptionOrOptGroupElement element, NullableHTMLElementOrElementIndex before = { Empty {} });
-    virtual WebIDL::ExceptionOr<void> set_value_of_indexed_property(u32, JS::Value) override;
+    WebIDL::ExceptionOr<void> set_value_of_indexed_property(u32, Optional<GC::Ref<DOM::Element>>);
     void remove();
     void remove(WebIDL::Long);
 
@@ -112,7 +109,7 @@ public:
     bool can_skip_selectedness_update_for_inserted_option(HTMLOptionElement const&) const;
 
     bool user_validity() const { return m_user_validity; }
-    void set_user_validity(bool flag) { m_user_validity = flag; }
+    void set_user_validity(bool);
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#placeholder-label-option
     HTMLOptionElement* placeholder_label_option() const;
@@ -133,8 +130,6 @@ public:
 
 private:
     HTMLSelectElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
     // ^DOM::Element
@@ -160,9 +155,10 @@ private:
     mutable GC::Ptr<HTMLOptionsCollection> m_options;
     GC::Ptr<DOM::HTMLCollection> m_selected_options;
     bool m_is_open { false };
-    Vector<SelectItem> m_select_items;
+    Vector<GC::Ref<HTMLOptionElement>> m_select_item_option_elements;
     GC::Ptr<DOM::Element> m_inner_text_element;
     GC::Ptr<DOM::Element> m_chevron_icon_element;
+    bool m_chevron_icon_hidden { false };
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
     bool m_user_validity { false };

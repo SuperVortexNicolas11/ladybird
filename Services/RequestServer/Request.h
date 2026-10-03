@@ -6,21 +6,27 @@
 
 #pragma once
 
+#include <LibRequests/NetworkUsage.h>
+
 #include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
+#include <AK/Function.h>
 #include <AK/MemoryStream.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <AK/Time.h>
-#include <LibCore/Proxy.h>
+#include <LibCore/Timer.h>
 #include <LibDNS/Resolver.h>
 #include <LibHTTP/Cache/CacheMode.h>
 #include <LibHTTP/Cache/CacheRequest.h>
 #include <LibHTTP/Cookie/IncludeCredentials.h>
+#include <LibHTTP/Cookie/ParsedCookie.h>
+#include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibHTTP/HeaderList.h>
 #include <LibIPC/File.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
+#include <LibRequests/RequestTransferLease.h>
 #include <LibURL/URL.h>
 #include <RequestServer/CacheLevel.h>
 #include <RequestServer/Forward.h>
@@ -31,8 +37,12 @@ struct curl_slist;
 
 namespace RequestServer {
 
+class AIACollector;
+
 class Request final : public HTTP::CacheRequest {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static NonnullOwnPtr<Request> fetch(
         u64 request_id,
         Optional<HTTP::DiskCache&> disk_cache,
@@ -46,8 +56,9 @@ public:
         ByteBuffer request_body,
         HTTP::Cookie::IncludeCredentials include_credentials,
         Optional<ByteString> alt_svc_cache_path,
-        Core::ProxyData proxy_data,
-        bool keep_alive_for_transfer);
+        Optional<Requests::RequestTransferLeaseKey>,
+        Optional<u32> address_selection_hint,
+        bool notify_on_cache_miss);
 
     static NonnullOwnPtr<Request> connect(
         u64 request_id,
@@ -68,23 +79,37 @@ public:
         NonnullRefPtr<HTTP::HeaderList> request_headers,
         ByteBuffer request_body,
         HTTP::Cookie::IncludeCredentials include_credentials,
-        Optional<ByteString> alt_svc_cache_path,
-        Core::ProxyData proxy_data);
+        Optional<ByteString> alt_svc_cache_path);
 
     virtual ~Request() override;
+
+    static void set_performance_monitor_enabled(bool);
+    static Vector<Requests::NetworkUsage> take_network_usage();
+    void set_performance_origin(i32 process_id, u64 page_id);
+    void sample_network_usage();
 
     u64 request_id() const { return m_request_id; }
     RequestType type() const { return m_type; }
     URL::URL const& url() const { return m_url; }
     bool is_complete() const { return m_state == State::Complete || m_state == State::Error; }
-    bool keep_alive_for_transfer() const { return m_keep_alive_for_transfer; }
+    bool has_transfer_lease() const { return m_transfer_lease.has_value(); }
+    Optional<Requests::RequestTransferLeaseKey> const& transfer_lease() const { return m_transfer_lease; }
 
-    ErrorOr<void> transfer_to_client(ConnectionFromClient&, u64 request_id);
-    void release_for_transfer() { m_keep_alive_for_transfer = false; }
+    ErrorOr<void> transfer_to_client(ConnectionFromClient&, u64 request_id, Optional<Requests::RequestTransferLeaseKey>);
+    void release_transfer_lease() { m_transfer_lease.clear(); }
+
+    // The disk cache defers a request while another request holds its cache entry open. These bound how long that other
+    // request may go without making progress before the deferred one goes to the network without the cache — and how
+    // long a background revalidation may go without receiving any data before it's abandoned. Tests shorten both.
+    static void set_wait_for_cache_timeout(AK::Duration);
+    static void set_revalidation_stall_timeout(AK::Duration);
 
     virtual void notify_request_unblocked(Badge<HTTP::DiskCache>) override;
-    void notify_retrieved_http_cookie(Badge<ConnectionFromClient>, StringView cookie);
+    virtual Optional<MonotonicTime> last_activity_time() const override { return m_last_activity_time; }
+    bool notify_retrieved_http_cookie(Badge<ControlConnectionFromClient>, u64 cookie_request_id, StringView cookie);
+    bool notify_stored_response_cookies_and_hsts_policy(Badge<ControlConnectionFromClient>, u64 store_request_id);
     void notify_fetch_complete(Badge<ConnectionFromClient>, int result_code);
+    void retry_after_aia(Badge<ConnectionFromClient>);
 
 private:
     struct TransferredBodyFile {
@@ -109,6 +134,7 @@ private:
         RetrieveCookie,    // Retrieve cookies from the UI process.
         Connect,           // Issue a network request to connect to the URL.
         Fetch,             // Issue a network request to fetch the URL.
+        WaitForAIA,        // Wait for an AIA intermediate-certificate fetch to complete, then retry the fetch.
         Complete,          // Finalize the request with the client.
         Error,             // Any error occured during the request's lifetime.
     };
@@ -122,6 +148,8 @@ private:
             return "ReadCache"sv;
         case State::WaitForCache:
             return "WaitForCache"sv;
+        case State::WaitForAIA:
+            return "WaitForAIA"sv;
         case State::FailedCacheOnly:
             return "FailedCacheOnly"sv;
         case State::ServeSubstitution:
@@ -156,8 +184,7 @@ private:
         ByteBuffer request_body,
         HTTP::Cookie::IncludeCredentials include_credentials,
         Optional<ByteString> alt_svc_cache_path,
-        Core::ProxyData proxy_data,
-        bool keep_alive_for_transfer = false);
+        Optional<Requests::RequestTransferLeaseKey> = {});
 
     Request(
         u64 request_id,
@@ -171,6 +198,8 @@ private:
 
     void handle_initial_state();
     void handle_read_cache_state();
+    void handle_wait_for_cache_state();
+    void wait_for_cache_timed_out();
     void handle_failed_cache_only_state();
     void handle_serve_substitution_state();
     void handle_dns_lookup_state();
@@ -183,11 +212,25 @@ private:
     static size_t on_header_received(void* buffer, size_t size, size_t nmemb, void* user_data);
     static size_t on_data_received(void* buffer, size_t size, size_t nmemb, void* user_data);
 
+    // A state change, response bytes from curl, or bytes written to the cache entry count as progress — and a
+    // request waiting on the cache entry this request holds open judges by it whether this request has stalled.
+    void mark_activity() { m_last_activity_time = MonotonicTime::now(); }
+
     ErrorOr<void> detach_curl_handle_from_multi();
+    ErrorOr<void> free_curl_structs();
     ErrorOr<void> inform_client_request_started();
+    bool should_retry_after_fetching_aia_intermediate(int curl_result_code) const;
+    void start_aia_fetch_and_retry();
     ErrorOr<void> send_request_pipe_to_client();
     ErrorOr<void> send_transferred_body_file_to_client();
     void transfer_headers_to_client_if_needed();
+
+    // The cookies and HSTS policy of a network response are stored by the UI process before the client learns about the
+    // response, so that the client can never observe the response without its cookies. Returns true if the response has
+    // to wait for that, in which case the continuation runs once the UI process has stored them.
+    bool defer_until_response_cookies_and_hsts_policy_are_stored(Function<void()> continuation);
+    void request_response_storage(ControlConnectionFromClient&);
+    void handle_fetch_complete(int result_code);
     void send_headers_to_client(Optional<IPC::File> javascript_bytecode = {}, u64 javascript_bytecode_size = 0, Optional<u64> javascript_bytecode_cache_vary_key = {});
     ErrorOr<void> write_queued_bytes_without_blocking();
 
@@ -199,7 +242,28 @@ private:
     u32 acquire_status_code() const;
     Requests::RequestTimingInfo acquire_timing_info() const;
 
+    Requests::NetworkUsage m_performance_origin;
+    u64 m_performance_generation { 0 };
+    u64 m_sampled_download_bytes { 0 };
+    u64 m_sampled_upload_bytes { 0 };
+
     u64 m_request_id { 0 };
+    Optional<u64> m_cookie_request_id;
+    bool m_appended_cookie_header { false };
+
+    enum class ResponseStorageState : u8 {
+        NotStarted,
+        Pending,
+        Done,
+    };
+    ResponseStorageState m_response_storage_state { ResponseStorageState::NotStarted };
+    Optional<u64> m_response_storage_request_id;
+    Function<void()> m_response_storage_continuation;
+    struct PendingResponseStorage {
+        Vector<HTTP::Cookie::ParsedCookie> cookies;
+        Optional<HTTP::HSTS::ParsedHSTSPolicy> hsts_policy;
+    };
+    Optional<PendingResponseStorage> m_pending_response_storage;
     RequestType m_type { RequestType::Fetch };
     State m_state { State::Init };
 
@@ -211,6 +275,13 @@ private:
     void* m_curl_easy_handle { nullptr };
     bool m_curl_easy_handle_is_in_multi { false };
     Vector<curl_slist*> m_curl_string_lists;
+
+    RefPtr<AIACollector> m_aia_collector;
+    size_t m_aia_fetch_count { 0 };
+    bool m_notify_on_cache_miss { false };
+    bool m_informed_client_requires_network { false };
+    bool m_informed_client_request_started { false };
+    bool m_cache_entry_was_revalidated { false };
     Optional<int> m_curl_result_code;
 
     NonnullRefPtr<Resolver> m_resolver;
@@ -221,13 +292,13 @@ private:
     ByteString m_method;
 
     UnixDateTime m_request_start_time { UnixDateTime::now() };
+    MonotonicTime m_last_activity_time { MonotonicTime::now() };
     NonnullRefPtr<HTTP::HeaderList> m_request_headers;
     ByteBuffer m_request_body;
 
     HTTP::Cookie::IncludeCredentials m_include_credentials { HTTP::Cookie::IncludeCredentials::Yes };
 
     Optional<ByteString> m_alt_svc_cache_path;
-    Core::ProxyData m_proxy_data;
 
     Optional<u32> m_status_code;
     Optional<String> m_reason_phrase;
@@ -237,12 +308,17 @@ private:
 
     AllocatingMemoryStream m_response_buffer;
     RefPtr<Core::Notifier> m_client_writer_notifier;
+    RefPtr<Core::Timer> m_wait_for_cache_timer;
     Optional<RequestPipe> m_client_request_pipe;
     Optional<TransferredBodyFile> m_transferred_body_file;
     size_t m_bytes_transferred_to_client { 0 };
 
     Optional<Requests::NetworkError> m_network_error;
-    bool m_keep_alive_for_transfer { false };
+    bool m_content_decoding_disabled { false };
+
+    Optional<u32> m_address_selection_hint;
+
+    Optional<Requests::RequestTransferLeaseKey> m_transfer_lease;
     RefPtr<ConnectionFromClient> m_network_connection_keep_alive;
 };
 

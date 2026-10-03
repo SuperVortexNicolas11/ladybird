@@ -8,13 +8,12 @@
  */
 
 #include <AK/AnyOf.h>
+#include <AK/CharacterTypes.h>
 #include <AK/Debug.h>
 #include <AK/FFIHelpers.h>
-#include <AK/NumericLimits.h>
-#include <AK/Utf16StringBuilder.h>
+#include <LibGC/Heap.h>
+#include <LibGC/RootVector.h>
 #include <LibTextCodec/Decoder.h>
-#include <LibWeb/Bindings/ExceptionOrUtils.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
@@ -34,12 +33,14 @@
 #include <LibWeb/DOM/StyleElementBase.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
+#include <LibWeb/HTML/CustomElements/CustomElementReactions.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLLinkElement.h>
+#include <LibWeb/HTML/HTMLMetaElement.h>
 #include <LibWeb/HTML/HTMLOptionElement.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLTemplateElement.h>
@@ -48,16 +49,17 @@
 #include <LibWeb/HTML/Parser/HTMLToken.h>
 #include <LibWeb/HTML/Parser/ParserScriptingMode.h>
 #include <LibWeb/HTML/Parser/SpeculativeHTMLParser.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTMLTokenizerRustFFI.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Infra/CharacterTypes.h>
-#include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
+#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::HTML {
 
@@ -95,6 +97,15 @@ static Utf16String utf16_string_from_ffi(u16 const* ptr, size_t len)
     return Utf16String::from_utf16({ reinterpret_cast<char16_t const*>(ptr), len });
 }
 
+static Utf16String utf8_string_from_ffi(u8 const* ptr, size_t len)
+{
+    if (len == 0)
+        return {};
+    return Utf16String::from_utf8_without_validation({ reinterpret_cast<char const*>(ptr), len });
+}
+
+static Optional<Utf16FlyString> attribute_namespace_from_html_parser_ffi(RustFfiHtmlAttributeNamespace);
+
 static Utf16String utf16_string_from_standardized_encoding_label(StringView label)
 {
     return Utf16String::from_ascii_without_validation(label.bytes());
@@ -116,27 +127,30 @@ extern "C" size_t ladybird_html_parser_document_html_element(void*);
 extern "C" void ladybird_html_parser_set_document_quirks_mode(void*, RustFfiHtmlQuirksMode);
 extern "C" size_t ladybird_html_parser_create_document_type(void*, u16 const*, size_t, u16 const*, size_t, u16 const*, size_t);
 extern "C" size_t ladybird_html_parser_create_comment(void*, u16 const*, size_t);
-extern "C" void ladybird_html_parser_insert_text(size_t, size_t, u16 const*, size_t);
-extern "C" void ladybird_html_parser_add_missing_attribute(size_t, u16 const*, size_t, u16 const*, size_t);
+extern "C" void ladybird_html_parser_insert_text(size_t, size_t, u8 const*, size_t);
+extern "C" void ladybird_html_parser_add_missing_attribute(size_t, size_t, u16 const*, size_t);
 extern "C" void ladybird_html_parser_remove_node(size_t);
 extern "C" void ladybird_html_parser_handle_element_popped(size_t);
 extern "C" void ladybird_html_parser_prepare_svg_script(void*, size_t, size_t);
 extern "C" void ladybird_html_parser_set_script_source_line(void*, size_t, size_t);
 extern "C" void ladybird_html_parser_mark_script_already_started(void*, size_t);
+extern "C" void ladybird_html_parser_process_meta_element(void*, size_t);
 extern "C" size_t ladybird_html_parser_parent_node(size_t);
 extern "C" size_t ladybird_html_parser_node_index(size_t);
-extern "C" size_t ladybird_html_parser_create_element(void*, size_t, RustFfiHtmlNamespace, u16 const*, size_t, u16 const*, size_t, RustFfiHtmlParserAttribute const*, size_t, bool, size_t, bool);
+extern "C" size_t ladybird_html_parser_create_element(void*, size_t, RustFfiHtmlNamespace, u16 const*, size_t, size_t, RustFfiHtmlParserAttribute const*, size_t, bool, size_t, bool);
 extern "C" void ladybird_html_parser_append_child(size_t, size_t);
 extern "C" void ladybird_html_parser_insert_node(size_t, size_t, size_t, bool);
+extern "C" void ladybird_html_parser_reinsert_last_node(size_t, size_t, size_t);
 extern "C" void ladybird_html_parser_move_all_children(size_t, size_t);
 extern "C" size_t ladybird_html_parser_template_content(size_t);
 extern "C" size_t ladybird_html_parser_attach_declarative_shadow_root(size_t, RustFfiHtmlShadowRootMode, RustFfiHtmlSlotAssignmentMode, bool, bool, bool, bool);
 extern "C" void ladybird_html_parser_set_template_content(size_t, size_t);
 extern "C" bool ladybird_html_parser_is_shadow_host(size_t);
 
-HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mode, StringView input, StringView encoding)
+HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mode, StringView input, StringView encoding, EncodingConfidence encoding_confidence)
     : m_tokenizer(decode_html_parser_input(input, encoding))
     , m_scripting_mode(scripting_mode)
+    , m_encoding_confidence(encoding_confidence)
     , m_document(document)
 {
     m_rust_parser = rust_html_parser_create();
@@ -146,9 +160,10 @@ HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mo
     m_document->set_encoding(utf16_string_from_standardized_encoding_label(standardized_encoding.value()));
 }
 
-HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mode, Utf16View input, Utf16View encoding)
+HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mode, Utf16View input, Utf16View encoding, EncodingConfidence encoding_confidence)
     : m_tokenizer(input)
     , m_scripting_mode(scripting_mode)
+    , m_encoding_confidence(encoding_confidence)
     , m_document(document)
 {
     m_rust_parser = rust_html_parser_create();
@@ -158,9 +173,21 @@ HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mo
     m_document->set_encoding(utf16_string_from_standardized_encoding_label(standardized_encoding.value()));
 }
 
-HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mode, ScriptCreatedParser script_created)
+HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mode, Utf16View input, FragmentParser fragment_parser)
+    : m_tokenizer(input)
+    , m_parsing_fragment(fragment_parser == FragmentParser::Yes)
+    , m_scripting_mode(scripting_mode)
+    , m_encoding_confidence(EncodingConfidence::Irrelevant)
+    , m_document(document)
+{
+    VERIFY(m_parsing_fragment);
+    m_rust_parser = rust_html_parser_create();
+}
+
+HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mode, ScriptCreatedParser script_created, EncodingConfidence encoding_confidence)
     : m_scripting_mode(scripting_mode)
     , m_script_created(script_created == ScriptCreatedParser::Yes)
+    , m_encoding_confidence(encoding_confidence)
     , m_document(document)
 {
     m_rust_parser = rust_html_parser_create();
@@ -186,13 +213,11 @@ void HTMLParser::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_context_element);
     visitor.visit(m_root_insertion_target);
     visitor.visit(m_active_speculative_html_parser);
+    visitor.visit(m_change_encoding_callback);
+    visitor.visit(m_ready_for_more_input_callback);
+    visitor.visit(m_parsing_complete_callback);
 
     rust_html_parser_visit_edges(m_rust_parser, &visitor);
-}
-
-void HTMLParser::initialize(JS::Realm& realm)
-{
-    Base::initialize(realm);
 }
 
 void HTMLParser::run(HTMLTokenizer::StopAtInsertionPoint stop_at_insertion_point)
@@ -248,29 +273,20 @@ void HTMLParser::pop_all_open_elements()
 
 void HTMLParser::configure_element_created_by_rust_parser(DOM::Element& element)
 {
-    if (element.local_name() == HTML::TagNames::link && element.namespace_uri() == Namespace::HTML) {
-        // AD-HOC: Let <link> elements know which document they were originally parsed for.
-        //         This is used for the render-blocking logic.
-        auto& link_element = as<HTMLLinkElement>(element);
-        link_element.set_parser_document({}, document());
-        link_element.set_was_enabled_when_created_by_parser({}, !element.has_attribute(HTML::AttributeNames::disabled));
-        return;
-    }
-
     if (element.local_name() != HTML::TagNames::script || element.namespace_uri() != Namespace::HTML)
         return;
 
     auto& script_element = as<HTMLScriptElement>(element);
-    if (m_scripting_mode != ParserScriptingMode::Fragment)
+    if (!m_parsing_fragment && m_scripting_mode != ParserScriptingMode::Fragment)
         script_element.set_parser_document(Badge<HTMLParser> {}, document());
     script_element.set_force_async(Badge<HTMLParser> {}, false);
-    if (m_scripting_mode == ParserScriptingMode::Inert)
+    if (m_parsing_fragment && m_scripting_mode != ParserScriptingMode::Fragment)
         script_element.set_already_started(Badge<HTMLParser> {}, true);
 }
 
-GC::Ref<DOM::Element> HTMLParser::create_element_for_rust_parser(HTMLToken const& token, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent, bool had_duplicate_attribute, GC::Ptr<HTMLFormElement> form_element, bool has_template_element_on_stack)
+GC::Ref<DOM::Element> HTMLParser::create_element_for_rust_parser(Utf16FlyString const& local_name, ReadonlySpan<RustFfiHtmlParserAttribute> attributes, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent, bool had_duplicate_attribute, GC::Ptr<HTMLFormElement> form_element, bool has_template_element_on_stack)
 {
-    auto element = create_element_for(token, namespace_, intended_parent);
+    auto element = create_element_for(local_name, attributes, namespace_, intended_parent);
     configure_element_created_by_rust_parser(element);
 
     // AD-HOC: See AD-HOC comment on Element.m_had_duplicate_attribute_during_tokenization about why this is done.
@@ -329,7 +345,7 @@ bool HTMLParser::process_script_end_tag_from_rust_parser(HTMLScriptElement& scri
     m_tokenizer.restore_old_insertion_point();
 
     // At this stage, if the pending parsing-blocking script is not null, then:
-    if (document().pending_parsing_blocking_script()) {
+    if (!m_parsing_fragment && document().pending_parsing_blocking_script()) {
         // -> If the script nesting level is not zero:
         if (script_nesting_level() != 0) {
             // Set the parser pause flag to true,
@@ -384,6 +400,101 @@ void HTMLParser::mark_script_already_started_from_rust_parser(HTMLScriptElement&
     script.set_already_started(Badge<HTMLParser> {}, true);
 }
 
+// https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inhead
+// -> A start tag whose tag name is "meta"
+void HTMLParser::process_meta_element_from_rust_parser(HTMLMetaElement& element)
+{
+    // If the active speculative HTML parser is null:
+    if (m_active_speculative_html_parser)
+        return;
+
+    // NB: Both steps below require tentative confidence.
+    if (m_encoding_confidence != EncodingConfidence::Tentative)
+        return;
+
+    // 1. If the element has a charset attribute, and getting an encoding from its value results in an encoding, and the
+    //    confidence is currently tentative, then change the encoding to the resulting encoding.
+    if (auto charset = element.get_attribute(AttributeNames::charset); charset.has_value()) {
+        if (auto encoding = TextCodec::get_standardized_encoding(charset->utf16_view()); encoding.has_value()) {
+            change_the_encoding(*encoding);
+            return;
+        }
+    }
+
+    // 2. Otherwise, if the element has an http-equiv attribute whose value is an ASCII case-insensitive match for
+    //    "Content-Type", and the element has a content attribute, and applying the algorithm for extracting a character
+    //    encoding from a meta element to that attribute's value returns an encoding, and the confidence is currently
+    //    tentative, then change the encoding to the extracted encoding.
+    if (element.http_equiv_state() != HTMLMetaElement::HttpEquivAttributeState::EncodingDeclaration)
+        return;
+
+    auto content = element.get_attribute(AttributeNames::content);
+    if (!content.has_value())
+        return;
+
+    auto content_as_utf8 = content->to_utf8_but_should_be_ported_to_utf16().to_byte_string();
+    if (auto encoding = extract_character_encoding_from_meta_element(content_as_utf8); encoding.has_value())
+        change_the_encoding(*encoding);
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#change-the-encoding
+void HTMLParser::change_the_encoding(StringView new_encoding)
+{
+    VERIFY(m_encoding_confidence == EncodingConfidence::Tentative);
+    VERIFY(m_document->has_encoding());
+
+    auto current_encoding = TextCodec::get_standardized_encoding(m_document->encoding().value());
+    VERIFY(current_encoding.has_value());
+
+    // 1. If the encoding that is already being used to interpret the input stream is UTF-16BE/LE, then set the
+    //    confidence to certain and return. The new encoding is ignored; if it was anything but the same encoding, then
+    //    it would be clearly incorrect.
+    if (current_encoding->is_one_of_ignoring_ascii_case("UTF-16BE"sv, "UTF-16LE"sv)) {
+        m_encoding_confidence = EncodingConfidence::Certain;
+        return;
+    }
+
+    // 2. If the new encoding is UTF-16BE/LE, then change it to UTF-8.
+    if (new_encoding.is_one_of_ignoring_ascii_case("UTF-16BE"sv, "UTF-16LE"sv))
+        new_encoding = "UTF-8"sv;
+
+    // 3. If the new encoding is x-user-defined, then change it to windows-1252.
+    if (new_encoding.equals_ignoring_ascii_case("x-user-defined"sv))
+        new_encoding = "windows-1252"sv;
+
+    // 4. If the new encoding is identical or equivalent to the encoding that is already being used to interpret the
+    //    input stream, then set the confidence to certain and return. This happens when the encoding information found
+    //    in the file matches what the encoding sniffing algorithm determined to be the encoding, and in the second pass
+    //    through the parser if the first pass found that the encoding sniffing algorithm described in the earlier
+    //    section failed to find the right encoding.
+    if (current_encoding->equals_ignoring_ascii_case(new_encoding)) {
+        m_encoding_confidence = EncodingConfidence::Certain;
+        return;
+    }
+
+    // 5. If all the bytes up to the last byte converted by the current decoder have the same Unicode interpretations in
+    //    both the current encoding and the new encoding, and if the user agent supports changing the converter on the
+    //    fly, then the user agent may change to the new converter for the encoding on the fly. Set the document's
+    //    character encoding and the encoding used to convert the input stream to the new encoding, set the confidence
+    //    to certain, and return.
+    if (m_change_encoding_callback && m_change_encoding_callback->function()(new_encoding)) {
+        m_document->set_encoding(utf16_string_from_standardized_encoding_label(new_encoding));
+        m_encoding_confidence = EncodingConfidence::Certain;
+        return;
+    }
+
+    // FIXME: 6. Otherwise, restart the navigate algorithm, with historyHandling set to "replace" and other inputs kept the
+    //           same, but this time skip the encoding sniffing algorithm and instead just set the encoding to the new encoding
+    //           and the confidence to certain. Whenever possible, this should be done without actually contacting the network
+    //           layer (the bytes should be re-parsed from memory), even if, e.g., the document is marked as not being
+    //           cacheable. If this is not possible and contacting the network layer would involve repeating a request that
+    //           uses a method other than `GET`, then instead set the confidence to certain and ignore the new encoding. The
+    //           resource will be misinterpreted. User agents may notify the user of the situation, to aid in application
+    //           development.
+    dbgln_if(HTML_PARSER_DEBUG, "Unable to change HTML parser encoding from '{}' to '{}' without restarting navigation", *current_encoding, new_encoding);
+    m_encoding_confidence = EncodingConfidence::Certain;
+}
+
 void HTMLParser::stop_parsing_from_rust_parser()
 {
     stop_parsing();
@@ -420,7 +531,7 @@ bool HTMLParser::process_svg_script_end_tag_from_rust_parser(SVG::SVGScriptEleme
     // If the SVG script registered itself as a pending parsing-blocking script (external fetch in flight),
     // pause the parser and schedule a resume check. The parser will resume from
     // resume_after_parser_blocking_script when the fetch completes.
-    if (document().pending_parsing_blocking_svg_script()) {
+    if (!m_parsing_fragment && document().pending_parsing_blocking_svg_script()) {
         m_parser_pause_flag = true;
         schedule_resume_check();
     }
@@ -468,22 +579,13 @@ void HTMLParser::the_end(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> pa
     if (parser)
         VERIFY(document == parser->m_document);
 
-    // The entirety of "the end" should be a no-op for HTML fragment parsers, because:
-    // - the temporary document is not accessible, making the DOMContentLoaded event and "ready for post load tasks" do
-    //   nothing, making the parser not re-entrant from document.{open,write,close} and document.readyState inaccessible
-    // - there is no Window associated with it and no associated browsing context with the temporary document (meaning
-    //   the Window load event is skipped and making the load timing info inaccessible)
-    // - scripts are not able to be prepared, meaning the script queues are empty.
-    // However, the unconditional "spin the event loop" invocations cause two issues:
-    // - Microtask timing is changed, as "spin the event loop" performs an unconditional microtask checkpoint, causing
-    //   things to happen out of order. For example, YouTube sets the innerHTML of a <template> element in the constructor
-    //   of the ytd-app custom element _before_ setting up class attributes. Since custom elements use microtasks to run
-    //   callbacks, this causes custom element callbacks that rely on attributes setup by the constructor to run before
-    //   the attributes are set up, causing unhandled exceptions.
-    // - Load event delaying can spin forever, e.g. if the fragment contains an <img> element which stops delaying the
-    //   load event from an element task. Since tasks are not considered runnable if they're from a document with no
-    //   browsing context (i.e. the temporary document made for innerHTML), the <img> element will forever delay the load
-    //   event and cause an infinite loop.
+    // The entirety of "the end" should be a no-op for HTML fragment parsers. Fragment parsing does not complete its
+    // context document, dispatch document or Window events, or process the context document's script queues. Moreover,
+    // the unconditional "spin the event loop" invocations perform a microtask checkpoint, causing things to happen out
+    // of order. For example, YouTube sets the innerHTML of a <template> element in the constructor of the ytd-app custom
+    // element _before_ setting up class attributes. Since custom elements use microtasks to run callbacks, this causes
+    // custom element callbacks that rely on attributes setup by the constructor to run before the attributes are set up,
+    // causing unhandled exceptions.
     // We can avoid these issues and also avoid doing unnecessary work by simply skipping "the end" for HTML fragment
     // parsers.
     // See the message of the commit that added this for more details.
@@ -552,14 +654,14 @@ static void perform_pre_progress_microtask_checkpoint()
 
 GC::Ref<HTMLParserEndState> HTMLParserEndState::create(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> parser, u64 parser_generation)
 {
-    return document->heap().allocate<HTMLParserEndState>(document, parser, parser_generation);
+    return GC::Heap::the().allocate<HTMLParserEndState>(document, parser, parser_generation);
 }
 
 HTMLParserEndState::HTMLParserEndState(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> parser, u64 parser_generation)
     : m_document(document)
     , m_parser(parser)
     , m_parser_generation(parser_generation)
-    , m_timeout(Platform::Timer::create_single_shot(heap(), THE_END_TIMEOUT_MS, GC::create_function(heap(), [this] {
+    , m_timeout(Platform::Timer::create_single_shot(GC::Heap::the(), THE_END_TIMEOUT_MS, GC::create_function(GC::Heap::the(), [this] {
         if (m_phase != Phase::Completed && m_phase != Phase::Cancelled)
             dbgln("HTMLParserEndState: timed out in phase {}", to_underlying(m_phase));
     })))
@@ -588,7 +690,7 @@ void HTMLParserEndState::schedule_progress_check()
     if (m_check_pending)
         return;
     m_check_pending = true;
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this] {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this] {
         perform_pre_progress_microtask_checkpoint();
         check_progress();
         m_check_pending = false;
@@ -648,6 +750,9 @@ void HTMLParserEndState::check_progress()
 
     case Phase::WaitingForLoadEventDelay:
         // 8. Spin the event loop until there is nothing that delays the load event in the Document.
+        // AD-HOC: Update layout first so font loads selected by text shaping can delay the load event.
+        // INTEROP: Gecko also flushes layout before firing the load event — so lazily-started font loads hold it back.
+        m_document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
         if (m_document->anything_is_delaying_the_load_event())
             return;
 
@@ -676,15 +781,16 @@ void HTMLParserEndState::advance_to_dom_content_loaded_phase()
     m_phase = Phase::WaitingForDOMContentLoaded;
 
     // 6. Queue a global task on the DOM manipulation task source given the Document's relevant global object to run the following substeps:
-    queue_global_task(HTML::Task::Source::DOMManipulation, *m_document, GC::create_function(m_document->heap(), [state = GC::Ref(*this), document = m_document] {
+    queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*m_document), GC::create_function(GC::Heap::the(), [state = GC::Ref(*this), document = m_document] {
         if (state->m_phase != Phase::WaitingForDOMContentLoaded)
             return;
-
         // 1. Set the Document's load timing info's DOM content loaded event start time to the current high resolution time given the Document's relevant global object.
         document->load_timing_info().dom_content_loaded_event_start_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(*document));
 
         // 2. Fire an event named DOMContentLoaded at the Document object, with its bubbles attribute initialized to true.
-        auto content_loaded_event = DOM::Event::create(document->realm(), HTML::EventNames::DOMContentLoaded);
+        auto content_loaded_event = DOM::Event::create(
+            HTML::EventNames::DOMContentLoaded,
+            HighResolutionTime::current_high_resolution_time(relevant_global_object(*document)));
         content_loaded_event->set_bubbles(true);
         document->dispatch_event(content_loaded_event);
 
@@ -711,35 +817,17 @@ void HTMLParserEndState::complete()
     m_phase = Phase::Completed;
 
     // 9. Queue a global task on the DOM manipulation task source given the Document's relevant global object to run the following steps:
-    queue_global_task(HTML::Task::Source::DOMManipulation, *m_document, GC::create_function(m_document->heap(), [state = GC::Ref(*this), document = m_document, parser = m_parser, parser_generation = m_parser_generation] {
+    queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*m_document), GC::create_function(GC::Heap::the(), [state = GC::Ref(*this), document = m_document, parser = m_parser, parser_generation = m_parser_generation] {
         if (state->m_phase != Phase::Completed)
             return;
-
-        // INTEROP: document.open() may have replaced the parser while this task was queued.
+        // document.open() can replace the parser after this completion task
+        // was queued but before it gets a chance to run. Do not let the old
+        // parser mark the replacement document ready for post-load tasks.
         if (parser_was_replaced(document, parser, parser_generation))
             return;
 
-        // NB: Step 8 can stop spinning and queue this task before an already-queued task reopens a descendant document.
-        //     Recheck its condition here and resume waiting using the same parser end state.
-        // INTEROP: Blink and WebKit recheck descendant completeness at their final load-completion gate. Gecko's
-        //          document loader likewise remains busy while a child loader is waiting to complete.
-        if (document->is_fully_active() && document->anything_is_delaying_the_load_event()) {
-            state->m_phase = Phase::WaitingForLoadEventDelay;
-            state->schedule_progress_check();
-            return;
-        }
-
         state->m_timeout->stop();
         document->set_html_parser_end_state(nullptr);
-
-        // 11. The Document is now ready for post-load tasks.
-        // NB: The spec sets this synchronously after queueing this task, and relies on "spin the event loop"
-        //     continuations being queued tasks to keep an ancestor document's load event behind this document's own
-        //     load event and its container's load event. Our parser end state machine checks its progress from
-        //     deferred invocations, which run ahead of queued tasks, so flip readiness inside this task instead;
-        //     an ancestor then cannot complete until this task (and everything it queues) is already in the queue.
-        //     WebKit and Blink time their equivalent flag the same way.
-        document->set_ready_for_post_load_tasks(true);
 
         // 1. Update the current document readiness to "complete".
         document->update_readiness(HTML::DocumentReadyState::Complete);
@@ -756,16 +844,24 @@ void HTMLParserEndState::complete()
         if (!document->browsing_context())
             return;
 
+        // AD-HOC: Give the document a styled, laid-out state before load listeners run. Style and
+        //         layout otherwise wait for the next rendering update, and a load handler that
+        //         changes style would fold its change into the document's very first style pass,
+        //         where a transition it expects to start has no before-change style to start from.
+        document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
+
         // 3. Let window be the Document's relevant global object.
-        auto& window = as<Window>(relevant_global_object(*document));
+        auto& window = relevant_window(*document);
 
         // 4. Set the Document's load timing info's load event start time to the current high resolution time given window.
-        document->load_timing_info().load_event_start_time = HighResolutionTime::current_high_resolution_time(window);
+        document->load_timing_info().load_event_start_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(window));
 
         // 5. Fire an event named load at window, with legacy target override flag set.
         // FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
         //        We should reorganize this so that the flag appears explicitly here instead.
-        window.dispatch_event(DOM::Event::create(document->realm(), HTML::EventNames::load));
+        window.dispatch_event(DOM::Event::create(
+            HTML::EventNames::load,
+            HighResolutionTime::current_high_resolution_time(relevant_global_object(window))));
 
         // INTEROP: A load event handler can call document.open(), which associates a replacement parser after the old
         //          parser was detached above. Do not let this completion continue into the replacement document.
@@ -777,7 +873,7 @@ void HTMLParserEndState::complete()
         // FIXME: 7. Set the Document object's navigation id to null.
 
         // 8. Set the Document's load timing info's load event end time to the current high resolution time given window.
-        document->load_timing_info().load_event_end_time = HighResolutionTime::current_high_resolution_time(window);
+        document->load_timing_info().load_event_end_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(window));
 
         // 9. Assert: Document's page showing is false.
         VERIFY(!document->page_showing());
@@ -793,10 +889,14 @@ void HTMLParserEndState::complete()
         if (document->parser_generation() != parser_generation)
             return;
 
+        // 11. The Document is now ready for post-load tasks.
+        document->set_ready_for_post_load_tasks(true);
+
         // 12. Completely finish loading the Document.
         document->completely_finish_loading();
 
-        // FIXME: 13. Queue the navigation timing entry for the Document.
+        // 13. Queue the navigation timing entry for the Document.
+        document->queue_navigation_timing_entry();
     }));
 
     // FIXME: 10. If the Document's print when loaded flag is set, then run the printing steps.
@@ -805,7 +905,7 @@ void HTMLParserEndState::complete()
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#create-an-element-for-the-token
-GC::Ref<DOM::Element> HTMLParser::create_element_for(HTMLToken const& token, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent)
+GC::Ref<DOM::Element> HTMLParser::create_element_for(Utf16FlyString const& local_name, ReadonlySpan<RustFfiHtmlParserAttribute> attributes, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent)
 {
     // 1. If the active speculative HTML parser is not null, then return the result of creating a speculative mock element given namespace, token's tag name, and token's attributes.
     // The active speculative HTML parser runs synchronously to completion, so it is null whenever the real parser
@@ -819,12 +919,19 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(HTMLToken const& token, Opt
     GC::Ref<DOM::Document> document = intended_parent.document();
 
     // 4. Let localName be token's tag name.
-    auto local_name = token.tag_name();
+
+    auto attribute_value = [&](Utf16FlyString const& name) -> Optional<StringView> {
+        for (auto const& attribute : attributes) {
+            if (attribute.local_name == name.raw_identity())
+                return StringView { reinterpret_cast<char const*>(attribute.value_ptr), attribute.value_len };
+        }
+        return {};
+    };
 
     // 5. Let is be the value of the "is" attribute in token, if such an attribute exists; otherwise null.
     Optional<Utf16FlyString> is_value;
-    if (auto is_attribute = token.attribute(AttributeNames::is); is_attribute.has_value())
-        is_value = Utf16FlyString::from_utf16(is_attribute->utf16_view());
+    if (auto is_attribute = attribute_value(AttributeNames::is); is_attribute.has_value())
+        is_value = Utf16FlyString::from_utf8_without_validation(*is_attribute);
 
     // 6. Let registry be the result of looking up a custom element registry given intendedParent.
     auto registry = look_up_a_custom_element_registry(intended_parent);
@@ -853,19 +960,14 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(HTMLToken const& token, Opt
 
     // 10. Let element be the result of creating an element given document, localName, namespace, null, is,
     //     willExecuteScript, and registry.
-    auto element = create_element(*document, local_name, namespace_, {}, is_value, will_execute_script, registry).release_value_but_fixme_should_propagate_errors();
-
-    // AD-HOC: See AD-HOC comment on Element.m_had_duplicate_attribute_during_tokenization about why this is done.
-    if (token.had_duplicate_attribute()) {
-        element->set_had_duplicate_attribute_during_tokenization({});
-    }
+    auto element = DOM::create_element(*document, local_name, namespace_, {}, is_value, will_execute_script, registry).release_value_but_fixme_should_propagate_errors();
 
     // AD-HOC: Let <link> elements know which document they were originally parsed for.
     //         This is used for the render-blocking logic.
-    if (local_name == HTML::TagNames::link && namespace_ == Namespace::HTML) {
+    if (!m_parsing_fragment && local_name == HTML::TagNames::link && namespace_ == Namespace::HTML) {
         auto& link_element = as<HTMLLinkElement>(*element);
         link_element.set_parser_document({}, document);
-        link_element.set_was_enabled_when_created_by_parser({}, !token.has_attribute(HTML::AttributeNames::disabled));
+        link_element.set_was_enabled_when_created_by_parser({}, !attribute_value(HTML::AttributeNames::disabled).has_value());
     }
 
     // AD-HOC: Let style elements know which document they were originally parsed for.
@@ -874,12 +976,14 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(HTMLToken const& token, Opt
         style_element->set_parser_document({}, document);
 
     // 11. Append each attribute in the given token to element.
-    token.for_each_attribute([&](auto const& attribute) {
-        DOM::QualifiedName qualified_name { attribute.local_name, attribute.prefix, attribute.namespace_ };
-        auto dom_attribute = realm().create<DOM::Attr>(*document, move(qualified_name), attribute.value, element);
-        element->append_attribute(dom_attribute);
-        return IterationDecision::Continue;
-    });
+    element->ensure_attribute_capacity(attributes.size());
+    for (auto const& attribute : attributes) {
+        Optional<Utf16FlyString> prefix;
+        if (attribute.prefix_len != 0)
+            prefix = Utf16FlyString::from_utf8_without_validation({ reinterpret_cast<char const*>(attribute.prefix_ptr), attribute.prefix_len });
+        DOM::QualifiedName qualified_name { Utf16FlyString::from_raw(attribute.local_name), move(prefix), attribute_namespace_from_html_parser_ffi(attribute.namespace_) };
+        element->append_attribute(move(qualified_name), utf8_string_from_ffi(attribute.value_ptr, attribute.value_len));
+    }
 
     // AD-HOC: The muted attribute on media elements is only set if the muted content attribute is present when the element is first created.
     if (element->is_html_media_element() && namespace_ == Namespace::HTML) {
@@ -899,7 +1003,7 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(HTMLToken const& token, Opt
         auto queue = relevant_similar_origin_window_agent(document).custom_element_reactions_stack.element_queue_stack.take_last();
 
         // 2. Invoke custom element reactions in queue.
-        Bindings::invoke_custom_element_reactions(queue);
+        invoke_custom_element_reactions(queue);
 
         // 3. Decrement document's throw-on-dynamic-markup-insertion counter.
         document->decrement_throw_on_dynamic_markup_insertion_counter({});
@@ -928,7 +1032,7 @@ void HTMLParser::schedule_resume_check()
     if (!m_parser_pause_flag)
         return;
     m_resume_check_pending = true;
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this] {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this] {
         m_resume_check_pending = false;
         perform_pre_progress_microtask_checkpoint();
         resume_after_parser_blocking_script();
@@ -947,7 +1051,20 @@ void HTMLParser::resume_after_parser_blocking_script()
 
     // INTEROP: Blink and WebKit detach a parser when document.open() replaces it. Do not let resume work from the
     //          detached parser consume a parsing-blocking script owned by the replacement parser.
-    if (m_document->parser() != this)
+    if (m_document->parser().ptr() != this)
+        return;
+
+    // The spec reaches the steps below only from the "text" insertion mode's script end-tag handling, at script-nesting
+    // level zero: While the level is nonzero (parser is being re-entered from a running script) that handling instead
+    // sets the parser pause flag and yields — leaving the pending script to the outer tree-construction stage. This
+    // async continuation is a deferred invocation, and a nested event-loop spin under a running script (sync XHR send)
+    // pumps those. So it can fire while a script is still executing; e.g. the one that wrote the pending script with
+    // document.write(). Yield the same way: Leave the parser paused, and let whatever ran the script (script end-tag
+    // handling, or tail of this method) re-schedule the check once the nesting level is back to zero. Gecko does the
+    // same in nsHtml5TreeOpExecutor::RunFlushLoop, which defers through ContinueParsingDocumentAfterCurrentScript while
+    // IsScriptExecuting; Blink/WebKit instead assert !IsExecutingScript() in HTMLDocumentParser::NotifyScriptLoaded and
+    // in HTMLScriptRunner's executeScriptsWaitingForLoad, since their sync XHR blocks without running tasks.
+    if (script_nesting_level() != 0)
         return;
 
     auto pending = document().pending_parsing_blocking_script();
@@ -1032,6 +1149,13 @@ void HTMLParser::resume_after_parser_blocking_script()
     // document.write).
     run();
 
+    // AD-HOC: The spec converts input bytes as the tokenizer consumes them, so a declaration can still re-encode
+    //         anything unconsumed. IncrementalDocumentParser pushes decoded characters instead and withholds bytes
+    //         whose encoding is still in question while the tokenizer is stopped; this hands them over, and can pause
+    //         us again.
+    if (!m_parser_pause_flag && m_ready_for_more_input_callback)
+        m_ready_for_more_input_callback->function()();
+
     if (m_parser_pause_flag)
         return;
 
@@ -1040,6 +1164,13 @@ void HTMLParser::resume_after_parser_blocking_script()
 
 void HTMLParser::invoke_post_parse_action()
 {
+    // AD-HOC: A resume from a parser-blocking script also lands here, with the input byte stream still open when more
+    //         bytes are on the way. The input retained for a late encoding declaration is only safe to drop once it
+    //         closes.
+    if (m_tokenizer.is_input_stream_closed()) {
+        if (auto callback = exchange(m_parsing_complete_callback, nullptr))
+            callback->function()();
+    }
     if (auto action = exchange(m_post_parse_action, nullptr))
         action();
 }
@@ -1060,6 +1191,252 @@ DOM::Document& HTMLParser::document()
     return *m_document;
 }
 
+namespace {
+
+struct FragmentAttribute {
+    StringView name;
+    StringView value;
+};
+
+Utf16FlyString const* supported_fragment_tag(StringView name)
+{
+    // Keep this subset deliberately small. Adding a tag requires checking its in-body tree-builder rules,
+    // its insertion steps, and interactions with every other supported tag.
+    if (name == "a"sv)
+        return &TagNames::a;
+    if (name == "b"sv)
+        return &TagNames::b;
+    if (name == "br"sv)
+        return &TagNames::br;
+    if (name == "button"sv)
+        return &TagNames::button;
+    if (name == "div"sv)
+        return &TagNames::div;
+    if (name == "footer"sv)
+        return &TagNames::footer;
+    if (name == "i"sv)
+        return &TagNames::i;
+    if (name == "input"sv)
+        return &TagNames::input;
+    if (name == "label"sv)
+        return &TagNames::label;
+    if (name == "li"sv)
+        return &TagNames::li;
+    if (name == "ol"sv)
+        return &TagNames::ol;
+    if (name == "span"sv)
+        return &TagNames::span;
+    if (name == "strong"sv)
+        return &TagNames::strong;
+    if (name == "ul"sv)
+        return &TagNames::ul;
+    if (name == "article"sv)
+        return &TagNames::article;
+    if (name == "aside"sv)
+        return &TagNames::aside;
+    if (name == "header"sv)
+        return &TagNames::header;
+    if (name == "main"sv)
+        return &TagNames::main;
+    if (name == "nav"sv)
+        return &TagNames::nav;
+    if (name == "section"sv)
+        return &TagNames::section;
+    if (name == "big"sv)
+        return &TagNames::big;
+    if (name == "code"sv)
+        return &TagNames::code;
+    if (name == "em"sv)
+        return &TagNames::em;
+    if (name == "s"sv)
+        return &TagNames::s;
+    if (name == "small"sv)
+        return &TagNames::small;
+    if (name == "strike"sv)
+        return &TagNames::strike;
+    if (name == "tt"sv)
+        return &TagNames::tt;
+    if (name == "u"sv)
+        return &TagNames::u;
+    return nullptr;
+}
+
+class FragmentScanner {
+public:
+    explicit FragmentScanner(StringView input)
+        : m_input(input)
+    {
+    }
+
+    template<typename Open, typename Close, typename Text>
+    bool parse(Open&& open, Close&& close, Text&& text)
+    {
+        Vector<Utf16FlyString const*, 32> stack;
+        Vector<FragmentAttribute, 16> attributes;
+        while (m_offset < m_input.length()) {
+            if (peek() != '<') {
+                auto start = m_offset;
+                while (m_offset < m_input.length() && peek() != '<') {
+                    if (peek() == '&' || peek() == '\r' || peek() == '\0')
+                        return false;
+                    ++m_offset;
+                }
+                text(m_input.substring_view(start, m_offset - start));
+                continue;
+            }
+            ++m_offset;
+            bool is_end_tag = consume('/');
+            auto name = scan_name();
+            auto* tag = supported_fragment_tag(name);
+            if (!tag)
+                return false;
+            if (is_end_tag) {
+                skip_whitespace();
+                if (!consume('>') || stack.is_empty() || stack.take_last() != tag)
+                    return false;
+                close();
+                continue;
+            }
+
+            // Leave implicit closing of anchors, buttons, and list items to the general parser.
+            if ((tag == &TagNames::a || tag == &TagNames::button) && stack.contains_slow(tag))
+                return false;
+            if (tag == &TagNames::li) {
+                for (size_t i = stack.size(); i > 0; --i) {
+                    auto* ancestor = stack[i - 1];
+                    if (ancestor == &TagNames::li)
+                        return false;
+                    // A nested list stops the in-body rule from closing an outer list item.
+                    if (ancestor == &TagNames::ul || ancestor == &TagNames::ol)
+                        break;
+                }
+            }
+            if (stack.size() >= 128)
+                return false;
+
+            attributes.clear_with_capacity();
+            while (true) {
+                skip_whitespace();
+                if (peek() == '>' || peek() == '/')
+                    break;
+                auto attribute_name = scan_name();
+                if (attribute_name.is_empty() || attribute_name == "is"sv || attributes.size() >= 64)
+                    return false;
+                for (auto const& attribute : attributes) {
+                    if (attribute.name == attribute_name)
+                        return false;
+                }
+                skip_whitespace();
+                StringView value = ""sv;
+                if (consume('=')) {
+                    skip_whitespace();
+                    char quote = peek();
+                    if (quote != '\'' && quote != '"')
+                        return false;
+                    ++m_offset;
+                    auto start = m_offset;
+                    while (m_offset < m_input.length() && peek() != quote) {
+                        if (peek() == '&' || peek() == '\r' || peek() == '\0')
+                            return false;
+                        ++m_offset;
+                    }
+                    value = m_input.substring_view(start, m_offset - start);
+                    if (!consume(quote))
+                        return false;
+                }
+                if (tag == &TagNames::input && attribute_name == "type"sv && !value.is_one_of("text"sv, "checkbox"sv))
+                    return false;
+                attributes.append({ attribute_name, value });
+            }
+            bool is_void = tag == &TagNames::br || tag == &TagNames::input;
+            if (consume('/') && !is_void)
+                return false;
+            if (!consume('>'))
+                return false;
+            open(*tag, attributes.span(), is_void);
+            if (!is_void)
+                stack.append(tag);
+        }
+        return stack.is_empty();
+    }
+
+private:
+    char peek() const { return m_offset < m_input.length() ? m_input[m_offset] : '\0'; }
+
+    bool consume(char ch)
+    {
+        if (m_offset == m_input.length() || peek() != ch)
+            return false;
+        ++m_offset;
+        return true;
+    }
+
+    void skip_whitespace()
+    {
+        while (peek() == ' ' || peek() == '\t' || peek() == '\n' || peek() == '\f')
+            ++m_offset;
+    }
+
+    StringView scan_name()
+    {
+        auto start = m_offset;
+        while (is_ascii_lower_alpha(peek()) || is_ascii_digit(peek()) || peek() == '-')
+            ++m_offset;
+        return m_input.substring_view(start, m_offset - start);
+    }
+
+    StringView m_input;
+    size_t m_offset { 0 };
+};
+
+}
+
+GC::Ptr<DOM::DocumentFragment> HTMLParser::try_parse_html_fragment_fast(DOM::Element& context, Utf16View input)
+{
+    // OPTIMIZATION: Validate a restricted in-body grammar before allocating or exposing any DOM nodes. The second
+    //               pass borrows input spans and constructs elements directly, bypassing tokenization and tree building.
+    //               All unsupported syntax falls back without side effects, including custom elements and foreign content.
+    if (context.namespace_uri() != Namespace::HTML || !input.has_ascii_storage())
+        return nullptr;
+    if (!context.local_name().is_one_of(TagNames::body, TagNames::div, TagNames::span, TagNames::ul, TagNames::ol,
+            TagNames::li, TagNames::footer, TagNames::button, TagNames::label, TagNames::p))
+        return nullptr;
+    if (context.first_ancestor_of_type<HTMLFormElement>())
+        return nullptr;
+
+    StringView source { input.ascii_span().data(), input.length_in_code_units() };
+    // Character references and input preprocessing use the general parser.
+    if (!FragmentScanner { source }.parse([](auto const&, auto, bool) { }, [] { }, [](auto) { }))
+        return nullptr;
+
+    auto fragment = DOM::DocumentFragment::create(context.document());
+    auto registry = look_up_a_custom_element_registry(context);
+    GC::RootVector<GC::Ref<DOM::Node>, 32> parents;
+    parents.append(fragment);
+    auto success = FragmentScanner { source }.parse(
+        [&](Utf16FlyString const& tag, ReadonlySpan<FragmentAttribute> attributes, bool is_void) {
+            auto& parent = *parents.last();
+            auto element = MUST(DOM::create_element(context.document(), tag, Namespace::HTML, {}, {}, false, registry));
+            element->ensure_attribute_capacity(attributes.size());
+            for (auto const& attribute : attributes) {
+                DOM::QualifiedName name { Utf16FlyString::from_utf8_without_validation(attribute.name), {}, {} };
+                element->append_attribute(move(name), Utf16String::from_utf8_without_validation(attribute.value));
+            }
+            auto& html_element = as<HTMLElement>(*element);
+            if (html_element.is_form_associated_element() && html_element.is_resettable())
+                html_element.reset_algorithm();
+            parent.parser_append_child(element);
+            if (!is_void)
+                parents.append(element);
+        },
+        [&] { parents.take_last(); },
+        [&](StringView text) {
+            parents.last()->parser_append_child(DOM::Text::create(context.document(), Utf16String::from_utf8_without_validation(text)));
+        });
+    VERIFY(success);
+    return fragment;
+}
+
 // https://html.spec.whatwg.org/multipage/parsing.html#parsing-html-fragments
 WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragment(Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::DocumentFragment>> target, Utf16View input, AllowDeclarativeShadowRoots allow_declarative_shadow_roots, ParserScriptingMode scripting_mode)
 {
@@ -1074,28 +1451,19 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragm
     // 3. Assert: context is non-null.
     VERIFY(context);
 
+    // OPTIMIZATION: A validated subset of in-body fragments can be constructed directly from input spans.
+    if (target.has<GC::Ref<DOM::Element>>()) {
+        if (auto fragment = try_parse_html_fragment_fast(*context, input))
+            return GC::Ref { *fragment };
+    }
+
     // 4. Let document be a Document node whose type is "html".
-    auto temp_document = DOM::Document::create(context->realm());
-    temp_document->set_document_type(DOM::Document::Type::HTML);
-
-    temp_document->set_temporary_document_for_fragment_parsing({});
-
-    // AD-HOC: We set the about base URL of the document to the same as the context's document.
-    //         This is required for Document::parse_url() to work inside iframe srcdoc documents.
-    //         Spec issue: https://github.com/whatwg/html/issues/12210
-    temp_document->set_about_base_url(context->document().about_base_url());
 
     // 5. Let contextDocument be context's node document.
     auto& context_document = context->document();
 
     // 6. If contextDocument is in quirks mode, then set document's mode to "quirks".
-    if (context_document.in_quirks_mode()) {
-        temp_document->set_quirks_mode(DOM::QuirksMode::Yes);
-    }
     // 7. Otherwise, if contextDocument is in limited-quirks mode, then set document's mode to "limited-quirks".
-    else if (context_document.in_limited_quirks_mode()) {
-        temp_document->set_quirks_mode(DOM::QuirksMode::Limited);
-    }
 
     // 8. Create a new HTML parser whose allow declarative shadow roots is allowDeclarativeShadowRoots, and associate it with document.
     // 9. If contextDocument's scripting is disabled, then set scriptingMode to Disabled.
@@ -1103,10 +1471,13 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragm
     if (context_document.is_scripting_disabled())
         scripting_mode = HTML::ParserScriptingMode::Disabled;
 
-    auto parser = HTMLParser::create_for_decoded_string(*temp_document, input, scripting_mode, "utf-8"_utf16);
+    // OPTIMIZATION: Use the context document directly while keeping the parser detached from its document parser state.
+    //               The detached root below supplies the temporary tree-builder state, while all output nodes are
+    //               created for their final document. This avoids initializing a complete Document for every fragment.
+    auto parser = GC::Heap::the().allocate<HTMLParser>(context_document, scripting_mode, input, FragmentParser::Yes);
+    parser->initialize(context_document.relevant_settings_object().realm());
     parser->set_allow_declarative_shadow_roots(allow_declarative_shadow_roots);
     parser->m_context_element = context; // FIXME: Is this needed?
-    parser->m_parsing_fragment = true;
 
     // 11. Set the state of the HTML parser's tokenization stage as follows, switching on context:
     bool const context_element_is_html = context->namespace_uri() == Namespace::HTML;
@@ -1153,14 +1524,15 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragm
     // 12. Let root be the result of creating an element given document, "html", the HTML namespace, null, null, false,
     //     and the result of looking up a custom element registry given target.
     auto root_registry = look_up_a_custom_element_registry(target_node);
-    auto root = MUST(create_element(*temp_document, HTML::TagNames::html, Namespace::HTML, {}, {}, false, root_registry));
+    auto root = MUST(DOM::create_element(context_document, HTML::TagNames::html, Namespace::HTML, {}, {}, false, root_registry));
 
     // 13. Append root to document.
-    MUST(temp_document->append_child(root));
+    // OPTIMIZATION: Keep the root detached. It is only a sentinel for the tree builder, whose root insertions are
+    //               redirected to the output fragment.
 
     // 14. Set up the HTML parser's stack of open elements so that it contains just the single element root.
     // 15. Let fragment be a new DocumentFragment whose node document is target's node document.
-    auto fragment = context->realm().create<DOM::DocumentFragment>(target_node->document());
+    auto fragment = DOM::DocumentFragment::create(target_node->document());
 
     // 16. Set the parser's root insertion target to fragment.
     parser->m_root_insertion_target = fragment;
@@ -1180,7 +1552,6 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragm
     if (!parser->m_form_element)
         parser->m_form_element = context->first_ancestor_of_type<HTMLFormElement>();
 
-    auto context_local_name = utf16_code_units_for_ffi(context->local_name().view());
     auto context_namespace = context->namespace_uri();
     auto context_namespace_ffi = namespace_to_html_parser_ffi(context_namespace);
     Vector<u16> context_namespace_uri;
@@ -1188,28 +1559,24 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragm
         context_namespace_uri = utf16_code_units_for_ffi(context_namespace->view());
     }
     Vector<RustFfiHtmlParserContextAttribute> context_attributes;
-    Vector<Vector<u16>> attribute_names;
     Vector<Vector<u16>> attribute_prefixes;
     Vector<Vector<u16>> attribute_values;
     if (auto attributes = context->attributes()) {
         context_attributes.ensure_capacity(attributes->length());
-        attribute_names.ensure_capacity(attributes->length());
         attribute_prefixes.ensure_capacity(attributes->length());
         attribute_values.ensure_capacity(attributes->length());
         for (size_t i = 0; i < attributes->length(); ++i) {
-            auto const* attribute = attributes->item(i);
-            attribute_names.unchecked_append(utf16_code_units_for_ffi(attribute->local_name().view()));
-            auto const& local_name = attribute_names.last();
-            attribute_values.unchecked_append(utf16_code_units_for_ffi(attribute->value().utf16_view()));
+            auto attribute = attributes->item(i);
+            auto attribute_value = attribute->value();
+            attribute_values.unchecked_append(utf16_code_units_for_ffi(attribute_value));
             auto const& value = attribute_values.last();
             Vector<u16> const* prefix = nullptr;
             if (attribute->prefix().has_value()) {
                 attribute_prefixes.unchecked_append(utf16_code_units_for_ffi(attribute->prefix()->view()));
                 prefix = &attribute_prefixes.last();
             }
-            context_attributes.unchecked_append({
-                local_name.data(),
-                local_name.size(),
+            context_attributes.unchecked_append(RustFfiHtmlParserContextAttribute {
+                attribute->local_name().raw_identity(),
                 prefix ? prefix->data() : nullptr,
                 prefix ? prefix->size() : 0,
                 attribute_namespace_to_html_parser_ffi(attribute->namespace_uri()),
@@ -1226,61 +1593,52 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragm
         context_namespace_ffi,
         context_namespace_uri.data(),
         context_namespace_uri.size(),
-        context_local_name.data(),
-        context_local_name.size(),
+        context->local_name().raw_identity(),
         context_attributes.data(),
         context_attributes.size(),
-        quirks_mode_to_html_parser_ffi(temp_document->mode()),
+        quirks_mode_to_html_parser_ffi(context_document.mode()),
         allow_declarative_shadow_roots == AllowDeclarativeShadowRoots::Yes,
         parser->m_form_element ? reinterpret_cast<size_t>(parser->m_form_element.ptr()) : 0);
 
     // 22. Place the input into the input stream for the HTML parser just created. The encoding confidence is irrelevant.
     // 23. Start the HTML parser and let it run until it has consumed all the characters just inserted into the input stream.
-    parser->run(context->document().url());
+    parser->run_until_completion();
 
-    // 24. Return fragment.
     return fragment;
 }
 
 GC::Ref<HTMLParser> HTMLParser::create_for_scripting(DOM::Document& document)
 {
     auto scripting_mode = document.is_scripting_enabled() ? ParserScriptingMode::Normal : ParserScriptingMode::Disabled;
-    return document.realm().create<HTMLParser>(document, scripting_mode, ScriptCreatedParser::Yes);
+    return document.relevant_settings_object().realm().create<HTMLParser>(document, scripting_mode, ScriptCreatedParser::Yes, EncodingConfidence::Irrelevant);
 }
 
-GC::Ref<HTMLParser> HTMLParser::create_with_open_input_stream(DOM::Document& document)
+GC::Ref<HTMLParser> HTMLParser::create_with_open_input_stream(DOM::Document& document, EncodingConfidence encoding_confidence)
 {
     auto scripting_mode = document.is_scripting_enabled() ? ParserScriptingMode::Normal : ParserScriptingMode::Disabled;
-    auto parser = document.realm().create<HTMLParser>(document, scripting_mode, ScriptCreatedParser::No);
-    parser->set_allow_declarative_shadow_roots(AllowDeclarativeShadowRoots::Yes);
-    return parser;
+    return document.relevant_settings_object().realm().create<HTMLParser>(document, scripting_mode, ScriptCreatedParser::No, encoding_confidence);
 }
 
 GC::Ref<HTMLParser> HTMLParser::create_with_uncertain_encoding(DOM::Document& document, ByteBuffer const& input, Optional<MimeSniff::MimeType> maybe_mime_type)
 {
     auto scripting_mode = document.is_scripting_enabled() ? ParserScriptingMode::Normal : ParserScriptingMode::Disabled;
-    auto parser = [&] {
-        if (document.has_encoding()) {
-            auto standardized_encoding = TextCodec::get_standardized_encoding(document.encoding().value());
-            VERIFY(standardized_encoding.has_value());
-            return document.realm().create<HTMLParser>(document, scripting_mode, input, standardized_encoding.value());
-        }
-        auto encoding = run_encoding_sniffing_algorithm(document, input, maybe_mime_type);
-        dbgln_if(HTML_PARSER_DEBUG, "The encoding sniffing algorithm returned encoding '{}'", encoding);
-        return document.realm().create<HTMLParser>(document, scripting_mode, input, encoding);
-    }();
-    parser->set_allow_declarative_shadow_roots(AllowDeclarativeShadowRoots::Yes);
-    return parser;
+
+    if (document.has_encoding())
+        return document.relevant_settings_object().realm().create<HTMLParser>(document, scripting_mode, input, document.encoding().value().to_byte_string(), EncodingConfidence::Certain);
+
+    auto [encoding, confidence] = run_encoding_sniffing_algorithm(document, input, maybe_mime_type);
+    dbgln_if(HTML_PARSER_DEBUG, "The encoding sniffing algorithm returned encoding '{}'", encoding);
+    return document.relevant_settings_object().realm().create<HTMLParser>(document, scripting_mode, input, encoding, confidence);
 }
 
 GC::Ref<HTMLParser> HTMLParser::create_from_byte_string(DOM::Document& document, StringView input, ParserScriptingMode scripting_mode, StringView encoding)
 {
-    return document.realm().create<HTMLParser>(document, scripting_mode, input, encoding);
+    return document.relevant_settings_object().realm().create<HTMLParser>(document, scripting_mode, input, encoding, EncodingConfidence::Certain);
 }
 
 GC::Ref<HTMLParser> HTMLParser::create_for_decoded_string(DOM::Document& document, Utf16View input, ParserScriptingMode scripting_mode, Utf16View encoding)
 {
-    return document.realm().create<HTMLParser>(document, scripting_mode, input, encoding);
+    return document.relevant_settings_object().realm().create<HTMLParser>(document, scripting_mode, input, encoding, EncodingConfidence::Irrelevant);
 }
 
 enum class AttributeMode {
@@ -1395,7 +1753,8 @@ Utf16String HTMLParser::serialize_html_fragment(DOM::Node const& node, Serializa
             }
 
             builder.append_ascii("=\""sv);
-            builder.append(escape_string(attribute.value().utf16_view(), AttributeMode::Yes));
+            auto attribute_value = attribute.value();
+            builder.append(escape_string(attribute_value.utf16_view(), AttributeMode::Yes));
             builder.append_ascii('"');
         });
 
@@ -1457,7 +1816,7 @@ Utf16String HTMLParser::serialize_html_fragment(DOM::Node const& node, Serializa
                 builder.append_ascii("<template shadowrootmode=\""sv);
 
                 // 2. If shadow's mode is "open", then append "open". Otherwise, append "closed".
-                builder.append_ascii(shadow->mode() == Bindings::ShadowRootMode::Open ? "open"sv : "closed"sv);
+                builder.append(shadow->mode() == Web::DOM::ShadowRootMode::Open ? "open"sv : "closed"sv);
 
                 // 3. Append """.
                 builder.append_ascii('"');
@@ -1471,8 +1830,8 @@ Utf16String HTMLParser::serialize_html_fragment(DOM::Node const& node, Serializa
                     builder.append_ascii(" shadowrootserializable=\"\""sv);
 
                 // 6. If shadow's slot assignment is "manual", then append " shadowrootslotassignment="manual"".
-                if (shadow->slot_assignment() == Bindings::SlotAssignmentMode::Manual)
-                    builder.append_ascii(" shadowrootslotassignment=\"manual\""sv);
+                if (shadow->slot_assignment() == Web::DOM::SlotAssignmentMode::Manual)
+                    builder.append(" shadowrootslotassignment=\"manual\""sv);
 
                 // 7. If shadow's clonable is set, then append " shadowrootclonable=""".
                 if (shadow->clonable())
@@ -1897,11 +2256,6 @@ RefPtr<CSS::StyleValue const> parse_table_child_element_align_value(Utf16View st
     return nullptr;
 }
 
-JS::Realm& HTMLParser::realm()
-{
-    return m_document->realm();
-}
-
 // https://html.spec.whatwg.org/multipage/parsing.html#start-the-speculative-html-parser
 void HTMLParser::start_the_speculative_html_parser()
 {
@@ -1917,7 +2271,7 @@ void HTMLParser::start_the_speculative_html_parser()
     //    speculative mock elements. Let speculativeParser parse into speculativeDoc.
     // NOTE: The Rust preload scanner emits speculative fetch candidates directly, so we do not materialize a
     // speculativeDoc tree or speculative mock elements.
-    auto speculative_parser = SpeculativeHTMLParser::create(realm(), *m_document, m_tokenizer.unparsed_input(), m_document->base_url());
+    auto speculative_parser = SpeculativeHTMLParser::create(*m_document, m_tokenizer.unparsed_input(), m_document->base_url(), m_scripting_mode);
 
     // 5. Set parser's active speculative HTML parser to speculativeParser.
     m_active_speculative_html_parser = speculative_parser;
@@ -2118,10 +2472,32 @@ struct NodeAndOffset {
     }
 };
 
+static void insert_node_for_parser(DOM::Node& parent, DOM::Node& node, DOM::Node* child)
+{
+    if (!parent.is_tracked_by_style_engine()) {
+        parent.parser_insert_before(node, child);
+        return;
+    }
+    if (child) {
+        parent.insert_before(node, child, false);
+    } else {
+        MUST(parent.append_child(node));
+    }
+}
+
+static u64 s_parser_non_append_insertions { 0 };
+
+u64 parser_non_append_insertions()
+{
+    return s_parser_non_append_insertions;
+}
+
 static NodeAndOffset node_and_offset_from_html_parser_ffi(size_t node, size_t offset)
 {
     auto& dom_node = node_from_html_parser_ffi(node);
     VERIFY(offset == NodeAndOffset::append_child_offset || offset <= dom_node.child_count());
+    if (offset != NodeAndOffset::append_child_offset)
+        ++s_parser_non_append_insertions;
     return { dom_node, offset };
 }
 
@@ -2148,22 +2524,24 @@ extern "C" void ladybird_html_parser_set_document_quirks_mode(void* parser, Rust
 extern "C" size_t ladybird_html_parser_create_document_type(void* parser, u16 const* name_ptr, size_t name_len, u16 const* public_id_ptr, size_t public_id_len, u16 const* system_id_ptr, size_t system_id_len)
 {
     auto& html_parser = parser_from_html_parser_ffi(parser);
-    auto document_type = html_parser.document().realm().create<DOM::DocumentType>(html_parser.document());
+    auto document_type = DOM::DocumentType::create(html_parser.document());
     document_type->set_name(utf16_fly_string_from_ffi(name_ptr, name_len));
-    document_type->set_public_id(utf16_string_from_ffi(public_id_ptr, public_id_len));
-    document_type->set_system_id(utf16_string_from_ffi(system_id_ptr, system_id_len));
+    auto public_id = utf16_string_from_ffi(public_id_ptr, public_id_len);
+    auto system_id = utf16_string_from_ffi(system_id_ptr, system_id_len);
+    document_type->set_public_id(public_id.utf16_view());
+    document_type->set_system_id(system_id.utf16_view());
     return reinterpret_cast<size_t>(document_type.ptr());
 }
 
 extern "C" size_t ladybird_html_parser_create_comment(void* parser, u16 const* data_ptr, size_t data_len)
 {
     auto& html_parser = parser_from_html_parser_ffi(parser);
-    auto comment = html_parser.document().realm().create<DOM::Comment>(html_parser.document(), utf16_string_from_ffi(data_ptr, data_len));
+    auto comment = DOM::Comment::create(html_parser.document(), utf16_string_from_ffi(data_ptr, data_len));
     return reinterpret_cast<size_t>(comment.ptr());
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#insert-a-character
-extern "C" void ladybird_html_parser_insert_text(size_t parent, size_t offset, u16 const* data_ptr, size_t data_len)
+extern "C" void ladybird_html_parser_insert_text(size_t parent, size_t offset, u8 const* data_ptr, size_t data_len)
 {
     auto insertion_location = node_and_offset_from_html_parser_ffi(parent, offset);
     auto& parent_node = *insertion_location.node;
@@ -2173,34 +2551,24 @@ extern "C" void ladybird_html_parser_insert_text(size_t parent, size_t offset, u
     if (parent_node.is_document())
         return;
 
-    // 4. If there is a Text node immediately before insertionLocation, then append data to that Text node's data.
-    //    Otherwise, create a new Text node whose data is data and whose node document is the same as that of the element
-    //    in which insertionLocation finds itself, and insert the newly created node at insertionLocation.
-    auto data = utf16_string_from_ffi(data_ptr, data_len);
+    auto data = utf8_string_from_ffi(data_ptr, data_len);
     if (auto* previous_text = as_if<DOM::Text>(insertion_location.previous_child())) {
         (void)previous_text->append_data(data);
         return;
     }
 
-    if (auto* before_node = insertion_location.child_at_offset()) {
-        auto text = parent_node.document().realm().create<DOM::Text>(parent_node.document(), data);
-        parent_node.insert_before(*text, before_node);
-        return;
-    }
-
-    auto text = parent_node.document().realm().create<DOM::Text>(parent_node.document(), data);
-    MUST(parent_node.append_child(*text));
+    auto text = DOM::Text::create(parent_node.document(), data);
+    insert_node_for_parser(parent_node, *text, insertion_location.child_at_offset());
 }
 
-extern "C" void ladybird_html_parser_add_missing_attribute(size_t element, u16 const* local_name_ptr, size_t local_name_len, u16 const* value_ptr, size_t value_len)
+extern "C" void ladybird_html_parser_add_missing_attribute(size_t element, size_t local_name_raw, u16 const* value_ptr, size_t value_len)
 {
     auto& dom_element = as<DOM::Element>(node_from_html_parser_ffi(element));
-    auto local_name = utf16_fly_string_from_ffi(local_name_ptr, local_name_len);
+    auto local_name = Utf16FlyString::from_raw(local_name_raw);
     if (dom_element.has_attribute(local_name))
         return;
     auto value = utf16_string_from_ffi(value_ptr, value_len);
-    auto attribute = DOM::Attr::create(dom_element.document(), move(local_name), move(value));
-    dom_element.append_attribute(attribute);
+    dom_element.append_attribute(DOM::QualifiedName { move(local_name), {}, {} }, move(value));
 }
 
 extern "C" void ladybird_html_parser_remove_node(size_t node)
@@ -2241,6 +2609,11 @@ extern "C" void ladybird_html_parser_mark_script_already_started(void* parser, s
         parser_from_html_parser_ffi(parser).mark_script_already_started_from_rust_parser(*script);
 }
 
+extern "C" void ladybird_html_parser_process_meta_element(void* parser, size_t element)
+{
+    parser_from_html_parser_ffi(parser).process_meta_element_from_rust_parser(as<HTMLMetaElement>(node_from_html_parser_ffi(element)));
+}
+
 extern "C" size_t ladybird_html_parser_parent_node(size_t node)
 {
     auto* parent = node_from_html_parser_ffi(node).parent();
@@ -2252,37 +2625,22 @@ extern "C" size_t ladybird_html_parser_node_index(size_t node)
     return node_from_html_parser_ffi(node).index();
 }
 
-extern "C" size_t ladybird_html_parser_create_element(void* parser, size_t intended_parent, RustFfiHtmlNamespace namespace_, u16 const* namespace_uri_ptr, size_t namespace_uri_len, u16 const* local_name_ptr, size_t local_name_len, RustFfiHtmlParserAttribute const* attributes, size_t attribute_count, bool had_duplicate_attribute, size_t form_element, bool has_template_element_on_stack)
+extern "C" size_t ladybird_html_parser_create_element(void* parser, size_t intended_parent, RustFfiHtmlNamespace namespace_, u16 const* namespace_uri_ptr, size_t namespace_uri_len, size_t local_name_raw, RustFfiHtmlParserAttribute const* attributes, size_t attribute_count, bool had_duplicate_attribute, size_t form_element, bool has_template_element_on_stack)
 {
     auto& html_parser = parser_from_html_parser_ffi(parser);
-    auto local_name = utf16_fly_string_from_ffi(local_name_ptr, local_name_len);
-    auto token = HTMLToken::make_start_tag(local_name);
-
-    for (size_t i = 0; i < attribute_count; ++i) {
-        auto const& attribute = attributes[i];
-        Optional<Utf16FlyString> prefix;
-        if (attribute.prefix_len != 0)
-            prefix = utf16_fly_string_from_ffi(attribute.prefix_ptr, attribute.prefix_len);
-        HTMLToken::Attribute token_attribute;
-        token_attribute.prefix = move(prefix);
-        token_attribute.local_name = utf16_fly_string_from_ffi(attribute.local_name_ptr, attribute.local_name_len);
-        token_attribute.namespace_ = attribute_namespace_from_html_parser_ffi(attribute.namespace_);
-        token_attribute.value = utf16_string_from_ffi(attribute.value_ptr, attribute.value_len);
-        token.add_attribute(move(token_attribute));
-    }
-
+    auto local_name = Utf16FlyString::from_raw(local_name_raw);
     auto& intended_parent_node = node_from_html_parser_ffi(intended_parent);
     GC::Ptr<HTMLFormElement> form_element_ptr;
     if (form_element)
         form_element_ptr = as<HTMLFormElement>(node_from_html_parser_ffi(form_element));
-    auto element = html_parser.create_element_for_rust_parser(token, namespace_from_html_parser_ffi(namespace_, namespace_uri_ptr, namespace_uri_len), intended_parent_node, had_duplicate_attribute, form_element_ptr, has_template_element_on_stack);
+    auto element = html_parser.create_element_for_rust_parser(local_name, { attributes, attribute_count }, namespace_from_html_parser_ffi(namespace_, namespace_uri_ptr, namespace_uri_len), intended_parent_node, had_duplicate_attribute, form_element_ptr, has_template_element_on_stack);
 
     return reinterpret_cast<size_t>(element.ptr());
 }
 
 extern "C" void ladybird_html_parser_append_child(size_t parent, size_t child)
 {
-    MUST(node_from_html_parser_ffi(parent).append_child(node_from_html_parser_ffi(child)));
+    insert_node_for_parser(node_from_html_parser_ffi(parent), node_from_html_parser_ffi(child), nullptr);
 }
 
 extern "C" void ladybird_html_parser_insert_node(size_t parent, size_t offset, size_t child, bool queue_custom_element_reactions)
@@ -2294,14 +2652,42 @@ extern "C" void ladybird_html_parser_insert_node(size_t parent, size_t offset, s
     if (queue_custom_element_reactions && child_element)
         relevant_similar_origin_window_agent(*child_element).custom_element_reactions_stack.element_queue_stack.append({});
 
-    if (auto* before_node = insertion_location.child_at_offset())
-        parent_node.insert_before(child_node, before_node, false);
-    else
-        MUST(parent_node.append_child(child_node));
+    insert_node_for_parser(parent_node, child_node, insertion_location.child_at_offset());
 
     if (queue_custom_element_reactions && child_element) {
         auto queue = relevant_similar_origin_window_agent(*child_element).custom_element_reactions_stack.element_queue_stack.take_last();
-        Bindings::invoke_custom_element_reactions(queue);
+        invoke_custom_element_reactions(queue);
+    }
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#adoptionAgency
+// NB: Steps 15 and 16, given the (target, refNode) pair computed by step 14.
+extern "C" void ladybird_html_parser_reinsert_last_node(size_t parent, size_t offset, size_t last_node)
+{
+    auto insertion_location = node_and_offset_from_html_parser_ffi(parent, offset);
+    auto& target = *insertion_location.node;
+    GC::Ptr<DOM::Node> ref_node = insertion_location.child_at_offset();
+    auto& last_node_to_insert = node_from_html_parser_ffi(last_node);
+
+    // 15. If lastNode's parent is non-null, then remove lastNode.
+    if (last_node_to_insert.parent())
+        last_node_to_insert.remove();
+
+    // 16. If all of the following are true:
+    //     - lastNode's parent is null;
+    //     - lastNode is not a host-including inclusive ancestor of target;
+    //     - target is not a Document node, or it does not have an element child; and
+    //     - refNode is null or its parent is target,
+    if (!last_node_to_insert.parent()
+        && !last_node_to_insert.is_host_including_inclusive_ancestor_of(target)
+        && (!is<DOM::Document>(target) || !target.first_child_of_type<DOM::Element>())
+        && (!ref_node || ref_node->parent() == &target)) {
+        // then:
+        // 1. Assert: ensure pre-insert validity given lastNode, target, refNode, and « » does not throw.
+        ASSERT(!target.ensure_pre_insertion_validity(last_node_to_insert, ref_node).is_error());
+
+        // 2. Insert lastNode into target before refNode.
+        insert_node_for_parser(target, last_node_to_insert, ref_node.ptr());
     }
 }
 
@@ -2330,11 +2716,11 @@ extern "C" size_t ladybird_html_parser_attach_declarative_shadow_root(size_t hos
         registry = host_element.document().custom_element_registry();
 
     auto result = host_element.attach_a_shadow_root(
-        mode == RustFfiHtmlShadowRootMode::Open ? Bindings::ShadowRootMode::Open : Bindings::ShadowRootMode::Closed,
+        mode == RustFfiHtmlShadowRootMode::Open ? Web::DOM::ShadowRootMode::Open : Web::DOM::ShadowRootMode::Closed,
         clonable,
         serializable,
         delegates_focus,
-        slot_assignment == RustFfiHtmlSlotAssignmentMode::Manual ? Bindings::SlotAssignmentMode::Manual : Bindings::SlotAssignmentMode::Named,
+        slot_assignment == RustFfiHtmlSlotAssignmentMode::Manual ? Web::DOM::SlotAssignmentMode::Manual : Web::DOM::SlotAssignmentMode::Named,
         registry);
     if (result.is_error())
         return 0;

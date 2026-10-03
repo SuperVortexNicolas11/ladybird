@@ -11,6 +11,7 @@
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/SourceLocation.h>
+#include <AK/kmalloc.h>
 #include <LibGC/Forward.h>
 #include <LibGC/Ptr.h>
 
@@ -23,8 +24,8 @@ class GC_API RootImpl : public RefCounted<RootImpl> {
 public:
     ~RootImpl();
 
-    Cell* cell() { return m_cell; }
-    Cell const* cell() const { return m_cell; }
+    Cell* cell() { return m_cell.ptr(); }
+    Cell const* cell() const { return m_cell.ptr(); }
 
     SourceLocation const& source_location() const { return m_location; }
 
@@ -45,6 +46,8 @@ public:
 template<class T>
 class Root {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     Root() = default;
 
     static Root create(T* cell, SourceLocation location = SourceLocation::current())

@@ -4,10 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/ShadowRoot.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
+#include <LibGC/Heap.h>
+#include <LibJS/Runtime/Iterator.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleSheetList.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/DOM/AdoptedStyleSheets.h>
+#include <LibWeb/DOM/BindingsGlue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentOrShadowRoot.h>
 #include <LibWeb/DOM/Event.h>
@@ -19,8 +22,10 @@
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/HTMLTemplateElement.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
+#include <LibWeb/HTML/RadioButtonGroupRegistry.h>
 #include <LibWeb/HTML/XMLSerializer.h>
-#include <LibWeb/Layout/BlockContainer.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 
@@ -28,7 +33,12 @@ namespace Web::DOM {
 
 GC_DEFINE_ALLOCATOR(ShadowRoot);
 
-ShadowRoot::ShadowRoot(Document& document, Element& host, Bindings::ShadowRootMode mode)
+GC::Ref<ShadowRoot> ShadowRoot::create(Document& document, Element& host, ShadowRootMode mode)
+{
+    return GC::Heap::the().allocate<ShadowRoot>(document, host, mode);
+}
+
+ShadowRoot::ShadowRoot(Document& document, Element& host, ShadowRootMode mode)
     : DocumentFragment(document)
     , m_mode(mode)
     , m_style_scope(*this)
@@ -52,11 +62,29 @@ void ShadowRoot::adopted_from(Document& old_document)
     old_document.unregister_shadow_root({}, *this);
     document().register_shadow_root({}, *this);
 
-    m_style_scope.node_was_adopted_from(old_document);
+    // Identities belong to one document's engine, so the root and its scope have to be minted
+    // again in the new one. Its sheets are re-adopted through the CSSOM, which is what attaches
+    // them to the new identities. Attaching a sheet names even a disconnected root, so the old
+    // document's node table may still hold it.
+    old_document.style_computer().unregister_style_node(style_node_id());
+    set_style_node_id(0);
+    m_style_engine_tree_scope = 0;
+}
+
+void ShadowRoot::set_style_node_id(CSS::StyleNodeID style_node_id)
+{
+    m_style_node_id = style_node_id;
+    // The layout arena keys layout tree update marks by identity alone, so one handed to this root holds none, whatever
+    // the node that held it before left behind.
+    if (auto* arena = document().layout_node_arena_if_created(); arena && style_node_id != 0)
+        Layout::RustFFI::layout_arena_clear_layout_tree_update_marks(arena->handle(), style_node_id.value());
+    // The style engine keeps the mark of the children that explicitly inherit by identity too.
+    if (style_node_id != 0)
+        publish_children_explicitly_inherit_mark();
 }
 
 // https://fullscreen.spec.whatwg.org/#dom-document-fullscreenelement
-GC::Ptr<Element> ShadowRoot::fullscreen_element_for_bindings() const
+GC::Ptr<Element> ShadowRoot::retargeted_fullscreen_element() const
 {
     // 1. If this is a shadow root and its host is not connected, then return null.
     if (!host() || !host()->is_connected())
@@ -65,7 +93,7 @@ GC::Ptr<Element> ShadowRoot::fullscreen_element_for_bindings() const
     // 2. Let candidate be the result of retargeting fullscreen element against this.
     // NB: ShadowRoot does not have it's own top layer. But the algorithm says to get the fullscreen element from the
     //     top layer, so it's grabbed from this' document.
-    auto* candidate = retarget(document().fullscreen_element(), const_cast<ShadowRoot*>(this));
+    auto* candidate = retarget(document().fullscreen_element().ptr(), const_cast<ShadowRoot*>(this));
     if (!candidate)
         return nullptr;
 
@@ -75,12 +103,6 @@ GC::Ptr<Element> ShadowRoot::fullscreen_element_for_bindings() const
 
     // 4. Return null.
     return nullptr;
-}
-
-void ShadowRoot::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(ShadowRoot);
-    Base::initialize(realm);
 }
 
 // https://dom.spec.whatwg.org/#dom-shadowroot-onslotchange
@@ -108,45 +130,40 @@ EventTarget* ShadowRoot::get_parent(Event const& event)
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-innerhtml
-WebIDL::ExceptionOr<TrustedTypes::TrustedHTMLOrString> ShadowRoot::inner_html() const
+WebIDL::ExceptionOr<Utf16String> ShadowRoot::inner_html() const
 {
     return TRY(serialize_fragment(HTML::RequireWellFormed::Yes));
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-innerhtml
-WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(TrustedTypes::TrustedHTMLOrString const& value)
+WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(Utf16View html)
 {
-    // 1. Let compliantString be the result of invoking the Get Trusted Type compliant string algorithm with
-    //    TrustedHTML, this's relevant global object, the given value, "ShadowRoot innerHTML", and "script".
-    auto const compliant_string = TRY(TrustedTypes::get_trusted_type_compliant_string(
-        TrustedTypes::TrustedTypeName::TrustedHTML,
-        HTML::relevant_global_object(*this),
-        value,
-        TrustedTypes::InjectionSink::ShadowRoot_innerHTML,
-        TrustedTypes::Script.view()));
+    // 2. Let context be this's host.
+    auto context = this->host();
+    VERIFY(context);
 
-    // 2. Let fragment be the result of invoking the fragment parsing algorithm steps with this and compliantString.
-    auto fragment = TRY(HTML::HTMLParser::parse_html_fragment(GC::Ref<DocumentFragment> { *this }, compliant_string.utf16_view()));
+    // 3. Let fragment be the result of invoking the fragment parsing algorithm steps with context and compliantString.
+    // Keep the shadow root as the fragment parsing target so custom element
+    // creation uses this shadow tree's registry. The host is still used as
+    // the parser context by the fragment parsing algorithm.
+    auto fragment = TRY(Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *this }, html));
 
-    // 3. Replace all with fragment within this.
+    // 4. Replace all with fragment within this.
     this->replace_all(fragment);
 
     // NOTE: We don't invalidate style & layout for <template> elements since they don't affect rendering.
     if (!is<HTML::HTMLTemplateElement>(*this)) {
-        this->set_needs_style_update(true);
-
         if (this->is_connected()) {
             // NOTE: Since the DOM has changed, we have to rebuild this shadow root's layout subtree.
             this->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::ShadowRootSetInnerHTML);
         }
     }
 
-    set_needs_style_update(true);
     return {};
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-gethtml
-WebIDL::ExceptionOr<Utf16String> ShadowRoot::get_html(Bindings::GetHTMLOptions const& options) const
+WebIDL::ExceptionOr<Utf16String> ShadowRoot::get_html(HTMLSerializationOptions const& options) const
 {
     // ShadowRoot's getHTML(options) method steps are to return the result
     // of HTML fragment serialization algorithm with this,
@@ -158,19 +175,11 @@ WebIDL::ExceptionOr<Utf16String> ShadowRoot::get_html(Bindings::GetHTMLOptions c
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-sethtmlunsafe
-WebIDL::ExceptionOr<void> ShadowRoot::set_html_unsafe(TrustedTypes::TrustedHTMLOrString const& html)
+WebIDL::ExceptionOr<void> ShadowRoot::set_html_unsafe(StringView html)
 {
-    // 1. Let compliantHTML be the result of invoking the Get Trusted Type compliant string algorithm with
-    //    TrustedHTML, this's relevant global object, html, "ShadowRoot setHTMLUnsafe", and "script".
-    auto const compliant_html = TRY(TrustedTypes::get_trusted_type_compliant_string(
-        TrustedTypes::TrustedTypeName::TrustedHTML,
-        HTML::relevant_global_object(*this),
-        html,
-        TrustedTypes::InjectionSink::ShadowRoot_setHTMLUnsafe,
-        TrustedTypes::Script.view()));
-
     // 2. Unsafely set HTML given this, this's shadow host, and compliantHTML.
-    TRY(unsafely_set_html(GC::Ref<DocumentFragment> { *this }, compliant_html.utf16_view()));
+    auto markup = Utf16String::from_utf8(html);
+    TRY(unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *this }, markup.utf16_view()));
 
     return {};
 }
@@ -183,7 +192,7 @@ GC::Ptr<Element> ShadowRoot::active_element()
 CSS::StyleSheetList& ShadowRoot::style_sheets()
 {
     if (!m_style_sheets)
-        m_style_sheets = CSS::StyleSheetList::create(*this);
+        m_style_sheets = CSS::StyleSheetList::create(m_style_scope);
     return *m_style_sheets;
 }
 
@@ -204,6 +213,14 @@ void ShadowRoot::visit_edges(Visitor& visitor)
             element.visit(visitor);
     }
     visitor.visit(m_custom_element_registry);
+    visitor.visit(m_radio_button_group_registry);
+}
+
+HTML::RadioButtonGroupRegistry& ShadowRoot::ensure_radio_button_group_registry()
+{
+    if (!m_radio_button_group_registry)
+        m_radio_button_group_registry = heap().allocate<HTML::RadioButtonGroupRegistry>();
+    return *m_radio_button_group_registry;
 }
 
 GC::Ref<WebIDL::ObservableArray> ShadowRoot::adopted_style_sheets() const
@@ -213,44 +230,27 @@ GC::Ref<WebIDL::ObservableArray> ShadowRoot::adopted_style_sheets() const
     return *m_adopted_style_sheets;
 }
 
-WebIDL::ExceptionOr<void> ShadowRoot::set_adopted_style_sheets(JS::Value new_value)
+void ShadowRoot::for_each_css_style_sheet(Function<void(CSS::StyleSheetState&)>&& callback) const
 {
-    if (!m_adopted_style_sheets)
-        m_adopted_style_sheets = create_adopted_style_sheets_list(*this);
-
-    m_adopted_style_sheets->clear();
-    auto iterator_record = TRY(get_iterator(vm(), new_value, JS::IteratorHint::Sync));
-    while (true) {
-        auto next = TRY(iterator_step_value(vm(), iterator_record));
-        if (!next.has_value())
-            break;
-        TRY(m_adopted_style_sheets->append(*next));
-    }
-
-    return {};
-}
-
-void ShadowRoot::for_each_css_style_sheet(Function<void(CSS::CSSStyleSheet&)>&& callback) const
-{
-    for (auto& style_sheet : style_sheets().sheets())
+    for (auto& style_sheet : m_style_scope.style_sheets())
         callback(*style_sheet);
 
     if (m_adopted_style_sheets) {
-        m_adopted_style_sheets->for_each<CSS::CSSStyleSheet>([&](auto& style_sheet) {
+        for_each_adopted_style_sheet(*m_adopted_style_sheets, [&](auto& style_sheet) {
             callback(style_sheet);
         });
     }
 }
 
-void ShadowRoot::for_each_active_css_style_sheet(Function<void(CSS::CSSStyleSheet&)> const& callback) const
+void ShadowRoot::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const
 {
-    for (auto& style_sheet : style_sheets().sheets()) {
+    for (auto& style_sheet : m_style_scope.style_sheets()) {
         if (!style_sheet->disabled())
             callback(*style_sheet);
     }
 
     if (m_adopted_style_sheets) {
-        m_adopted_style_sheets->for_each<CSS::CSSStyleSheet>([&](auto& style_sheet) {
+        for_each_adopted_style_sheet(*m_adopted_style_sheets, [&](auto& style_sheet) {
             if (!style_sheet.disabled())
                 callback(style_sheet);
         });
@@ -295,41 +295,11 @@ ShadowRoot::PartElementMap const& ShadowRoot::part_element_map() const
 {
     // FIXME: dom_tree_version() is crude and invalidates more than necessary.
     //        Come up with a smarter way of invalidating this if it turns out to be slow.
-    if (m_dom_tree_version_when_calculated_part_element_map < document().dom_tree_version()) {
+    if (m_dom_tree_version_when_calculated_part_element_map != dom_tree_version()) {
         const_cast<ShadowRoot*>(this)->calculate_part_element_map();
-        m_dom_tree_version_when_calculated_part_element_map = document().dom_tree_version();
+        m_dom_tree_version_when_calculated_part_element_map = dom_tree_version();
     }
     return m_part_element_map;
-}
-
-// https://drafts.csswg.org/css-shadow-1/#exportparts
-// Parse the exportparts attribute into a list of (inner_name, outer_name) pairs.
-template<typename Callback>
-static void for_each_exported_part(Element const& element, Callback callback)
-{
-    auto exportparts = element.get_attribute(HTML::AttributeNames::exportparts);
-    if (!exportparts.has_value())
-        return;
-
-    exportparts->for_each_split_view(u',', SplitBehavior::Nothing, [&](Utf16View mapping) {
-        auto trimmed = mapping.trim_ascii_whitespace();
-        if (trimmed.is_empty())
-            return IterationDecision::Continue;
-
-        Vector<Utf16View, 2> parts;
-        trimmed.for_each_split_view(u':', SplitBehavior::KeepEmpty, [&](Utf16View part) {
-            parts.append(part);
-            return IterationDecision::Continue;
-        });
-        if (parts.size() == 1) {
-            auto name = parts[0].trim_ascii_whitespace();
-            callback(name, name);
-        } else if (parts.size() == 2) {
-            callback(parts[0].trim_ascii_whitespace(), parts[1].trim_ascii_whitespace());
-        }
-
-        return IterationDecision::Continue;
-    });
 }
 
 // https://drafts.csswg.org/css-shadow-1/#calculate-the-part-element-map
@@ -353,7 +323,7 @@ void ShadowRoot::calculate_part_element_map()
             auto const& inner_map = inner_root->part_element_map();
 
             // 4. For each innerName/outerName in el’s forwarded part name list:
-            for_each_exported_part(element, [&](Utf16View inner_name_view, Utf16View outer_name_view) {
+            element.for_each_exported_part([&](Utf16View inner_name_view, Utf16View outer_name_view) {
                 // 1. If innerName is an ident:
                 if (auto it = inner_map.find(inner_name_view); it != inner_map.end()) {
                     // 1. Let innerParts be innerRoot’s part element map[innerName]
@@ -385,6 +355,69 @@ GC::Ptr<HTML::CustomElementRegistry> ShadowRoot::custom_element_registry() const
     // 2. Assert: this is a ShadowRoot node.
     // 3. Return this’s custom element registry.
     return m_custom_element_registry;
+}
+
+}
+
+namespace Web::Bindings {
+
+WebIDL::ExceptionOr<TrustedTypes::TrustedHTMLOrString> inner_html(DOM::ShadowRoot& shadow_root)
+{
+    return TRY(shadow_root.inner_html());
+}
+
+WebIDL::ExceptionOr<void> set_inner_html(DOM::ShadowRoot& shadow_root, TrustedTypes::TrustedHTMLOrString const& value)
+{
+    // 1. Let compliantString be the result of invoking the Get Trusted Type compliant string algorithm with
+    //    TrustedHTML, this's relevant global object, the given value, "ShadowRoot innerHTML", and "script".
+    auto const compliant_string = TRY(TrustedTypes::get_trusted_type_compliant_string(
+        TrustedTypes::TrustedTypeName::TrustedHTML,
+        HTML::relevant_global_object(shadow_root),
+        value,
+        TrustedTypes::InjectionSink::ShadowRoot_innerHTML,
+        "script"_utf16));
+
+    return shadow_root.set_inner_html(compliant_string);
+}
+
+WebIDL::ExceptionOr<void> set_html_unsafe(DOM::ShadowRoot& shadow_root, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html)
+{
+    // 1. Let compliantHTML be the result of invoking the Get Trusted Type compliant string algorithm with
+    //    TrustedHTML, this's relevant global object, html, "ShadowRoot setHTMLUnsafe", and "script".
+    auto const compliant_html = TRY(TrustedTypes::get_trusted_type_compliant_string(
+        TrustedTypes::TrustedTypeName::TrustedHTML,
+        HTML::relevant_global_object(shadow_root),
+        html,
+        TrustedTypes::InjectionSink::ShadowRoot_setHTMLUnsafe,
+        "script"_utf16));
+
+    return shadow_root.set_html_unsafe(compliant_html.to_utf8_but_should_be_ported_to_utf16());
+}
+
+GC::Ref<CSS::StyleSheetList> style_sheets(DOM::ShadowRoot& shadow_root)
+{
+    return shadow_root.style_sheets();
+}
+
+JS::Value adopted_style_sheets(DOM::ShadowRoot& shadow_root)
+{
+    return DOM::AdoptedStyleSheetsAccess::adopted_style_sheets(shadow_root).ptr();
+}
+
+WebIDL::ExceptionOr<void> set_adopted_style_sheets(DOM::ShadowRoot& shadow_root, JS::Value new_value)
+{
+    auto adopted_style_sheets = DOM::AdoptedStyleSheetsAccess::adopted_style_sheets(shadow_root);
+    adopted_style_sheets->clear();
+
+    auto iterator_record = TRY(JS::get_iterator(shadow_root.vm(), new_value, JS::IteratorHint::Sync));
+    while (true) {
+        auto next = TRY(JS::iterator_step_value(shadow_root.vm(), iterator_record));
+        if (!next.has_value())
+            break;
+        TRY(adopted_style_sheets->append(*next));
+    }
+
+    return {};
 }
 
 }

@@ -18,13 +18,14 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/ModuleMap.h>
-#include <LibWeb/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/ServiceWorker/Registration.h>
+#include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
+#include <LibWebCommon/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
 
 namespace Web::HTML {
 
-class UniversalGlobalScopeMixin;
+class WindowOrWorkerGlobalScopeMixin;
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#environment
 struct WEB_API Environment : public JS::Cell {
@@ -32,10 +33,13 @@ struct WEB_API Environment : public JS::Cell {
     GC_DECLARE_ALLOCATOR(Environment);
 
 public:
+    static GC::Ref<Environment> create(EnvironmentId id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url,
+        Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context);
+
     virtual ~Environment() override;
 
     // An id https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-id
-    Utf16String id;
+    EnvironmentId id;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-creation-url
     URL::URL creation_url;
@@ -63,7 +67,7 @@ public:
 
 protected:
     Environment() = default;
-    Environment(Utf16String id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url, Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context)
+    Environment(EnvironmentId id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url, Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context)
         : id(move(id))
         , creation_url(move(creation_url))
         , top_level_creation_url(move(top_level_creation_url))
@@ -84,10 +88,7 @@ struct WEB_API EnvironmentSettingsObject : public Environment {
     GC_CELL(EnvironmentSettingsObject, Environment);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     virtual void finalize() override;
-    virtual void initialize(JS::Realm&) override;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-target-browsing-context
     JS::ExecutionContext& realm_execution_context();
@@ -114,6 +115,13 @@ public:
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-cross-origin-isolated-capability
     virtual CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability() const = 0;
 
+    // https://html.spec.whatwg.org/multipage/webappapis.html#agent-cluster
+    // AD-HOC: We don't model agent clusters — this names the one the realm's agent belongs to, so that a
+    //         SharedArrayBuffer can be kept from leaving it. A window's is the UI process's, which obtains its agent;
+    //         a dedicated worker's or a worklet's is its owner's; and a shared or service worker agent names a cluster
+    //         of its own. An empty value names no cluster at all, and so matches none.
+    virtual Optional<u64> agent_cluster_id() const = 0;
+
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-time-origin
     virtual double time_origin() const = 0;
 
@@ -124,8 +132,6 @@ public:
     JS::Realm& realm();
     JS::Object& global_object();
     JS::Object const& global_object() const { return const_cast<EnvironmentSettingsObject*>(this)->global_object(); }
-    UniversalGlobalScopeMixin& universal_global_scope();
-    UniversalGlobalScopeMixin const& universal_global_scope() const { return const_cast<EnvironmentSettingsObject*>(this)->universal_global_scope(); }
     EventLoop& responsible_event_loop();
 
     // https://fetch.spec.whatwg.org/#concept-fetch-group
@@ -147,8 +153,9 @@ public:
 
     virtual void discard_environment() override;
 
-    void keep_worker_agent_alive_while_starting(WorkerAgentParent&);
-    void release_worker_agent_from_startup_keep_alive(WorkerAgentParent&);
+    void add_owned_worker_agent(WorkerAgentParent&);
+    void remove_owned_worker_agent(WorkerAgentParent&);
+    void release_owned_worker_agents();
 
     // FIXME: This method below is from HighResolutionTime spec in section 3. Section for Specification Authors.
     // The following other methods are currently not supported:
@@ -176,7 +183,6 @@ protected:
 private:
     NonnullOwnPtr<JS::ExecutionContext> m_realm_execution_context;
     GC::Ptr<ModuleMap> m_module_map;
-    UniversalGlobalScopeMixin* m_universal_global_scope { nullptr };
 
     GC::Ptr<EventLoop> m_responsible_event_loop;
 
@@ -206,7 +212,7 @@ private:
     // A service worker client has an associated discarded flag. It is initially unset.
     bool m_discarded { false };
 
-    Vector<GC::Ref<WorkerAgentParent>> m_worker_agents_to_keep_alive_while_starting;
+    Vector<GC::Ref<WorkerAgentParent>> m_owned_worker_agents;
 };
 
 RunScriptDecision can_run_script(EnvironmentSettingsObject const&);
@@ -224,18 +230,42 @@ WEB_API EnvironmentSettingsObject& incumbent_settings_object();
 WEB_API JS::Realm& incumbent_realm();
 
 JS::Object& incumbent_global_object();
+WEB_API Window& incumbent_window();
 
-EnvironmentSettingsObject& principal_realm_settings_object(JS::Realm&);
+WEB_API EnvironmentSettingsObject& principal_realm_settings_object(JS::Realm&);
 EnvironmentSettingsObject& current_settings_object();
 
 WEB_API JS::Object& current_global_object();
+WEB_API Window& current_window();
 
 WEB_API JS::Realm& relevant_realm(JS::Object const&);
+WEB_API JS::Realm& relevant_realm(DOM::Node const&);
+WEB_API JS::Realm& relevant_realm(Window const&);
+WEB_API JS::Realm& relevant_realm(WorkerGlobalScope const&);
+WEB_API JS::Realm& relevant_realm(WindowOrWorkerGlobalScopeMixin const&);
 
 WEB_API EnvironmentSettingsObject& relevant_settings_object(JS::Object const&);
 EnvironmentSettingsObject& relevant_settings_object(DOM::Node const&);
+EnvironmentSettingsObject& relevant_settings_object(Window const&);
+WEB_API EnvironmentSettingsObject& relevant_settings_object(WorkerGlobalScope const&);
+WEB_API EnvironmentSettingsObject& relevant_settings_object(WindowOrWorkerGlobalScopeMixin const&);
 
 WEB_API JS::Object& relevant_global_object(JS::Object const&);
+WEB_API JS::Object& relevant_global_object(DOM::Node const&);
+WEB_API JS::Object& relevant_global_object(Window const&);
+WEB_API JS::Object& relevant_global_object(WorkerGlobalScope const&);
+WEB_API JS::Object& relevant_global_object(WindowOrWorkerGlobalScopeMixin const&);
+WEB_API Window* window_from_global_object(JS::Object&);
+WEB_API Window const* window_from_global_object(JS::Object const&);
+WEB_API WindowOrWorkerGlobalScopeMixin* window_or_worker_global_scope_from_global_object(JS::Object&);
+WEB_API WindowOrWorkerGlobalScopeMixin const* window_or_worker_global_scope_from_global_object(JS::Object const&);
+WEB_API Window& relevant_window(JS::Object const&);
+WEB_API Window& relevant_window(DOM::Node const&);
+WEB_API Window& relevant_window(Window const&);
+WEB_API WindowOrWorkerGlobalScopeMixin& relevant_window_or_worker_global_scope(JS::Object const&);
+WEB_API WindowOrWorkerGlobalScopeMixin& relevant_window_or_worker_global_scope(DOM::Node const&);
+WEB_API WindowOrWorkerGlobalScopeMixin& relevant_window_or_worker_global_scope(DOM::EventTarget const&);
+WEB_API WindowOrWorkerGlobalScopeMixin& relevant_window_or_worker_global_scope(Window const&);
 
 JS::Realm& entry_realm();
 EnvironmentSettingsObject& entry_settings_object();

@@ -11,16 +11,17 @@
 #include <AK/Atomic.h>
 #include <AK/Diagnostics.h>
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
+#include <AK/MutexProtected.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Time.h>
 #include <AK/Windows.h>
+#include <AK/kmalloc.h>
 #include <LibCore/EventLoopImplementationWindows.h>
 #include <LibCore/Notifier.h>
 #include <LibCore/ThreadEventQueue.h>
 #include <LibCore/TimeoutSet.h>
 #include <LibCore/Timer.h>
-#include <LibSync/Mutex.h>
-#include <LibSync/MutexProtected.h>
 
 struct OwnHandle {
     HANDLE handle = NULL;
@@ -74,6 +75,8 @@ enum class CompletionType : u8 {
 };
 
 struct CompletionPacket {
+    AK_ALLOC_WITH_KMALLOC;
+
     CompletionType type;
 };
 
@@ -103,6 +106,8 @@ struct EventLoopMasterTimer final : CompletionPacket {
 
 class EventLoopTimer final : public EventLoopTimeout {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     EventLoopTimer() = default;
 
     void reload(MonotonicTime const& now) { m_fire_time = now + interval; }
@@ -161,6 +166,8 @@ struct EventLoopProcess final : CompletionPacket {
 };
 
 struct ThreadData {
+    AK_ALLOC_WITH_KMALLOC;
+
     static ThreadData* the()
     {
         thread_local OwnPtr<ThreadData> thread_data = make<ThreadData>();
@@ -216,7 +223,7 @@ struct ThreadData {
     NonnullOwnPtr<EventLoopWake> wake_data;
 };
 
-static Sync::MutexProtected<HashMap<pid_t, NonnullOwnPtr<EventLoopProcess>>> s_processes;
+static MutexProtected<HashMap<pid_t, NonnullOwnPtr<EventLoopProcess>>> s_processes;
 
 // Arms (or disarms) the thread's shared waitable timer for the earliest pending deadline.
 static void arm_master_timer(ThreadData& thread_data)
@@ -265,8 +272,8 @@ EventLoopImplementationWindows::~EventLoopImplementationWindows()
 int EventLoopImplementationWindows::exec()
 {
     for (;;) {
-        if (m_exit_requested)
-            return m_exit_code;
+        if (auto exit_code = exit_code_if_requested(); exit_code.has_value())
+            return exit_code.release_value();
         pump(PumpMode::WaitForEvents);
     }
     VERIFY_NOT_REACHED();
@@ -367,8 +374,7 @@ size_t EventLoopImplementationWindows::pump(PumpMode pump_mode)
 
 void EventLoopImplementationWindows::quit(int code)
 {
-    m_exit_requested = true;
-    m_exit_code = code;
+    request_exit(code);
 }
 
 void EventLoopImplementationWindows::wake()

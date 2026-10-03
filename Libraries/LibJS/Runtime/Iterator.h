@@ -74,12 +74,8 @@ public:
     virtual ThrowCompletionOr<void> next(VM&, bool& done, Value& value) = 0;
 };
 
-struct IterationResult {
-    ThrowCompletionOr<Value> done;
-    ThrowCompletionOr<Value> value;
-};
 struct IterationDone { };
-using IterationResultOrDone = Variant<IterationResult, IterationDone>;
+using IterationResult = Variant<IterationDone, Value>;
 
 // 7.4.13 IfAbruptCloseIterator ( value, iteratorRecord ), https://tc39.es/ecma262/#sec-ifabruptcloseiterator
 #define TRY_OR_CLOSE_ITERATOR(vm, iterator_record, expression)                                                    \
@@ -126,10 +122,11 @@ ThrowCompletionOr<GC::Ref<IteratorRecord>> get_iterator_flattenable(VM&, Value, 
 JS_API ThrowCompletionOr<GC::Ref<Object>> iterator_next(VM&, IteratorRecordImpl&, Optional<Value> = {});
 JS_API ThrowCompletionOr<bool> iterator_complete(VM&, Object& iterator_result);
 JS_API ThrowCompletionOr<Value> iterator_value(VM&, Object& iterator_result);
-JS_API ThrowCompletionOr<IterationResultOrDone> iterator_step(VM&, IteratorRecordImpl&);
+JS_API ThrowCompletionOr<IterationResult> iterator_step(VM&, IteratorRecordImpl&);
 JS_API ThrowCompletionOr<Optional<Value>> iterator_step_value(VM&, IteratorRecordImpl&);
 Completion iterator_close(VM&, IteratorRecordImpl const&, Completion);
 Completion iterator_close_all(VM&, ReadonlySpan<GC::Ref<IteratorRecord>>, Completion);
+JS_API GC::Ref<Object> create_iterator_result_object(Realm&, Value, bool done);
 JS_API GC::Ref<Object> create_iterator_result_object(VM&, Value, bool done);
 JS_API ThrowCompletionOr<GC::RootVector<Value>> iterator_to_list(VM&, IteratorRecord&);
 ThrowCompletionOr<void> setter_that_ignores_prototype_properties(VM&, Value this_, Object const& home, PropertyKey const& property, Value value);

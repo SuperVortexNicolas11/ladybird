@@ -12,8 +12,6 @@
 #include <LibCore/System.h>
 #include <LibGC/Function.h>
 #include <LibHTTP/Cookie/Cookie.h>
-#include <LibHTTP/Cookie/ParsedCookie.h>
-#include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibHTTP/HSTSPreloadData.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
@@ -23,12 +21,11 @@
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/LoadRequest.h>
-#include <LibWeb/Loader/ProxyMappings.h>
 #include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/Loader/UserAgent.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/Timer.h>
+#include <LibWebCommon/Loader/UserAgent.h>
 
 namespace Web {
 
@@ -59,22 +56,20 @@ ResourceLoader& ResourceLoader::the()
 
 ResourceLoader::ResourceLoader(GC::Heap& heap, NonnullRefPtr<Requests::RequestClient> request_client)
     : m_heap(heap)
-    , m_request_client(move(request_client))
     , m_user_agent(MUST(String::from_utf8(default_user_agent)))
     , m_platform(MUST(String::from_utf8(default_platform)))
     , m_preferred_languages({ "en-US"_string })
     , m_navigator_compatibility_mode(default_navigator_compatibility_mode)
 {
-    m_request_client->on_request_server_died = [this]() {
-        m_request_client = nullptr;
-    };
+    set_client(move(request_client));
 }
 
 void ResourceLoader::set_client(NonnullRefPtr<Requests::RequestClient> request_client)
 {
     m_request_client = move(request_client);
-    m_request_client->on_request_server_died = [this]() {
-        m_request_client = nullptr;
+    m_request_client->on_request_server_died = [this, disconnected_client = m_request_client->make_weak_ptr<Requests::RequestClient>()]() {
+        if (m_request_client.ptr() == disconnected_client.ptr())
+            m_request_client = nullptr;
     };
 }
 
@@ -113,35 +108,6 @@ static ByteString sanitized_url_for_logging(URL::URL const& url)
     if (url.scheme() == "data"sv)
         return "[data URL]"sv;
     return url.to_byte_string();
-}
-
-static void store_response_cookies(Page& page, URL::URL const& url, StringView set_cookie_entry)
-{
-    auto decoded_cookie = String::from_utf8(set_cookie_entry);
-    if (decoded_cookie.is_error())
-        return;
-
-    auto cookie = HTTP::Cookie::parse_cookie(url, decoded_cookie.value());
-    if (!cookie.has_value())
-        return;
-
-    page.client().page_did_set_cookie(url, cookie.value(), HTTP::Cookie::Source::Http);
-}
-
-void ResourceLoader::try_store_hsts_policy_for_url(Page& page, URL::URL const& url, StringView header_value)
-{
-    // https://www.rfc-editor.org/rfc/rfc6797#section-8.1
-    // If the substring matching the host production from the Request-URI (of the message to which the host responded)
-    // syntactically matches the IP-literal or IPv4address productions from Section 3.2.2 of [RFC3986], then the UA
-    // MUST NOT note this host as a Known HSTS Host.
-    if (!url.host().has_value() || !url.host()->is_domain())
-        return;
-
-    auto parsed_policy = HTTP::HSTS::parse_header(header_value);
-    if (!parsed_policy.has_value())
-        return;
-
-    page.client().page_did_store_hsts_policy(url.host()->get<String>(), parsed_policy.value());
 }
 
 // https://www.rfc-editor.org/rfc/rfc6797#section-8.2
@@ -241,11 +207,7 @@ void ResourceLoader::handle_file_load_request(LoadRequest& request, FileHandler 
 
     auto const& url = request.url().value();
 
-    FileRequest file_request(url.file_path(), [this, request, on_file, on_error, url](ErrorOr<i32> file_or_error) mutable {
-        --m_pending_loads;
-        if (on_load_counter_change)
-            on_load_counter_change();
-
+    FileRequest file_request(url.file_path(), [request, on_file, on_error, url](ErrorOr<i32> file_or_error) mutable {
         if (file_or_error.is_error()) {
             auto const message = ByteString::formatted("{}", file_or_error.error());
             on_error(message);
@@ -298,10 +260,6 @@ void ResourceLoader::handle_file_load_request(LoadRequest& request, FileHandler 
     });
 
     page->client().request_file(move(file_request));
-
-    ++m_pending_loads;
-    if (on_load_counter_change)
-        on_load_counter_change();
 }
 
 template<typename ResourceHandler, typename ErrorHandler>
@@ -382,7 +340,7 @@ void ResourceLoader::handle_resource_load_request(LoadRequest const& request, Re
     on_resource(load_result);
 }
 
-RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<OnHeadersReceived> on_headers_received, GC::Root<OnDataReceived> on_data_received, GC::Root<OnCachedBodyAvailable> on_cached_body_available, GC::Root<OnComplete> on_complete, Requests::RequestClient::KeepAliveForTransfer keep_alive_for_transfer)
+RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<OnHeadersReceived> on_headers_received, GC::Root<OnDataReceived> on_data_received, GC::Root<OnCachedBodyAvailable> on_cached_body_available, GC::Root<OnComplete> on_complete, Requests::RequestClient::TransferLease transfer_lease)
 {
     auto const& url = request.url().value();
 
@@ -399,7 +357,7 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
             request,
             [on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete, request](ReadonlyBytes data, Requests::RequestTimingInfo const& timing_info, HTTP::HeaderList const& response_headers) {
                 log_success(request);
-                on_headers_received->function()(nullptr, response_headers, {}, {}, {}, {}, Requests::CameFromCache::No);
+                on_headers_received->function()(nullptr, response_headers, {}, {}, {}, {}, Requests::CacheState::NotCached);
                 on_data_received->function()(Requests::ResponseData::from_bytes(data));
                 on_complete->function()(true, timing_info, {});
             },
@@ -415,7 +373,7 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
         handle_resource_load_request(
             request,
             [on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete](FileLoadResult const& load_result) {
-                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, {}, {}, Requests::CameFromCache::No);
+                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, {}, {}, Requests::CacheState::NotCached);
                 on_data_received->function()(Requests::ResponseData::from_bytes(load_result.data));
                 on_complete->function()(true, load_result.timing_info, {});
             },
@@ -431,7 +389,7 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
             request,
             [request, on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete](FileLoadResult const& load_result) {
                 log_success(request);
-                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, {}, {}, Requests::CameFromCache::No);
+                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, {}, {}, Requests::CacheState::NotCached);
                 on_data_received->function()(Requests::ResponseData::from_bytes(load_result.data));
                 on_complete->function()(true, load_result.timing_info, {});
             },
@@ -450,19 +408,17 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
         return nullptr;
     }
 
-    auto protocol_request = start_network_request(request, keep_alive_for_transfer);
+    auto protocol_request = start_network_request(request, transfer_lease);
     if (!protocol_request) {
         on_complete->function()(false, {}, "Failed to start network request"sv);
         return nullptr;
     }
 
-    auto protocol_headers_received = [this, on_headers_received = move(on_headers_received), request, &protocol_request = *protocol_request](auto const& response_headers, auto status_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key, auto came_from_cache) {
-        handle_network_response_headers(request, response_headers);
-
+    auto protocol_headers_received = [on_headers_received = move(on_headers_received), request, &protocol_request = *protocol_request](auto const& response_headers, auto status_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key, auto cache_state) {
         if (auto page = request.page())
-            page->client().page_did_receive_network_response_headers(protocol_request.id(), status_code.value_or(0), reason_phrase, response_headers->headers(), came_from_cache);
+            page->client().page_did_receive_network_response_headers(protocol_request.id(), status_code.value_or(0), reason_phrase, response_headers->headers(), cache_state);
 
-        on_headers_received->function()(&protocol_request, response_headers, move(status_code), reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, came_from_cache);
+        on_headers_received->function()(&protocol_request, response_headers, move(status_code), reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, cache_state);
     };
 
     auto protocol_data_received = [on_data_received = move(on_data_received), request, request_id = protocol_request->id()](auto data) {
@@ -500,17 +456,21 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
     return protocol_request;
 }
 
-RefPtr<Requests::Request> ResourceLoader::start_network_request(LoadRequest const& request, Requests::RequestClient::KeepAliveForTransfer keep_alive_for_transfer)
+RefPtr<Requests::Request> ResourceLoader::start_network_request(LoadRequest const& request, Requests::RequestClient::TransferLease transfer_lease)
 {
-    auto proxy = ProxyMappings::the().proxy_for_url(request.url().value());
-
     // FIXME: We could put this request in a queue until the client connection is re-established.
     if (!m_request_client) {
         log_failure(request, "RequestServer is currently unavailable"sv);
         return nullptr;
     }
 
-    auto protocol_request = m_request_client->start_request(request.method(), request.url().value(), request.headers(), request.body(), request.cache_mode(), request.include_credentials(), proxy, keep_alive_for_transfer);
+    auto cache_miss_notification = request.destination() == Fetch::Infrastructure::Request::Destination::Font
+        ? Requests::RequestClient::CacheMissNotification::Yes
+        : Requests::RequestClient::CacheMissNotification::No;
+    // NB: Workers have a Page shim without a navigable or a browser page ID. Their
+    //     requests are attributed through the worker process's browser-level owners.
+    auto originating_page_id = request.page() && request.page()->has_top_level_traversable() ? request.page()->client().id().value() : 0;
+    auto protocol_request = m_request_client->start_request(request.method(), request.url().value(), request.headers(), request.body(), request.cache_mode(), request.include_credentials(), transfer_lease, {}, cache_miss_notification, originating_page_id);
     if (!protocol_request) {
         log_failure(request, "Failed to initiate load"sv);
         return nullptr;
@@ -528,56 +488,14 @@ RefPtr<Requests::Request> ResourceLoader::start_network_request(LoadRequest cons
         page->client().page_did_start_network_request(protocol_request->id(), request.url().value(), request.method(), request.headers().headers(), request.body(), move(initiator_type_string), referrer_policy, request.is_navigation_request(), request.priority());
     }
 
-    ++m_pending_loads;
-    if (on_load_counter_change)
-        on_load_counter_change();
-
     m_active_requests.set(*protocol_request);
     return protocol_request;
 }
 
-void ResourceLoader::handle_network_response_headers(LoadRequest const& request, HTTP::HeaderList const& response_headers)
-{
-    if (!request.page())
-        return;
-
-    // https://www.rfc-editor.org/rfc/rfc6797#section-8.1
-    // If an HTTP response, received over a secure transport, includes an STS header field, conforming to the grammar
-    // specified in Section 6.1, and there are no underlying secure transport errors or warnings, the UA MUST either
-    // note the host as a Known HSTS Host or update the UA's cached information for the Known HSTS Host.
-    if (request.url().has_value() && request.url()->scheme() == "https"sv) {
-        // If a UA receives more than one STS header field in an HTTP response message over secure transport, then
-        // the UA MUST process only the first such header field.
-        for (auto const& [header, value] : response_headers) {
-            if (header.equals_ignoring_ascii_case("Strict-Transport-Security"sv)) {
-                try_store_hsts_policy_for_url(*request.page(), request.url().value(), value);
-                break;
-            }
-        }
-    }
-
-    if (request.include_credentials() == HTTP::Cookie::IncludeCredentials::Yes) {
-        // From https://fetch.spec.whatwg.org/#concept-http-network-fetch:
-        // 15. If includeCredentials is true, then the user agent should parse and store response
-        //     `Set-Cookie` headers given request and response.
-        for (auto const& [header, value] : response_headers) {
-            if (header.equals_ignoring_ascii_case("Set-Cookie"sv)) {
-                store_response_cookies(*request.page(), request.url().value(), value);
-            }
-        }
-    }
-}
-
 void ResourceLoader::finish_network_request(NonnullRefPtr<Requests::Request> protocol_request)
 {
-    --m_pending_loads;
-    if (on_load_counter_change)
-        on_load_counter_change();
-
-    deferred_invoke([this, protocol_request = move(protocol_request)] {
-        auto did_remove = m_active_requests.remove(protocol_request);
-        VERIFY(did_remove);
-    });
+    if (!m_active_requests.remove(protocol_request))
+        warnln("ResourceLoader: finish_network_request() called for request {}, which is not active", protocol_request->id());
 }
 
 }

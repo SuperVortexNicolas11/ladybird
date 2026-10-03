@@ -24,6 +24,9 @@ struct DNSInfo {
     bool use_dns_over_tls { true };
     bool validate_dnssec_locally { false };
 
+    // Only configured DNS gives us the full address pool to distribute requests over.
+    bool uses_configured_dns_server() const { return server_address.has_value() || server_hostname.has_value(); }
+
 private:
     DNSInfo() = default;
 };
@@ -36,7 +39,7 @@ struct Resolver
     DNS::Resolver dns;
 
 private:
-    explicit Resolver(Function<ErrorOr<DNS::Resolver::SocketResult>()> create_socket);
+    explicit Resolver(Function<ErrorOr<Optional<DNS::Resolver::SocketResult>>()> create_socket);
 };
 
 ByteString const& default_certificate_path();

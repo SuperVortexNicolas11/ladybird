@@ -31,13 +31,18 @@
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/PredefinedColorSpace.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/Crypto/CryptoKey.h>
 #include <LibWeb/Crypto/CryptoKeySerializationTags.h>
 #include <LibWeb/Crypto/KeyAlgorithms.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/Geometry/DOMPoint.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/Platform/FontPlugin.h>
 
 using Web::HTML::ValueTag;
 
@@ -197,9 +202,37 @@ inline JS::Realm& test_realm()
     return *realm;
 }
 
+template<typename T>
+requires(IsBaseOf<Web::Bindings::Wrappable, T>)
+inline T& unwrap_wrappable(JS::Value value)
+{
+    VERIFY(value.is_object());
+    auto* object = Web::Bindings::impl_from<T>(&value.as_object());
+    VERIFY(object);
+    return *object;
+}
+
 inline Web::HTML::StorageSerializationRecord storage_serialize(GC::Ref<JS::Object> object)
 {
     return MUST(Web::HTML::structured_serialize_for_storage(test_realm().vm(), object));
+}
+
+template<typename T>
+requires(IsConvertible<T*, Web::Bindings::Wrappable*>)
+inline Web::HTML::StorageSerializationRecord storage_serialize(GC::Ref<T> object)
+{
+    auto& realm = test_realm();
+    auto wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, GC::Ref<Web::Bindings::Wrappable> { object });
+    return MUST(Web::HTML::structured_serialize_for_storage(realm.vm(), JS::Value(wrapper.ptr())));
+}
+
+template<typename T>
+requires(IsConvertible<T*, Web::Bindings::Wrappable*>)
+inline Web::HTML::IPCSerializationRecord structured_serialize(JS::VM& vm, GC::Ref<T> object)
+{
+    auto& realm = test_realm();
+    auto wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, GC::Ref<Web::Bindings::Wrappable> { object });
+    return MUST(Web::HTML::structured_serialize(vm, JS::Value(wrapper.ptr())));
 }
 
 inline Web::WebIDL::ExceptionOr<JS::Value> storage_deserialize(Web::HTML::StorageSerializationRecord const& record)
@@ -279,6 +312,15 @@ inline ByteBuffer serialized_object_body(GC::Ref<JS::Object> object)
     return MUST(ByteBuffer::copy(record.data.bytes().slice(header.size())));
 }
 
+template<typename T>
+requires(IsConvertible<T*, Web::Bindings::Wrappable*>)
+inline ByteBuffer serialized_object_body(GC::Ref<T> object)
+{
+    auto header_size = 6uz;
+    auto record = storage_serialize(object);
+    return MUST(ByteBuffer::copy(record.data.bytes().slice(header_size)));
+}
+
 inline void append_byte_length(Vector<u8>& bytes, Optional<u32> length)
 {
     bytes.append(length.has_value() ? 0 : 1);
@@ -350,8 +392,8 @@ inline Web::HTML::StorageSerializationRecord frozen_image_data_record(ReadonlyBy
     return serializable_storage_record("ImageData"sv, 1, body);
 }
 
-// CryptoKey is [SecureContext], so decode it through a principal realm.
-inline Web::WebIDL::ExceptionOr<JS::Value> crypto_storage_deserialize(Web::HTML::StorageSerializationRecord const& record)
+// CryptoKey is [SecureContext], and WebAssembly module compilation consults Content Security Policy, so decode them through a principal realm.
+inline Web::WebIDL::ExceptionOr<JS::Value> principal_storage_deserialize(Web::HTML::StorageSerializationRecord const& record)
 {
     static GC::Root<JS::Realm> realm;
     auto& vm = test_realm().vm();
@@ -360,6 +402,18 @@ inline Web::WebIDL::ExceptionOr<JS::Value> crypto_storage_deserialize(Web::HTML:
         realm = Web::Bindings::create_a_principal_javascript_realm();
         while (vm.execution_context_stack().size() > depth)
             vm.pop_execution_context();
+
+        // The Content Security Policy requires a document.
+        static Web::Platform::FontPlugin font_plugin { false };
+        Web::Platform::FontPlugin::install(font_plugin);
+
+        auto* window = Web::HTML::window_from_global_object(realm->global_object());
+        VERIFY(window);
+
+        auto& settings = Web::Bindings::principal_host_defined_environment_settings_object(*realm);
+        auto document = Web::DOM::Document::create(Web::Bindings::principal_host_defined_page(*realm), *window, settings.creation_url);
+        window->set_associated_document(document);
+        document->set_window(*window);
     }
 
     auto& settings = Web::Bindings::principal_host_defined_environment_settings_object(*realm);
@@ -373,6 +427,15 @@ inline Web::WebIDL::ExceptionOr<JS::Value> crypto_storage_deserialize(Web::HTML:
     while (vm.execution_context_stack().size() > depth)
         vm.pop_execution_context();
     return result;
+}
+
+constexpr inline auto s_minimal_webassembly_module_bytes = to_array<u8>({ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+
+inline Web::HTML::StorageSerializationRecord webassembly_module_storage_record(ReadonlyBytes module_bytes)
+{
+    Vector<u8> body;
+    append_storage_bytes(body, module_bytes);
+    return serializable_storage_record("Module"sv, 1, body);
 }
 
 // `declared_handle_size` lets tests overstate the raw ByteBuffer handle length.
@@ -639,26 +702,24 @@ inline Vector<CryptoHandleGolden> crypto_handle_goldens()
 // Deserialize first so encode goldens use slot-consistent CryptoKeys.
 inline GC::Ref<Web::Crypto::CryptoKey> build_live_crypto_key(StringView type, StringView usage, Vector<u8> const& algorithm, Vector<u8> const& handle)
 {
-    auto value = MUST(crypto_storage_deserialize(crypto_key_full_record(type, usage, algorithm, handle)));
-    return as<Web::Crypto::CryptoKey>(value.as_object());
+    auto value = MUST(principal_storage_deserialize(crypto_key_full_record(type, usage, algorithm, handle)));
+    return unwrap_wrappable<Web::Crypto::CryptoKey>(value);
 }
 
 // Fabricate RsaKeyAlgorithm directly to pin the encode-only tag-1 branch.
 inline GC::Ref<Web::Crypto::CryptoKey> build_live_crypto_key_with_rsa_key_algorithm(StringView type, StringView usage, StringView name, u32 modulus_length, ReadonlyBytes public_exponent, ReadonlyBytes modulus)
 {
-    auto& realm = test_realm();
     auto exponent = ::Crypto::UnsignedBigInteger::import_data(public_exponent);
     auto modulus_value = ::Crypto::UnsignedBigInteger::import_data(modulus);
 
-    auto key = Web::Crypto::CryptoKey::create(realm, ::Crypto::PK::RSAPublicKey { modulus_value, exponent });
-    key->set_type(type == "public"sv ? Web::Bindings::KeyType::Public : (type == "private"sv ? Web::Bindings::KeyType::Private : Web::Bindings::KeyType::Secret));
+    auto key = Web::Crypto::CryptoKey::create(::Crypto::PK::RSAPublicKey { modulus_value, exponent });
+    key->set_type(type == "public"sv ? Web::Crypto::KeyType::Public : (type == "private"sv ? Web::Crypto::KeyType::Private : Web::Crypto::KeyType::Secret));
     key->set_extractable(false);
     key->set_usages({ usage == "verify"sv ? Web::Bindings::KeyUsage::Verify : Web::Bindings::KeyUsage::Sign });
-
-    auto algorithm = Web::Crypto::RsaKeyAlgorithm::create(realm);
-    algorithm->set_name(MUST(String::from_utf8(name)));
-    algorithm->set_modulus_length(modulus_length);
-    MUST(algorithm->set_public_exponent(exponent));
-    key->set_algorithm(algorithm);
+    key->set_algorithm(Web::Crypto::CryptoKey::RsaKeyAlgorithmData {
+        Utf16String::from_utf8(name),
+        modulus_length,
+        MUST(ByteBuffer::copy(public_exponent)),
+    });
     return key;
 }

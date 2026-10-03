@@ -6,41 +6,61 @@
 
 #pragma once
 
+#include <AK/Badge.h>
 #include <AK/Noncopyable.h>
 #include <AK/RefCounted.h>
 #include <AK/Types.h>
 #include <AK/Vector.h>
 #include <AK/WeakPtr.h>
+#include <LibGC/Cell.h>
+#include <LibGC/Ptr.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/Layout/TreeBuilderRustFFI.h>
+#include <LibWeb/Forward.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Layout/RenderDocument.h>
 
 namespace Web::Layout {
 
+class Node;
 class TextNode;
 
-static_assert(sizeof(RustFFI::NodeAllocation) == 24);
-static_assert(offsetof(RustFFI::NodeAllocation, slot) == 0);
-static_assert(offsetof(RustFFI::NodeAllocation, data) == 8);
-static_assert(offsetof(RustFFI::NodeAllocation, generation) == 16);
-
+// A document's layout node arena, in the render state the document's style engine created, kept alive by the layout
+// shells and paint objects that reach the arena.
 class WEB_API NodeArena : public RefCounted<NodeArena> {
     AK_MAKE_NONCOPYABLE(NodeArena);
     AK_MAKE_NONMOVABLE(NodeArena);
 
 public:
-    NodeArena();
+    explicit NodeArena(RenderDocument&);
     ~NodeArena();
 
-    RustFFI::NodeAllocation allocate();
-    void free(RustFFI::NodeSlotId, u32 generation);
+    void free_subtree(Compositing::RustFFI::NodeSlotId);
+    Node* node_if_live(Compositing::RustFFI::NodeSlotId) const;
     void* handle() const { return m_handle; }
+    RustFFI::DocumentHost* host() const { return m_render_document->host(); }
+    u64 table_cell_measurement_cache_miss_count() const;
+    u64 intrinsic_measurement_count() const;
+    u64 intrinsic_inline_measurement_count() const;
 
-    void enroll_text_node_for_content_sync(TextNode const&);
-    void sync_enrolled_text_node_content();
+    void sync_enrolled_content_for_layout();
+
+    DOM::Document* document() const { return m_document.ptr(); }
+    void set_document(Badge<DOM::Document>, DOM::Document* document) { m_document = document; }
+
+    // The arena reports to each DOM node whether it has a layout node, and whether that layout node has a committed
+    // box, as it changes them. Only the arena writes those bits onto the node.
+    void start_reporting_box_presence(Badge<DOM::Document>);
+    void stop_reporting_box_presence(Badge<DOM::Document>);
+    void commit_box_presence(DOM::Node&);
 
 private:
+    NonnullRefPtr<RenderDocument> m_render_document;
+    // The arena of the document's render state, which the entries that have not been converted to render messages
+    // still take.
     void* m_handle { nullptr };
-    Vector<WeakPtr<TextNode>> m_text_nodes_enrolled_for_content_sync;
+    GC::RawPtr<DOM::Document> m_document;
 };
+
+WEB_API bool destroy_layout_subtree(Node&);
 
 }

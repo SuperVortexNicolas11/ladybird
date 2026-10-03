@@ -7,20 +7,18 @@
 #pragma once
 
 #include <AK/Utf16String.h>
+#include <LibCompositing/Types.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/HTML/InitialInsertion.h>
+#include <LibWebCommon/HTML/InitialInsertion.h>
+#include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 
 namespace Web::HTML {
 
 class WEB_API NavigableContainer : public HTMLElement {
-    WEB_NON_IDL_PLATFORM_OBJECT(NavigableContainer, HTMLElement);
+    WEB_NON_IDL_WRAPPABLE(NavigableContainer, HTMLElement);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
-    static GC::Ptr<NavigableContainer> navigable_container_with_content_navigable(GC::Ref<LocalNavigable> navigable);
-
     virtual ~NavigableContainer() override;
 
     static HashTable<NavigableContainer*>& all_instances();
@@ -36,6 +34,13 @@ public:
     DOM::Document const* get_svg_document() const;
 
     void destroy_the_child_navigable();
+    static void continue_destroying_the_child_navigable(Navigable&);
+
+    void swap_content_navigable_to_remote(Badge<Page>, ReplicatedNavigableState);
+    void swap_content_navigable_to_local(Badge<Page>, LocalNavigable&);
+
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#completely-finish-loading
+    void content_navigable_completely_finished_loading();
 
     // All elements that extend NavigableContainer "potentially delay the load event".
     // (embed, frame, iframe, and object)
@@ -43,6 +48,13 @@ public:
     bool currently_delays_the_load_event() const;
 
     bool content_navigable_has_session_history_entry_and_ready_for_navigation() const;
+
+    ReplicatedContainerState replicated_container_state();
+
+    // The UI process routes input over a navigable another process hosts by the rect of its container's content box
+    // in the viewport of the local root, and tells that navigable the part of it the top-level viewport shows. Both
+    // are reported whenever they change.
+    void report_content_navigable_viewport_rect();
 
 protected:
     NavigableContainer(DOM::Document&, DOM::QualifiedName);
@@ -62,14 +74,21 @@ protected:
 
     void set_potentially_delays_the_load_event(bool value);
 
-    void set_content_navigable_has_session_history_entry_and_ready_for_navigation();
-
 private:
     virtual bool is_navigable_container() const override { return true; }
 
     virtual void finalize() override;
 
+    static void finish_destroying_the_child_navigable(Navigable&);
+
     bool m_potentially_delays_the_load_event { true };
+
+    struct ReportedContentNavigableViewport {
+        DevicePixelRect rect;
+        DevicePixelRect intersection;
+        bool operator==(ReportedContentNavigableViewport const&) const = default;
+    };
+    Optional<ReportedContentNavigableViewport> m_reported_content_navigable_viewport;
 };
 
 }

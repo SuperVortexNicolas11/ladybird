@@ -9,11 +9,11 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
 #include <AK/AtomicRefCounted.h>
 #include <AK/FlyString.h>
-#include <AK/HashMap.h>
+#include <AK/Once.h>
 #include <AK/Optional.h>
-#include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Utf16String.h>
 #include <LibGfx/Font/Font.h>
@@ -25,16 +25,6 @@ struct hb_font_t;
 struct hb_buffer_t;
 
 namespace Gfx {
-
-struct ShapedGlyphs;
-
-struct ShapingCacheKey {
-    Utf16String text;
-    u8 text_type { 0 };
-    u32 letter_spacing_bit_pattern { 0 };
-
-    bool operator==(ShapingCacheKey const&) const = default;
-};
 
 struct FontPixelMetrics {
     float x_height { 0 };
@@ -88,53 +78,46 @@ public:
     u8 slope() const { return m_typeface->slope(); }
     u16 weight() const { return m_typeface->weight(); }
     bool contains_glyph(u32 code_point) const { return m_typeface->glyph_id_for_code_point(code_point) > 0; }
-    float glyph_width(u32 code_point) const;
     u32 glyph_id_for_code_point(u32 code_point) const { return m_typeface->glyph_id_for_code_point(code_point); }
     int x_height() const { return m_point_height; } // FIXME: Read from font
     float width(Utf16View const&) const;
     FlyString const& family() const { return m_typeface->family(); }
 
     NonnullRefPtr<Font> with_size(float point_size) const;
+    NonnullRefPtr<Font> invisible_variant() const;
+    bool is_invisible() const { return m_is_invisible; }
 
     Typeface const& typeface() const { return m_typeface; }
 
     SkFont skia_font(float scale) const;
 
-    Font const& bold_variant() const;
     hb_font_t* harfbuzz_font() const;
     FontVariationSettings const& variation_settings() const { return m_font_variation_settings; }
     ShapeFeatures const& features() const { return m_shape_features; }
 
-    struct ShapingCache {
-        HashMap<ShapingCacheKey, OwnPtr<ShapedGlyphs>> map;
-        OwnPtr<ShapedGlyphs> single_ascii_character_map[128];
-
-        ~ShapingCache();
-        void clear();
-    };
-    ShapingCache& shaping_cache() const { return m_shaping_cache; }
-
     bool is_emoji_font() const;
 
 private:
+    bool m_is_invisible { false };
     u64 m_id { 0 };
 
 #if defined(USE_FONTCONFIG)
     FontHintingOptions hinting_options(float scale) const;
 
-    struct ScaledFontHintingOptions {
-        float scale;
-        FontHintingOptions options;
-    };
-    mutable Optional<ScaledFontHintingOptions> m_hinting_options;
+    // The one-entry memo is a single atomic word because a stage that turns text into a path and
+    // the rasterizer that draws it ask the same font for hinting at different scales. Font.cpp
+    // owns the encoding. Either winner is correct: fontconfig's answer is a pure function of the
+    // family, the scaled pixel size, the weight and the slope.
+    mutable Atomic<u64> m_hinting_memo { 0 };
 #endif
 
-    mutable RefPtr<Font const> m_bold_variant;
+    mutable OnceFlag m_harfbuzz_font_once;
     mutable hb_font_t* m_harfbuzz_font { nullptr };
 
-    mutable ShapingCache m_shaping_cache;
-
-    mutable TriState m_is_emoji_font { TriState::Unknown };
+    // A layout pass classifies fonts while the document thread may be doing the same to the same
+    // font, so the verdict is a single atomic byte. Either winner is correct: the classification
+    // reads only the face's immutable tables.
+    mutable Atomic<TriState> m_is_emoji_font { TriState::Unknown };
 
     NonnullRefPtr<Typeface const> m_typeface;
     float m_point_width { 0.0f };
@@ -144,18 +127,6 @@ private:
     FontPixelMetrics m_pixel_metrics;
 
     float m_pixel_size { 0.0f };
-};
-
-}
-
-namespace AK {
-
-template<>
-struct Traits<Gfx::ShapingCacheKey> : public DefaultTraits<Gfx::ShapingCacheKey> {
-    static unsigned hash(Gfx::ShapingCacheKey const& key)
-    {
-        return pair_int_hash(key.text.hash(), pair_int_hash(key.text_type, key.letter_spacing_bit_pattern));
-    }
 };
 
 }

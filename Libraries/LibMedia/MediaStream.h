@@ -8,6 +8,7 @@
 
 #include <AK/AtomicRefCounted.h>
 #include <AK/Endian.h>
+#include <AK/FixedArray.h>
 #include <AK/Function.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Stream.h>
@@ -31,8 +32,12 @@ public:
 
     virtual DecoderErrorOr<void> seek(i64 offset, AK::SeekMode) = 0;
     virtual DecoderErrorOr<size_t> read_into(Bytes) = 0;
+    virtual DecoderErrorOr<FixedArray<u8>> read_bytes(size_t size) = 0;
     virtual size_t position() const = 0;
-    virtual size_t size() const = 0;
+    virtual Optional<u64> size() const = 0;
+    // Waits for the size of the stream to become known. Only for callers with no way to express an
+    // unknown size, since a stream that never announces one leaves this waiting.
+    virtual size_t blocking_size() const = 0;
 
     DecoderErrorOr<void> read_until_filled(Bytes buffer)
     {
@@ -43,7 +48,7 @@ public:
     }
 
     template<Integral T>
-    DecoderErrorOr<T> read_value(AK::Endianness endianness = AK::Endianness::Host)
+    DecoderErrorOr<T> read_value(AK::Endianness endianness = AK::Endianness::Big)
     {
         T value = 0;
         TRY(read_until_filled({ &value, sizeof(value) }));

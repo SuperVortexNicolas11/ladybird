@@ -16,6 +16,8 @@ namespace DevTools {
 
 class DEVTOOLS_API FirefoxClient {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static NonnullOwnPtr<FirefoxClient> create();
     ~FirefoxClient();
 
@@ -25,7 +27,7 @@ public:
 private:
     FirefoxClient() = default;
 
-    Optional<Core::Process> m_process;
+    Optional<pid_t> m_process_id;
 };
 
 }

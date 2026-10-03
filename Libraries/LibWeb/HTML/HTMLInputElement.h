@@ -16,14 +16,21 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/FileAPI/FileList.h>
 #include <LibWeb/HTML/AutocompleteElement.h>
-#include <LibWeb/HTML/ColorPickerUpdateState.h>
-#include <LibWeb/HTML/FileFilter.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/PopoverTargetAttributes.h>
 #include <LibWeb/Layout/ImageProvider.h>
 #include <LibWeb/WebIDL/DOMException.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/HTML/ColorPickerUpdateState.h>
+#include <LibWebCommon/HTML/FileFilter.h>
+#include <LibWebCommon/WebIDL/Types.h>
+
+namespace JS {
+
+class Object;
+class Realm;
+
+}
 
 namespace Web::HTML {
 
@@ -58,15 +65,14 @@ class WEB_API HTMLInputElement final
     , public Layout::ImageProvider
     , public PopoverTargetAttributes
     , public AutocompleteElement {
-    WEB_PLATFORM_OBJECT(HTMLInputElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLInputElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLInputElement);
     AUTOCOMPLETE_ELEMENT(HTMLElement, HTMLInputElement);
 
 public:
     virtual ~HTMLInputElement() override;
 
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
     virtual void set_being_activated(bool) override;
 
     enum class TypeAttributeState {
@@ -95,10 +101,12 @@ public:
     virtual void set_dirty_value_flag(bool flag) override { m_dirty_value = flag; }
 
     bool user_validity() const { return m_user_validity; }
-    void set_user_validity(bool flag) { m_user_validity = flag; }
+    void set_user_validity(bool);
 
     void commit_pending_changes();
     bool has_uncommitted_changes() { return m_has_uncommitted_changes; }
+
+    void ensure_user_agent_shadow_tree(Badge<Internals::Internals>) { create_shadow_tree_if_needed(); }
 
     Utf16String placeholder() const;
     Optional<Utf16String> placeholder_value() const;
@@ -151,8 +159,10 @@ public:
     };
     SelectedCoordinate selected_coordinate() const { return m_selected_coordinate; }
 
-    JS::Object* value_as_date() const;
-    WebIDL::ExceptionOr<void> set_value_as_date(GC::Ptr<JS::Object>);
+    Optional<double> value_as_date() const;
+    WebIDL::ExceptionOr<void> set_value_as_date(Optional<double>);
+    GC::Ptr<JS::Object> value_as_date_object(JS::Object& relevant_global_object) const;
+    WebIDL::ExceptionOr<void> set_value_as_date_object(GC::Ptr<JS::Object>);
 
     double value_as_number() const;
     WebIDL::ExceptionOr<void> set_value_as_number(double value);
@@ -188,6 +198,7 @@ public:
 
     // https://html.spec.whatwg.org/multipage/forms.html#concept-submit-button
     virtual bool is_submit_button() const override;
+    static bool is_submit_button(TypeAttributeState);
 
     bool is_single_line() const;
 
@@ -195,6 +206,9 @@ public:
     virtual void clear_algorithm() override;
 
     virtual void form_associated_element_was_inserted() override;
+    virtual void form_associated_element_was_removed(DOM::Node*) override;
+    virtual void form_associated_element_was_moved(GC::Ptr<DOM::Node>) override;
+    virtual void form_associated_element_form_owner_changed() override;
     virtual void form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const override;
@@ -233,7 +247,16 @@ public:
 
     static bool selection_or_range_applies_for_type_state(TypeAttributeState);
 
-    Optional<Utf16FlyString> selection_direction_binding() { return selection_direction(); }
+    WebIDL::ExceptionOr<void> set_range_text(Utf16String const& replacement);
+    WebIDL::ExceptionOr<void> set_range_text(Utf16String const& replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, SelectionMode = SelectionMode::Preserve);
+
+    Optional<String> selection_direction_binding()
+    {
+        auto direction = selection_direction();
+        if (!direction.has_value())
+            return {};
+        return direction->to_utf16_string().to_utf8();
+    }
 
     // ^FormAssociatedTextControlElement
     virtual HTMLElement& text_control_to_html_element() override { return *this; }
@@ -263,7 +286,10 @@ private:
     HTMLInputElement(DOM::Document&, DOM::QualifiedName);
 
     void type_attribute_changed(TypeAttributeState old_state, TypeAttributeState new_state);
+    RadioButtonGroupRegistry* radio_button_group_registry();
+    void update_radio_button_group_registration();
     virtual void computed_properties_changed() override;
+    virtual void prepare_for_style_computation() override { create_shadow_tree_if_needed(); }
 
     virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
@@ -288,8 +314,7 @@ private:
     // ^Layout::ImageProvider
     virtual bool is_image_pending() const override;
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override { return image_data(); }
-
-    virtual void initialize(JS::Realm&) override;
+    virtual Layout::Node const* image_provider_layout_node() const override;
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void adopted_from(DOM::Document&) override;
 
@@ -297,8 +322,9 @@ private:
     Optional<double> convert_string_to_number(Utf16View input) const;
     Utf16String convert_number_to_string(double input) const;
 
-    WebIDL::ExceptionOr<GC::Ptr<JS::Date>> convert_string_to_date(Utf16View input) const;
-    Utf16String convert_date_to_string(GC::Ref<JS::Date> input) const;
+    WebIDL::ExceptionOr<Optional<double>> convert_string_to_date(StringView input) const;
+    WebIDL::ExceptionOr<Optional<double>> convert_string_to_date(Utf16String const& input) const;
+    Utf16String convert_date_to_string(double input) const;
 
     Optional<double> min() const;
     Optional<double> max() const;
@@ -315,6 +341,9 @@ private:
     void create_shadow_tree_if_needed();
     void update_shadow_tree();
     void create_button_input_shadow_tree();
+    void create_image_button_alt_text_shadow_tree();
+    void remove_image_button_alt_text_shadow_tree();
+    void update_image_button_alt_text_shadow_tree();
     void create_text_input_shadow_tree();
     void create_color_input_shadow_tree();
     void create_file_input_shadow_tree();
@@ -347,6 +376,7 @@ private:
     void update_text_input_shadow_tree();
     GC::Ptr<DOM::Element> m_inner_text_element;
     GC::Ptr<DOM::Text> m_text_node;
+    GC::Ptr<DOM::Text> m_image_button_alt_text_node;
     bool m_checked { false };
     GC::Ptr<DOM::Element> m_up_button_element;
     GC::Ptr<DOM::Element> m_down_button_element;
@@ -385,6 +415,9 @@ private:
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
     bool m_user_validity { false };
 
+    GC::Ptr<RadioButtonGroupRegistry> m_radio_button_group_registry;
+    Utf16FlyString m_radio_button_group_name;
+
     // https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior
     bool m_before_legacy_pre_activation_behavior_checked { false };
     bool m_before_legacy_pre_activation_behavior_indeterminate { false };
@@ -416,15 +449,5 @@ namespace Web::DOM {
 
 template<>
 inline bool Node::fast_is<HTML::HTMLInputElement>() const { return is_html_input_element(); }
-
-}
-
-namespace JS {
-
-template<>
-inline bool Object::fast_is<Web::HTML::HTMLInputElement>() const
-{
-    return is_dom_node() && static_cast<Web::DOM::Node const&>(*this).is_html_input_element();
-}
 
 }

@@ -4,9 +4,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibCore/GeolocationProvider.h>
 #include <LibMain/Main.h>
+#include <LibURL/URL.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BrowserProcess.h>
+#include <LibWebView/CrashReportStore.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
 #include <UI/Qt/Application.h>
@@ -15,6 +18,7 @@
 #    include <UI/Qt/GeolocationProviderQt.h>
 #endif
 #include <UI/Qt/Settings.h>
+#include <UI/Qt/WebContentView.h>
 
 #include <QCoreApplication>
 #include <QStyleHints>
@@ -23,7 +27,7 @@
 #if defined(AK_OS_MACOS)
 #    include <QColorSpace>
 #    include <QSurfaceFormat>
-#    include <UI/AppKit/Utilities/ApplicationIcon.h>
+#    include <UI/Qt/ApplicationIcon.h>
 #    include <UI/Qt/MacWindow.h>
 #endif
 
@@ -51,18 +55,24 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     AK::set_rich_debug_enabled(true);
 
-#ifdef AK_OS_MACOS
-    // The web content view is a native QRhiWidget child. Keep it from forcing
-    // every sibling in the tab UI to become native as well.
+    if (auto result = WebView::CrashReportStore::the().initialize_browser_crash_handler(); result.is_error())
+        warnln("Could not prepare Browser crash reporting: {}", result.error());
+
+    // The web content view is presented in a native child window. Without this attribute, a widget
+    // gaining a native window would force every other widget in the browser window to become native
+    // as well.
     QCoreApplication::setAttribute(Qt::AA_DontCreateNativeWidgetSiblings);
 
+#ifdef AK_OS_MACOS
     auto surface_format = QSurfaceFormat::defaultFormat();
     surface_format.setColorSpace(QColorSpace::SRgb);
     QSurfaceFormat::setDefaultFormat(surface_format);
 #endif
 
 #if defined(LADYBIRD_QT_HAVE_POSITIONING)
-    Ladybird::install_qt_geolocation_provider();
+    // Only fall back to Qt on platforms that have no geolocation provider of their own.
+    if (!Core::GeolocationProvider::is_available())
+        Ladybird::install_qt_geolocation_provider();
 #endif
 
     auto app = TRY(Ladybird::Application::create(arguments));
@@ -71,7 +81,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         return 0;
     }
 
-    app->initialize_macos_application_menu();
     auto& browser_process = app->browser_process();
 
     if (auto const& browser_options = Ladybird::Application::browser_options(); !browser_options.headless_mode.has_value()) {
@@ -94,6 +103,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
                 return;
             }
             app->new_window({ file_url });
+        };
+
+        browser_process.on_open_urls = [&](auto const& urls) {
+            for (auto const& url : urls)
+                app->on_open_file(url);
         };
 
         browser_process.on_new_tab = [&](auto const& urls) {
@@ -127,6 +141,17 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         }
         auto& window = app->new_window(browser_options.urls, configuration);
         window.setWindowTitle("Ladybird");
+
+        if (!browser_options.webdriver_browser_endpoint.has_value() && WebView::CrashReportStore::the().has_pending_reports()) {
+            // A window that opened only the new tab page shows the reports there. Otherwise, they wait in a tab of their
+            // own, which does not take the page the user asked for out of view.
+            auto opened_only_new_tab_page = browser_options.urls.size() == 1
+                && browser_options.urls.first() == WebView::Application::settings().new_tab_page_url();
+            auto& tab = opened_only_new_tab_page && window.current_tab()
+                ? *window.current_tab()
+                : window.new_tab_from_url(URL::about_blank(), Web::HTML::ActivateTab::No, Ladybird::BrowserWindow::TabLocation::end());
+            tab.view().show_earlier_crash_reports();
+        }
     }
 
     return app->execute();

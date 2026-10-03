@@ -10,12 +10,13 @@
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
 #include <LibWeb/CSS/Descriptor.h>
 #include <LibWeb/CSS/DescriptorID.h>
+#include <LibWeb/CSS/RustDescriptorBlock.h>
 
 namespace Web::CSS {
 
 // A non-spec base class for descriptor-list classes
 class CSSDescriptors : public CSSStyleDeclaration {
-    WEB_NON_IDL_PLATFORM_OBJECT(CSSDescriptors, CSSStyleDeclaration);
+    WEB_NON_IDL_WRAPPABLE(CSSDescriptors, CSSStyleDeclaration);
 
 public:
     virtual ~CSSDescriptors() override;
@@ -27,7 +28,6 @@ public:
     virtual Utf16String get_property_value(Utf16FlyString const& property) const override;
     virtual Utf16String get_property_priority(Utf16FlyString const& property) const override;
 
-    Vector<Descriptor> const& descriptors() const { return m_descriptors; }
     RefPtr<StyleValue const> descriptor(DescriptorNameAndID const&) const;
     RefPtr<StyleValue const> descriptor_or_initial_value(DescriptorNameAndID const&) const;
     virtual Utf16String serialized() const override;
@@ -35,15 +35,17 @@ public:
     virtual WebIDL::ExceptionOr<void> set_css_text(Utf16View) override;
 
 protected:
-    CSSDescriptors(JS::Realm&, AtRuleID, Vector<Descriptor>);
+    CSSDescriptors(AtRuleID, RustDescriptorBlock);
 
 private:
+    virtual size_t external_memory_size() const override;
     bool set_a_css_declaration(DescriptorNameAndID const&, NonnullRefPtr<StyleValue const>, Important);
+    void invalidate_owners();
 
     WebIDL::ExceptionOr<void> set_property_internal(Utf16FlyString const& property, Utf16View value, Utf16View priority);
 
     AtRuleID m_at_rule_id;
-    Vector<Descriptor> m_descriptors;
+    RustDescriptorBlock m_descriptors;
 };
 
 bool is_shorthand(AtRuleID, DescriptorNameAndID const&);

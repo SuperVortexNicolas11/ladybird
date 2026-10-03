@@ -14,10 +14,10 @@
 #include <AK/Noncopyable.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/RWLock.h>
 #include <AK/RefPtr.h>
 #include <LibCore/Export.h>
 #include <LibCore/Forward.h>
-#include <LibSync/RWLock.h>
 
 namespace Core {
 
@@ -45,6 +45,8 @@ class CORE_API EventLoop {
     AK_MAKE_NONCOPYABLE(EventLoop);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     enum class WaitMode {
         WaitForEvents,
         PollForEvents,
@@ -115,7 +117,7 @@ private:
     void revoke();
 
     EventLoop* m_event_loop;
-    Sync::RWLock m_lock;
+    RWLock m_lock;
 };
 
 class CORE_API StrongEventLoopReference {

@@ -7,8 +7,6 @@
 
 #include <AK/Utf16StringBuilder.h>
 #include <LibWeb/ARIA/Roles.h>
-#include <LibWeb/Bindings/HTMLOptionElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
@@ -22,8 +20,8 @@
 #include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLSelectedContentElement.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Infra/Strings.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
+#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::HTML {
 
@@ -37,12 +35,6 @@ HTMLOptionElement::HTMLOptionElement(DOM::Document& document, DOM::QualifiedName
 }
 
 HTMLOptionElement::~HTMLOptionElement() = default;
-
-void HTMLOptionElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLOptionElement);
-    Base::initialize(realm);
-}
 
 void HTMLOptionElement::visit_edges(Cell::Visitor& visitor)
 {
@@ -92,15 +84,14 @@ void HTMLOptionElement::set_selected(bool selected)
 
 void HTMLOptionElement::set_selected_internal(bool selected)
 {
-    if (m_selected != selected)
-        CSS::Invalidation::invalidate_style_after_option_selected_state_change(*this);
+    if (m_selected != selected) {
+        CSS::Invalidation::invalidate_style_after_option_selected_state_change(*this, selected);
+        document().bump_option_selectedness_version();
+    }
 
     m_selected = selected;
     if (selected)
         m_selectedness_update_index = m_next_selectedness_update_index++;
-
-    // this is here to invalidate the cache on the HTMLCollection in HTMLSelectElement::selected_options
-    document().bump_dom_tree_version();
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value
@@ -280,7 +271,7 @@ WebIDL::ExceptionOr<void> HTMLOptionElement::clone_into_selectedcontent(GC::Ref<
     // To clone an option into a selectedcontent, given an option element option and a selectedcontent element selectedcontent:
 
     // 1. Let documentFragment be a new DocumentFragment whose node document is option's node document.
-    auto fragment = realm().create<DOM::DocumentFragment>(document());
+    auto fragment = DOM::DocumentFragment::create(document());
 
     // 2. For each child of option's children:
     for (auto* child = first_child(); child; child = child->next_sibling()) {

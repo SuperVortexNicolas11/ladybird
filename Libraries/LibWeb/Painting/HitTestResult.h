@@ -12,43 +12,50 @@
 #include <AK/Types.h>
 #include <LibGC/Ptr.h>
 #include <LibWeb/DOM/AbstractRange.h>
+#include <LibWeb/DOM/NodeIdentity.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/PixelUnits.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/ChromeWidget.h>
 #include <LibWeb/TextAffinity.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::Painting {
 
-class ChromeWidget;
-class Paintable;
-
 struct HitTestResult {
-    NonnullRefPtr<Paintable> paintable;
+    DOM::NodeIdentity node;
+    Compositing::RustFFI::NodeSlotId hit_node;
+    NonnullRefPtr<Layout::NodeArena> arena;
     RefPtr<ChromeWidget> chrome_widget {};
-    GC::Ptr<DOM::Node> dom_node_override {};
     size_t index_in_node { 0 };
     bool is_text_fragment { false };
-    enum InternalPosition {
-        None,
-        Before,
-        Inside,
-        After,
-    };
-    InternalPosition internal_position { None };
 
-    DOM::Node* dom_node();
-    DOM::Node const* dom_node() const;
+    DOM::Node* dom_node() const;
+    Layout::Node* layout_node() const { return layout_node_for_committed_slot(*arena, hit_node); }
 };
 
-struct CaretPosition {
-    NonnullRefPtr<Paintable> paintable;
-    DOM::BoundaryPoint boundary;
+// A boundary point that names its node instead of pointing at it. A node that left the tree since
+// the hit test resolves to nothing, where a pointer would have handed back a node the document no
+// longer contains.
+struct WEB_API BoundaryIdentity {
+    DOM::NodeIdentity node;
+    WebIDL::UnsignedLong offset { 0 };
+
+    Optional<DOM::BoundaryPoint> resolve(DOM::Document&) const;
+};
+
+struct WEB_API CaretPosition {
+    Compositing::RustFFI::NodeSlotId paintable;
+    NonnullRefPtr<Layout::NodeArena> arena;
+    BoundaryIdentity boundary;
     TextAffinity affinity { TextAffinity::Downstream };
-    Optional<DOM::BoundaryPoint> secondary_boundary {};
+    Optional<BoundaryIdentity> secondary_boundary {};
     Optional<CSSPixelRect> debug_rect {};
-};
 
-enum class HitTestType : u8 {
-    Exact, // Exact matches only
+    GC::Ptr<DOM::Node> boundary_node() const;
+    Optional<DOM::BoundaryPoint> boundary_point() const;
+    // The layout node the boundary's node is bound to, found in the arena rather than asked of that node.
+    Layout::Node* boundary_layout_node() const;
+    Layout::Node* layout_node() const { return layout_node_for_committed_slot(*arena, paintable); }
 };
 
 }

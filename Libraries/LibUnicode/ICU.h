@@ -33,12 +33,18 @@ class TimeZone;
 class TimeZoneNames;
 U_NAMESPACE_END
 
+template<DerivedFrom<icu::UMemory> T>
+constexpr bool AllocatedWithSystemAllocator<T> = true;
+
 namespace Unicode {
 
+// Cache entries, returned references, and lazy ICU objects are confined to the calling thread.
 class LocaleData {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static Optional<LocaleData&> for_locale(StringView locale);
-    static Utf16String canonicalize(StringView locale);
+    static Optional<Utf16String> canonicalize(StringView locale);
 
     ALWAYS_INLINE icu::Locale& locale() { return m_locale; }
 
@@ -47,7 +53,7 @@ public:
 
     icu::NumberingSystem& numbering_system();
 
-    icu::DateTimePatternGenerator& date_time_pattern_generator();
+    Optional<icu::DateTimePatternGenerator&> date_time_pattern_generator();
 
     icu::TimeZoneNames& time_zone_names();
 
@@ -68,8 +74,11 @@ private:
     Optional<DigitalFormat> m_digital_format;
 };
 
+// Cache entries and their ICU objects are confined to the calling thread.
 class TimeZoneData {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static Optional<TimeZoneData&> for_time_zone(Utf16View time_zone);
 
     ALWAYS_INLINE icu::TimeZone& time_zone() { return *m_time_zone; }

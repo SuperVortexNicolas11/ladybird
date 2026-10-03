@@ -46,22 +46,16 @@ ErrorOr<void, ValidationError> Validator::validate(Module& module)
     for (auto& import_ : module.import_section().imports()) {
         TRY(import_.description().visit(
             [&](TypeIndex const& index) -> ErrorOr<void, ValidationError> {
-                if (m_context.types.size() > index.value()) {
-                    m_context.types[index.value()].description().visit(
-                        [&](FunctionType const& func) {
-                            m_context.functions.append(func);
-                            m_context.function_type_indices.append(index);
-                            m_context.imported_function_count++;
-                        },
-                        [&](StructType const& struct_) {
-                            m_context.structs.append(struct_);
-                        },
-                        [&](ArrayType const& array) {
-                            m_context.arrays.append(array);
-                        });
-                } else {
+                if (m_context.types.size() <= index.value())
                     return Errors::invalid("TypeIndex"sv);
-                }
+
+                auto const& type = m_context.types[index.value()];
+                if (!type.is_function())
+                    return Errors::invalid("function import type"sv);
+
+                m_context.functions.append(type.function());
+                m_context.function_type_indices.append(index);
+                m_context.imported_function_count++;
                 return {};
             },
             [&](FunctionType const& type) -> ErrorOr<void, ValidationError> {
@@ -333,6 +327,9 @@ ErrorOr<void, ValidationError> Validator::validate(ElementSection const& section
         // https://webassembly.github.io/spec/core/valid/modules.html#element-segments
         // - The reference type elemtype is valid.
         TRY(validate(segment.type));
+        if (!segment.type.is_reference())
+            return Errors::invalid("element reference type"sv);
+
         TRY(segment.mode.visit(
             [](ElementSection::Declarative const&) -> ErrorOr<void, ValidationError> { return {}; },
             [](ElementSection::Passive const&) -> ErrorOr<void, ValidationError> { return {}; },
@@ -5072,6 +5069,116 @@ VALIDATE_INSTRUCTION(synthetic_end_expression)
     return {}; // Always valid.
 }
 
+// https://webassembly.github.io/threads/core/valid/instructions.html#atomic-memory-instructions
+ErrorOr<void, ValidationError> Validator::validate_atomic_memory_argument(Instruction::MemoryArgument const& arg, size_t access_size)
+{
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
+    // Unlike plain memory accesses, atomic accesses must be exactly naturally aligned.
+    if ((1ull << arg.align) != access_size)
+        return Errors::invalid("atomic memory op alignment"sv, access_size, 1ull << arg.align);
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_load)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY((take_memory_address(stack, memory, arg.memory)));
+    stack.append(arg.value_type());
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_store)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY(stack.take(arg.value_type()));
+    TRY((take_memory_address(stack, memory, arg.memory)));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_rmw)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY(stack.take(arg.value_type()));
+    TRY((take_memory_address(stack, memory, arg.memory)));
+    stack.append(arg.value_type());
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_rmw_cmpxchg)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY(stack.take(arg.value_type())); // replacement
+    TRY(stack.take(arg.value_type())); // expected
+    TRY((take_memory_address(stack, memory, arg.memory)));
+    stack.append(arg.value_type());
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(memory_atomic_notify)
+{
+    auto const& arg = instruction.arguments().get<Instruction::MemoryArgument>();
+    auto memory = TRY(validate(arg.memory_index));
+    TRY(validate_atomic_memory_argument(arg, sizeof(i32)));
+
+    TRY((stack.take<ValueType::I32>())); // count
+    TRY((take_memory_address(stack, memory, arg)));
+    stack.append(ValueType(ValueType::I32));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(memory_atomic_wait32)
+{
+    auto const& arg = instruction.arguments().get<Instruction::MemoryArgument>();
+    auto memory = TRY(validate(arg.memory_index));
+    TRY(validate_atomic_memory_argument(arg, sizeof(i32)));
+
+    TRY((stack.take<ValueType::I64>())); // timeout
+    TRY((stack.take<ValueType::I32>())); // expected
+    TRY((take_memory_address(stack, memory, arg)));
+    stack.append(ValueType(ValueType::I32));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(memory_atomic_wait64)
+{
+    auto const& arg = instruction.arguments().get<Instruction::MemoryArgument>();
+    auto memory = TRY(validate(arg.memory_index));
+    TRY(validate_atomic_memory_argument(arg, sizeof(i64)));
+
+    TRY((stack.take<ValueType::I64>())); // timeout
+    TRY((stack.take<ValueType::I64>())); // expected
+    TRY((take_memory_address(stack, memory, arg)));
+    stack.append(ValueType(ValueType::I32));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_fence)
+{
+    return {};
+}
+
 ErrorOr<void, ValidationError> Validator::validate(Instruction const& instruction, Stack& stack, bool& is_constant)
 {
     switch (instruction.opcode().value()) {
@@ -5112,10 +5219,8 @@ ErrorOr<Validator::ExpressionTypeResult, ValidationError> Validator::validate(Ex
     m_frames.take_last();
 
     expression.set_stack_usage_hint(stack.max_known_size());
-    expression.set_frame_usage_hint(m_max_frame_size);
 
     VERIFY(m_frames.is_empty());
-    m_max_frame_size = 0;
 
     // Now that we're in happy land, try to compile the expression down to a list of labels to help dispatch.
     expression.compiled_instructions = try_compile_instructions(expression, m_context.functions.span(), callee_bodies, current_function_index, m_context.locals.size(), m_context.imported_function_count);

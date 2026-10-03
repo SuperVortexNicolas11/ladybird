@@ -7,13 +7,11 @@
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/QuickSort.h>
-#include <AK/Utf16StringBuilder.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/SourceSet.h>
-#include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
 
 namespace Web::HTML {
 
@@ -347,8 +345,8 @@ descriptor_parser:
 // https://html.spec.whatwg.org/multipage/images.html#parse-a-sizes-attribute
 NonnullRefPtr<CSS::StyleValue const> parse_a_sizes_attribute(DOM::Element const& element, Utf16View sizes, HTML::HTMLImageElement const* img)
 {
-    auto css_parser = CSS::Parser::Parser::create(CSS::Parser::ParsingParams { element.document() }, sizes);
-    return css_parser.parse_as_sizes_attribute(element, img);
+    CSS::Parser::Parser css_parser { CSS::Parser::ParsingParams { element.document() } };
+    return css_parser.parse_as_sizes_attribute(sizes, element, img);
 }
 
 // https://html.spec.whatwg.org/multipage/images.html#create-a-source-set

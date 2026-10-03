@@ -24,6 +24,7 @@ set(AK_TEST_SOURCES
     TestEndian.cpp
     TestEnumBits.cpp
     TestEnumerate.cpp
+    TestFFIHelpers.cpp
     TestFind.cpp
     TestFixedArray.cpp
     TestFunction.cpp
@@ -34,6 +35,7 @@ set(AK_TEST_SOURCES
     TestHashFunctions.cpp
     TestHashMap.cpp
     TestHashTable.cpp
+    TestHeapPartition.cpp
     TestHex.cpp
     TestIPv4Address.cpp
     TestIPv6Address.cpp
@@ -58,6 +60,7 @@ set(AK_TEST_SOURCES
     TestRedBlackTree.cpp
     TestRefPtr.cpp
     TestSeqLock.cpp
+    TestSetUnion.cpp
     TestSingleProducerCircularQueue.cpp
     TestSinglyLinkedList.cpp
     TestSourceGenerator.cpp
@@ -69,6 +72,7 @@ set(AK_TEST_SOURCES
     TestStringUtils.cpp
     TestStringView.cpp
     TestTearableAtomic.cpp
+    TestThreadSafeWeakable.cpp
     TestTime.cpp
     TestTrie.cpp
     TestTuple.cpp
@@ -109,7 +113,12 @@ if (APPLE)
     target_compile_options(TestFunctionObjCArc PRIVATE -fobjc-arc)
 endif()
 
+target_link_libraries(TestByteString PRIVATE LibThreading)
+target_link_libraries(TestFFIHelpers PRIVATE LibThreading)
+target_link_libraries(TestFlyString PRIVATE LibThreading)
 target_link_libraries(TestSeqLock PRIVATE LibThreading)
-target_link_libraries(TestString PRIVATE LibUnicode)
+target_link_libraries(TestString PRIVATE LibThreading LibUnicode)
 target_link_libraries(TestTearableAtomic PRIVATE LibThreading)
+target_link_libraries(TestThreadSafeWeakable PRIVATE LibThreading)
+target_link_libraries(TestUtf16FlyString PRIVATE LibThreading)
 target_link_libraries(TestUtf16String PRIVATE LibUnicode)

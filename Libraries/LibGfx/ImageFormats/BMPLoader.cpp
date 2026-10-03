@@ -194,6 +194,8 @@ enum class DIBType {
 };
 
 struct BMPLoadingContext {
+    AK_ALLOC_WITH_KMALLOC;
+
     enum class State {
         NotDecoded = 0,
         DIBDecoded,
@@ -458,6 +460,10 @@ static bool check_for_invalid_bitmask_combinations(BMPLoadingContext& context)
     case DIBType::V4:
     case DIBType::V5:
         if (compression == Compression::BITFIELDS && bpp != 16 && bpp != 32)
+            return false;
+        if (compression == Compression::RLE8 && bpp > 8)
+            return false;
+        if (compression == Compression::RLE4 && bpp > 4)
             return false;
         break;
     }
@@ -756,7 +762,9 @@ static bool decode_bmp_v3_dib(BMPLoadingContext& context, InputStreamer& streame
         dbgln_if(BMP_DEBUG, "BMP alpha mask: {:#08x}", context.dib.info.masks[3]);
     } else if (context.dib_size() >= 56 && context.dib.core.bpp >= 16) {
         auto mask = streamer.read_u32();
-        if ((context.dib.core.bpp == 32 && mask != 0) || context.dib.core.bpp == 16) {
+        if (context.dib.info.compression == Compression::RGB && context.dib.core.bpp == 32 && mask != 0)
+            context.dib.info.masks.extend({ 0xff0000, 0x00ff00, 0x0000ff });
+        if ((context.dib.core.bpp == 32 && mask != 0) || (context.dib.core.bpp == 16 && context.dib.info.compression != Compression::RGB)) {
             context.dib.info.masks.append(mask);
             dbgln_if(BMP_DEBUG, "BMP alpha mask: {:#08x}", mask);
         } else {

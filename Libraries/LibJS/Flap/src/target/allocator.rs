@@ -27,8 +27,7 @@ use crate::low_ir::cfg::{ControlFlowGraph, instruction_successors};
 use crate::low_ir::optimize::{invert_branches_over_jumps, remove_unreferenced_labels};
 #[cfg(test)]
 use crate::target::description::{
-    AssertionOperation, CallKind, ControlOperation, EqualityCondition, MemoryWidth, PairWidth, TestCondition,
-    ZeroCondition,
+    CallKind, ControlOperation, EqualityCondition, MemoryWidth, PairWidth, TestCondition, ZeroCondition,
 };
 use crate::target::description::{InstructionDescription, OperandKind, SelectedOpcode};
 use crate::target::ir::{
@@ -1610,27 +1609,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rejects_unavailable_interpreter_register_during_allocation() {
-        let error = build(
-            vec![instruction!(
-                Operation::Move(IntegerWidth::U64),
-                SourceOperand::InterpreterRegister(InterpreterRegister::Int32TagShifted,),
-                immediate(0)
-            )],
-            Architecture::Aarch64,
-        )
-        .unwrap_err();
-
-        assert_eq!(error.stage, CompileStage::Allocation);
-        assert_eq!(error.handler.as_deref(), Some("Test"));
-        assert!(
-            error
-                .message
-                .contains("interpreter register 'int32_tag_shifted' is unavailable on Aarch64")
-        );
-    }
-
     fn build(
         instructions: Vec<SourceInstruction>,
         arch: Architecture,
@@ -1969,10 +1947,10 @@ mod tests {
                     label(".wide")
                 ),
                 instruction!(Operation::Move(IntegerWidth::U64), register("narrow"), register("wide")),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("narrow")),
+                instruction!(Operation::AssertNonzero, register("narrow")),
                 instruction!(Operation::Control(ControlOperation::JumpLabel), label(".done")),
                 instruction!(Operation::Label, label(".wide")),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("wide")),
+                instruction!(Operation::AssertNonzero, register("wide")),
                 instruction!(Operation::Label, label(".done")),
                 instruction!(Operation::Control(ControlOperation::DispatchNext)),
             ],
@@ -1981,7 +1959,7 @@ mod tests {
 
         assert_eq!(
             assignment_for(&instructions, Operation::branch_bit(TestCondition::Set), 0),
-            assignment_for(&instructions, Operation::Assertion(AssertionOperation::NonZero), 0)
+            assignment_for(&instructions, Operation::AssertNonzero, 0)
         );
         assert_eq!(operation_count(&instructions, Operation::Move(IntegerWidth::U64)), 1);
     }
@@ -1996,10 +1974,7 @@ mod tests {
                     register("destination"),
                     register("source")
                 ),
-                instruction!(
-                    Operation::Assertion(AssertionOperation::NonZero),
-                    register("destination")
-                ),
+                instruction!(Operation::AssertNonzero, register("destination")),
                 instruction!(Operation::Control(ControlOperation::DispatchNext)),
             ],
             Architecture::X86_64,
@@ -2041,10 +2016,10 @@ mod tests {
             vec![
                 instruction!(Operation::Move(IntegerWidth::U64), register("blocker"), immediate(1)),
                 instruction!(Operation::Move(IntegerWidth::U64), register("producer"), immediate(2)),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("blocker")),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("blocker")),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("blocker")),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("blocker")),
+                instruction!(Operation::AssertNonzero, register("blocker")),
+                instruction!(Operation::AssertNonzero, register("blocker")),
+                instruction!(Operation::AssertNonzero, register("blocker")),
+                instruction!(Operation::AssertNonzero, register("blocker")),
                 instruction!(
                     Operation::Move(IntegerWidth::U64),
                     register("middle"),
@@ -2055,8 +2030,8 @@ mod tests {
                     register("consumer"),
                     register("middle")
                 ),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("consumer")),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("consumer")),
+                instruction!(Operation::AssertNonzero, register("consumer")),
+                instruction!(Operation::AssertNonzero, register("consumer")),
                 instruction!(Operation::Control(ControlOperation::DispatchNext)),
             ],
             Architecture::X86_64,
@@ -2080,8 +2055,8 @@ mod tests {
                     register("local"),
                     immediate(1)
                 ),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("live")),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("local")),
+                instruction!(Operation::AssertNonzero, register("live")),
+                instruction!(Operation::AssertNonzero, register("local")),
                 instruction!(Operation::Control(ControlOperation::DispatchNext)),
             ],
             Architecture::X86_64,
@@ -2105,8 +2080,8 @@ mod tests {
                     register("result"),
                     register("rhs")
                 ),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("lhs")),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("result")),
+                instruction!(Operation::AssertNonzero, register("lhs")),
+                instruction!(Operation::AssertNonzero, register("result")),
                 instruction!(Operation::Control(ControlOperation::DispatchNext)),
             ],
             Architecture::X86_64,
@@ -2121,7 +2096,7 @@ mod tests {
             vec![
                 instruction!(Operation::Move(IntegerWidth::U64), register("boxed"), immediate(1)),
                 instruction!(Operation::UnboxObject, register("object"), register("boxed")),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("object")),
+                instruction!(Operation::AssertNonzero, register("object")),
                 instruction!(Operation::Control(ControlOperation::DispatchNext)),
             ],
             Architecture::X86_64,
@@ -2333,8 +2308,8 @@ mod tests {
                     register("parameter"),
                     register("raw")
                 ),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("parameter")),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("parameter")),
+                instruction!(Operation::AssertNonzero, register("parameter")),
+                instruction!(Operation::AssertNonzero, register("parameter")),
                 instruction!(Operation::Control(ControlOperation::DispatchNext)),
                 instruction!(Operation::Label, label(".fail")),
                 instruction!(Operation::Control(ControlOperation::Exit)),
@@ -2348,7 +2323,7 @@ mod tests {
                 Operation::Float(FloatingPointOperation::Convert(FloatConversion::Float64ToInt32)),
                 0
             ),
-            assignment_for(&instructions, Operation::Assertion(AssertionOperation::NonZero), 0)
+            assignment_for(&instructions, Operation::AssertNonzero, 0)
         );
         assert!(
             !instructions
@@ -2376,7 +2351,7 @@ mod tests {
                     register("value"),
                     immediate(1)
                 ),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("value")),
+                instruction!(Operation::AssertNonzero, register("value")),
             ],
             Architecture::X86_64,
         )
@@ -2394,7 +2369,7 @@ mod tests {
                     operation: IntegerBinaryOperation::Binary(BinaryOperation::Add),
                     width: IntegerWidth::U64,
                 },
-                Operation::Assertion(AssertionOperation::NonZero),
+                Operation::AssertNonzero,
             ]
         );
         assert_eq!(out[0].operands[1], AllocatedOperand::Immediate(7));
@@ -2423,8 +2398,8 @@ mod tests {
                         register("argument"),
                         register("second_result")
                     ),
-                    instruction!(Operation::Assertion(AssertionOperation::NonZero), register("small")),
-                    instruction!(Operation::Assertion(AssertionOperation::NonZero), register("large")),
+                    instruction!(Operation::AssertNonzero, register("small")),
+                    instruction!(Operation::AssertNonzero, register("large")),
                 ],
                 architecture,
             );
@@ -2472,7 +2447,7 @@ mod tests {
                             displacement: None,
                         })
                     ),
-                    instruction!(Operation::Assertion(AssertionOperation::NonZero), register("value")),
+                    instruction!(Operation::AssertNonzero, register("value")),
                 ],
                 architecture,
             );
@@ -2522,7 +2497,7 @@ mod tests {
                     x86_register("rcx"),
                     register("value")
                 ),
-                instruction!(Operation::Assertion(AssertionOperation::NonZero), register("value")),
+                instruction!(Operation::AssertNonzero, register("value")),
             ],
             Architecture::X86_64,
         );
@@ -2534,7 +2509,7 @@ mod tests {
             [
                 Operation::Move(IntegerWidth::U64),
                 Operation::Call(CallKind::Helper),
-                Operation::Assertion(AssertionOperation::NonZero),
+                Operation::AssertNonzero,
             ]
         );
     }
@@ -2679,7 +2654,7 @@ mod tests {
                 instruction!(Operation::Move(IntegerWidth::U64), register("dividend"), immediate(1)),
                 instruction!(Operation::Move(IntegerWidth::U64), register("divisor"), immediate(2)),
                 instruction!(
-                    Operation::Modulo,
+                    Operation::Modulo(IntegerWidth::U32),
                     register("rem"),
                     register("dividend"),
                     register("divisor")
@@ -2690,7 +2665,7 @@ mod tests {
             ],
             Architecture::X86_64,
         );
-        let names = find_operation(&out, Operation::Modulo)
+        let names = find_operation(&out, Operation::Modulo(IntegerWidth::U32))
             .operands
             .iter()
             .map(|operand| operand.register_name().unwrap_or("<non-reg>"))

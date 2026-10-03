@@ -10,16 +10,18 @@
 #include <LibJS/Forward.h>
 #include <LibJS/Runtime/JobCallback.h>
 #include <LibJS/Runtime/VM.h>
-#include <LibWeb/Bindings/AgentType.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/MutationObserver.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
+#include <LibWebCommon/HTML/WorkerTypes.h>
 
 namespace Web::Bindings {
 
 struct WebEngineCustomJobCallbackData final : public JS::JobCallback::CustomData {
+    AK_ALLOC_WITH_KMALLOC;
+
     WebEngineCustomJobCallbackData(HTML::EnvironmentSettingsObject& incumbent_settings, OwnPtr<JS::ExecutionContext> active_script_context)
         : incumbent_settings(incumbent_settings)
         , active_script_context(move(active_script_context))
@@ -34,12 +36,10 @@ struct WebEngineCustomJobCallbackData final : public JS::JobCallback::CustomData
 
 HTML::Script* active_script();
 
-WEB_API void initialize_main_thread_vm(AgentType);
+WEB_API void initialize_main_thread_vm(HTML::AgentType);
 WEB_API JS::VM& main_thread_vm();
 
-void queue_mutation_observer_microtask();
-WEB_API NonnullOwnPtr<JS::ExecutionContext> create_a_new_javascript_realm(JS::VM&, Function<JS::Object*(JS::Realm&)> create_global_object, Function<JS::Object*(JS::Realm&)> create_global_this_value);
-WEB_API void invoke_custom_element_reactions(Vector<GC::Weak<DOM::Element>>& element_queue);
+WEB_API NonnullOwnPtr<JS::ExecutionContext> create_a_new_javascript_realm(JS::VM&, Function<GC::Ref<JS::Object>(JS::Realm&)> create_global_object, Function<GC::Ref<JS::Object>(JS::Realm&)> create_global_this_value);
 
 // Creates a bare Window-backed realm for tests and tools that do not need a full Document.
 WEB_API GC::Ref<JS::Realm> create_a_simple_javascript_realm();

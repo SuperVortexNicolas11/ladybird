@@ -4,8 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/ExceptionOrUtils.h>
-#include <LibWeb/Bindings/MathMLElement.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/FunctionStyleValue.h>
@@ -47,12 +45,6 @@ void MathMLElement::inserted()
     HTMLOrSVGOrMathMLElement::inserted();
 }
 
-void MathMLElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(MathMLElement);
-    Base::initialize(realm);
-}
-
 Optional<ARIA::Role> MathMLElement::default_role() const
 {
     // https://www.w3.org/TR/html-aria/#el-math
@@ -64,7 +56,6 @@ Optional<ARIA::Role> MathMLElement::default_role() const
 void MathMLElement::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    HTMLOrSVGOrMathMLElement::visit_edges(visitor);
 }
 
 bool MathMLElement::is_presentational_hint(Utf16FlyString const& name) const

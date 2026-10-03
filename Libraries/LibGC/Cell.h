@@ -35,22 +35,39 @@ public:                                            \
     {                                              \
         return #class_##sv;                        \
     }                                              \
-    friend class GC::Heap;
+    friend class GC::Heap;                         \
+    friend struct GC::CellTypeThunks;
 
 #define GC_CELL_WITH_CUSTOM_CLASS_NAME(class_, base_class) \
 public:                                                    \
     using Base = base_class;                               \
-    friend class GC::Heap;
+    friend class GC::Heap;                                 \
+    friend struct GC::CellTypeThunks;
+
+// A coarse class tag stored in every cell header. It lets a holder of a cell pointer confirm what
+// the cell really is with a single byte compare, without reading a vtable. Only the classes a
+// JS::Value can point at need their own kind; everything else stays Other.
+enum class CellKind : u8 {
+    Other,
+    Object,
+    PrimitiveString,
+    Symbol,
+    BigInt,
+    Accessor,
+};
 
 class GC_API Cell {
     AK_MAKE_NONCOPYABLE(Cell);
     AK_MAKE_NONMOVABLE(Cell);
 
 public:
-    static constexpr bool OVERRIDES_MUST_SURVIVE_GARBAGE_COLLECTION = false;
-    static constexpr bool OVERRIDES_FINALIZE = false;
+    // Heap::allocate() copies this into the header of every cell it creates. A class that a
+    // JS::Value can point at overrides it, and its subclasses inherit the override.
+    static constexpr CellKind cell_kind_for_class = CellKind::Other;
 
     virtual ~Cell() = default;
+
+    CellKind cell_kind() const { return m_cell_kind; }
 
     bool is_marked() const { return m_mark; }
     void set_marked(bool b) { m_mark = b; }
@@ -185,6 +202,28 @@ public:
         }
 
         template<typename T>
+        void visit(T const& value)
+        requires(!IsBaseOf<Cell, T> && requires(T& visitable) { visitable.visit_edges(*this); })
+        {
+            const_cast<T&>(value).visit_edges(*this);
+        }
+
+        template<typename T>
+        void visit(AK::RefPtr<T> const& value)
+        requires(requires(RemoveConst<T>& visitable) { visitable.visit_edges(*this); })
+        {
+            if (value)
+                visit(*value);
+        }
+
+        template<typename T>
+        void visit(AK::NonnullRefPtr<T> const& value)
+        requires(requires(RemoveConst<T>& visitable) { visitable.visit_edges(*this); })
+        {
+            visit(*value);
+        }
+
+        template<typename T>
         void visit(Optional<T> const& optional)
         requires(IsVisitable<T>::value)
         {
@@ -226,19 +265,20 @@ public:
 
     virtual size_t external_memory_size() const { return 0; }
 
-    // This allows cells to survive GC by choice, even if nothing points to them.
-    // It's used to implement special rules in the web platform.
-    // NOTE: Cell types must have OVERRIDES_MUST_SURVIVE_GARBAGE_COLLECTION set for this to be called.
-    virtual bool must_survive_garbage_collection() const { return false; }
-
     ALWAYS_INLINE Heap& heap() const { return HeapBlockBase::from_cell(this)->heap(); }
+    ALWAYS_INLINE CellTypeInfo const& type_info() const { return HeapBlockBase::from_cell(this)->type_info(); }
 
 protected:
     Cell() = default;
 
 private:
+    friend class Heap;
+
+    void set_cell_kind(CellKind kind) { m_cell_kind = kind; }
+
     bool m_mark { false };
     State m_state { State::Live };
+    CellKind m_cell_kind { CellKind::Other };
 };
 
 template<typename T>
@@ -246,14 +286,14 @@ struct IsVisitable {
     static constexpr bool value = requires(Cell::Visitor& visitor, T const& value) { visitor.visit(value); };
 };
 
+GC_API StringView class_name_of(Cell const&);
+
 }
 
 template<>
 struct AK::Formatter<GC::Cell> : AK::Formatter<FormatString> {
-    ErrorOr<void> format(FormatBuilder& builder, GC::Cell const* cell)
+    ErrorOr<void> format(FormatBuilder& builder, GC::Cell const& cell)
     {
-        if (!cell)
-            return builder.put_string("Cell{nullptr}"sv);
-        return Formatter<FormatString>::format(builder, "{}({})"sv, cell->class_name(), cell);
+        return Formatter<FormatString>::format(builder, "{}({})"sv, GC::class_name_of(cell), &cell);
     }
 };

@@ -371,6 +371,13 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
         if (field->isAnonymousStructOrUnion())
             continue;
 
+        if (auto const* field_record = m_context.getBaseElementType(field->getType())->getAsCXXRecordDecl(); field_record && record_inherits_from_cell(*field_record)) {
+            auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "GC::Cell type %0 must be allocated with GC::Heap::allocate(), not stored by value");
+            auto builder = diag_engine.Report(field->getLocation(), diag_id);
+            builder << field_record->getName();
+            continue;
+        }
+
         auto validation_results = validate_field_qualified_type(field);
 
         if (validation_results) {
@@ -465,43 +472,6 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
 
     validate_record_macros(*record);
 
-    // Check that overrides of must_survive_garbage_collection() and finalize() have the
-    // corresponding static constexpr bool flags set
-    auto check_override_requires_flag = [&](char const* method_name, char const* flag_name) {
-        clang::DeclarationName decl_name = &m_context.Idents.get(method_name);
-        auto const* method = record->lookup(decl_name).find_first<clang::CXXMethodDecl>();
-        if (!method || !method->isVirtual() || !method->size_overridden_methods())
-            return;
-
-        // Check if the method is defined in this class (not just inherited)
-        if (method->getParent() != record)
-            return;
-
-        // Look for the static constexpr bool flag
-        clang::DeclarationName flag_decl_name = &m_context.Idents.get(flag_name);
-        auto const* flag_var = record->lookup(flag_decl_name).find_first<clang::VarDecl>();
-
-        bool flag_found = false;
-        if (flag_var && flag_var->isStaticDataMember() && flag_var->isConstexpr()) {
-            // Check if it's set to true
-            if (auto const* init = flag_var->getInit()) {
-                if (auto const* bool_literal = llvm::dyn_cast<clang::CXXBoolLiteralExpr>(init->IgnoreParenImpCasts())) {
-                    flag_found = bool_literal->getValue();
-                }
-            }
-        }
-
-        if (!flag_found) {
-            auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error,
-                "Class %0 overrides %1 but does not set static constexpr bool %2 = true");
-            auto builder = diag_engine.Report(method->getBeginLoc(), diag_id);
-            builder << record->getName() << method_name << flag_name;
-        }
-    };
-
-    check_override_requires_flag("must_survive_garbage_collection", "OVERRIDES_MUST_SURVIVE_GARBAGE_COLLECTION");
-    check_override_requires_flag("finalize", "OVERRIDES_FINALIZE");
-
     // Check that Cell subclasses (and all their base classes) don't have non-trivial destructors.
     // They should override Cell::finalize() instead.
     auto check_no_nontrivial_destructor = [&](clang::CXXRecordDecl const* check_record) {
@@ -524,7 +494,7 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
         if (decl_has_annotation(destructor, "ladybird::allow_cell_destructor"))
             return;
         auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error,
-            "GC::Cell-inheriting class %0 has a non-trivial destructor; override Cell::finalize() instead (and set OVERRIDES_FINALIZE)");
+            "GC::Cell-inheriting class %0 has a non-trivial destructor; override Cell::finalize() instead");
         auto builder = diag_engine.Report(destructor->getBeginLoc(), diag_id);
         builder << check_record->getName();
     };
@@ -749,6 +719,22 @@ bool LibJSGCVisitor::VisitCXXMethodDecl(clang::CXXMethodDecl* method)
     return true;
 }
 
+bool LibJSGCVisitor::VisitCXXConstructExpr(clang::CXXConstructExpr* construct_expression)
+{
+    if (construct_expression->getConstructionKind() != clang::CXXConstructionKind::Complete)
+        return true;
+
+    auto const* record = construct_expression->getConstructor()->getParent();
+    if (!record_inherits_from_cell(*record))
+        return true;
+
+    auto& diag_engine = m_context.getDiagnostics();
+    auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "GC::Cell type %0 must be allocated with GC::Heap::allocate()");
+    auto builder = diag_engine.Report(construct_expression->getBeginLoc(), diag_id);
+    builder << record->getName();
+    return true;
+}
+
 struct CellTypeWithOrigin {
     clang::CXXRecordDecl const& base_origin;
     LibJSCellMacro::Type type;
@@ -774,6 +760,9 @@ static std::optional<CellTypeWithOrigin> find_cell_type_with_origin(clang::CXXRe
 
             if (base_name == "Web::Bindings::PlatformObject")
                 return CellTypeWithOrigin { *base_record, LibJSCellMacro::Type::WebPlatformObject };
+
+            if (base_name == "Web::Bindings::Wrappable")
+                return CellTypeWithOrigin { *base_record, LibJSCellMacro::Type::WebWrappable };
 
             if (auto origin = find_cell_type_with_origin(*base_record))
                 return CellTypeWithOrigin { *base_record, origin->type };
@@ -929,6 +918,8 @@ char const* LibJSCellMacro::type_name(Type type)
         return "JS_PROTOTYPE_OBJECT";
     case Type::WebPlatformObject:
         return "WEB_PLATFORM_OBJECT";
+    case Type::WebWrappable:
+        return "WEB_WRAPPABLE";
     default:
         __builtin_unreachable();
     }
@@ -955,6 +946,8 @@ void LibJSPPCallbacks::MacroExpands(clang::Token const& name_token, clang::Macro
             { "JS_PROTOTYPE_OBJECT", LibJSCellMacro::Type::JSPrototypeObject },
             { "WEB_PLATFORM_OBJECT", LibJSCellMacro::Type::WebPlatformObject },
             { "WEB_NON_IDL_PLATFORM_OBJECT", LibJSCellMacro::Type::WebPlatformObject },
+            { "WEB_WRAPPABLE", LibJSCellMacro::Type::WebWrappable },
+            { "WEB_NON_IDL_WRAPPABLE", LibJSCellMacro::Type::WebWrappable },
         };
 
         auto name = ident_info->getName();

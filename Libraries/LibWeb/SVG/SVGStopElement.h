@@ -7,7 +7,7 @@
 #pragma once
 
 #include <LibGfx/Color.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGAnimatedNumber.h>
 #include <LibWeb/SVG/SVGElement.h>
 
@@ -15,7 +15,7 @@ namespace Web::SVG {
 
 // https://svgwg.org/svg2-draft/pservers.html#GradientStops
 class SVGStopElement final : public SVGElement {
-    WEB_PLATFORM_OBJECT(SVGStopElement, SVGElement);
+    WEB_WRAPPABLE(SVGStopElement, SVGElement);
     GC_DECLARE_ALLOCATOR(SVGStopElement);
 
 public:
@@ -29,8 +29,6 @@ public:
 
 private:
     SVGStopElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Visitor&) override;
 
     GC::Ptr<SVGAnimatedNumber> m_stop_offset;

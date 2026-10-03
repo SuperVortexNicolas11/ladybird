@@ -15,9 +15,6 @@
 #include <LibGfx/Palette.h>
 #include <LibMain/Main.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/CSS/PreferredColorScheme.h>
-#include <LibWeb/CSS/PreferredContrast.h>
-#include <LibWeb/CSS/PreferredMotion.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Document.h>
@@ -34,6 +31,9 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/CSS/PreferredContrast.h>
+#include <LibWebCommon/CSS/PreferredMotion.h>
 
 class DumpHTMLTreePageClient final : public Web::PageClient {
     GC_CELL(DumpHTMLTreePageClient, Web::PageClient);
@@ -49,7 +49,7 @@ public:
 
     void set_page(GC::Ref<Web::Page> page) { m_page = page; }
 
-    virtual u64 id() const override { return 0; }
+    virtual Web::PageId id() const override { return Web::PageId { 0 }; }
     virtual Web::Page& page() override { return *m_page; }
     virtual Web::Page const& page() const override { return *m_page; }
     virtual bool is_connection_open() const override { return true; }
@@ -63,7 +63,7 @@ public:
     virtual Web::CSS::PreferredMotion preferred_motion() const override { return Web::CSS::PreferredMotion::Auto; }
     virtual size_t screen_count() const override { return 1; }
     virtual Queue<Web::QueuedInputEvent>& input_event_queue() override { return m_input_event_queue; }
-    virtual void report_finished_handling_input_event([[maybe_unused]] u64 page_id, [[maybe_unused]] Web::EventResult event_was_handled) override { }
+    virtual void report_finished_handling_input_event([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] u64 event_id, [[maybe_unused]] Web::EventResult event_was_handled) override { }
     virtual void request_frame() override { }
     virtual void request_file(Web::FileRequest) override { }
     virtual bool is_headless() const override { return true; }
@@ -197,7 +197,7 @@ static void dump_element(Web::DOM::Element const& element, size_t indent)
 
     if (auto shadow_root = element.shadow_root(); shadow_root && !shadow_root->is_user_agent_internal()) {
         dump_line_prefix(indent + 1);
-        out("#shadow-root mode=\"{}\"", shadow_root->mode() == Web::Bindings::ShadowRootMode::Open ? "open"sv : "closed"sv);
+        out("#shadow-root mode=\"{}\"", shadow_root->mode() == Web::DOM::ShadowRootMode::Open ? "open"sv : "closed"sv);
         if (shadow_root->declarative())
             out(" declarative");
         if (shadow_root->clonable())
@@ -279,15 +279,15 @@ static void dump_tree(Web::DOM::Node const& node, size_t indent)
     }
 }
 
-static GC::Ref<Web::DOM::Document> parse_html(JS::Realm& realm, Web::DOM::Document const& origin_document, StringView input)
+static GC::Ref<Web::DOM::Document> parse_html(Web::Page& page, Web::DOM::Document const& origin_document, StringView input)
 {
-    auto document = Web::DOM::Document::create(realm, URL::about_blank());
+    auto document = Web::DOM::Document::create(page, origin_document.relevant_global_event_target(), URL::about_blank());
     document->set_document_type(Web::DOM::Document::Type::HTML);
     document->set_content_type("text/html"_utf16_fly_string);
     document->set_origin(origin_document.origin());
     document->set_ready_to_run_scripts();
     document->set_allow_declarative_shadow_roots(Web::HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
-    document->set_custom_element_registry(realm.create<Web::HTML::CustomElementRegistry>(realm));
+    document->set_custom_element_registry(Web::HTML::CustomElementRegistry::create_global(*document));
 
     auto parser = Web::HTML::HTMLParser::create_from_byte_string(document, input, Web::HTML::ParserScriptingMode::Disabled, "UTF-8"sv);
     parser->run(URL::about_blank());
@@ -331,21 +331,20 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     [[maybe_unused]] auto& event_loop = Core::EventLoop::initialize_for_current_thread();
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
     Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(false));
-    Web::Bindings::initialize_main_thread_vm(Web::Bindings::AgentType::SimilarOriginWindow);
+    Web::Bindings::initialize_main_thread_vm(Web::HTML::AgentType::SimilarOriginWindow);
 
     auto& vm = Web::Bindings::main_thread_vm();
     auto page_client = DumpHTMLTreePageClient::create(vm);
-    auto page = Web::Page::create(vm, page_client);
+    auto page = Web::Page::create(page_client);
     page->set_is_scripting_enabled(false);
     page_client->set_page(page);
     page->set_top_level_traversable(Web::HTML::LocalTraversableNavigable::create_a_new_top_level_traversable(page, nullptr, {}));
-    auto& origin_document = *page->top_level_traversable()->active_document();
-    auto& realm = origin_document.realm();
+    auto& origin_document = *page->local_traversable()->active_document();
 
     auto timer = Core::ElapsedTimer::start_new();
 
     for (int i = 0; i < iterations; i++) {
-        auto document = parse_html(realm, origin_document, input);
+        auto document = parse_html(page, origin_document, input);
         if (!silent && i == 0)
             dump_tree(document);
     }

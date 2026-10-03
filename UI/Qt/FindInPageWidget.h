@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/kmalloc.h>
 #include <LibWebView/Forward.h>
 #include <UI/Qt/WebContentView.h>
 
@@ -24,6 +25,8 @@ class FindInPageWidget final : public QWidget {
     Q_OBJECT
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     FindInPageWidget(Tab* tab, WebContentView* content_view);
 
     void update_result_label(size_t current_match_index, Optional<size_t> const& total_match_count);
@@ -56,6 +59,7 @@ private:
     QCheckBox* m_match_case { nullptr };
     QLabel* m_result_label { nullptr };
     bool m_is_updating_chrome_style { false };
+    u64 m_selected_text_request_id { 0 };
 };
 
 }

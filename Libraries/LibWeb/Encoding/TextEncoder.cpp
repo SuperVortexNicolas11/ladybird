@@ -4,37 +4,31 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/UnicodeUtils.h>
+#include <LibGC/Heap.h>
+#include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/TypedArray.h>
-#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/TextEncoder.h>
 #include <LibWeb/Encoding/TextEncoder.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::Encoding {
 
 GC_DEFINE_ALLOCATOR(TextEncoder);
 
-GC::Ref<TextEncoder> TextEncoder::construct_impl(JS::Realm& realm)
+GC::Ref<TextEncoder> TextEncoder::create()
 {
-    return realm.create<TextEncoder>(realm);
+    return GC::Heap::the().allocate<TextEncoder>();
 }
 
-TextEncoder::TextEncoder(JS::Realm& realm)
-    : PlatformObject(realm)
+TextEncoder::TextEncoder()
 {
 }
 
 TextEncoder::~TextEncoder() = default;
 
-void TextEncoder::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(TextEncoder);
-    Base::initialize(realm);
-}
-
 // https://encoding.spec.whatwg.org/#dom-textencoder-encode
-GC::Ref<JS::Uint8Array> TextEncoder::encode(Utf16String const& input) const
+ErrorOr<ByteBuffer> TextEncoder::encode_to_byte_buffer(Utf16String const& input) const
 {
     // 1. Convert input to an I/O queue of scalar values.
     // 2. Let output be the I/O queue of bytes « end-of-queue ».
@@ -44,15 +38,21 @@ GC::Ref<JS::Uint8Array> TextEncoder::encode(Utf16String const& input) const
     //     3. Assert: result is not an error.
     //     4. If result is finished, then convert output into a byte sequence and return a Uint8Array object wrapping an ArrayBuffer containing output.
 
-    auto utf8_input = input.to_utf8(AllowLonelySurrogates::No);
-    auto byte_buffer = MUST(ByteBuffer::copy(utf8_input.bytes()));
+    auto utf8_input = input.to_utf8();
+    return ByteBuffer::copy(utf8_input.bytes());
+}
+
+WebIDL::ExceptionOr<GC::Ref<JS::Uint8Array>> TextEncoder::encode(JS::Object const& relevant_global_object, Utf16String const& input) const
+{
+    auto& target = HTML::relevant_realm(relevant_global_object);
+    auto byte_buffer = TRY_OR_THROW_OOM(target.vm(), encode_to_byte_buffer(input));
     auto array_length = byte_buffer.size();
-    auto array_buffer = JS::ArrayBuffer::create(realm(), move(byte_buffer));
-    return JS::Uint8Array::create(realm(), array_length, *array_buffer);
+    auto array_buffer = JS::ArrayBuffer::create(target, move(byte_buffer));
+    return JS::Uint8Array::create(target, array_length, *array_buffer);
 }
 
 // https://encoding.spec.whatwg.org/#dom-textencoder-encodeinto
-Bindings::TextEncoderEncodeIntoResult TextEncoder::encode_into(Utf16String const& source, GC::Ref<JS::Uint8Array> destination) const
+EncodeIntoResult TextEncoder::encode_into_result(Utf16String const& source, GC::Root<JS::Uint8Array> const& destination) const
 {
     // AD-HOC: Return early if destination is detached. This is not explicitly handled in the spec,
     //         however no bytes are copied as destinations size is always zero in this case.
@@ -64,6 +64,15 @@ Bindings::TextEncoderEncodeIntoResult TextEncoder::encode_into(Utf16String const
     if (JS::is_typed_array_out_of_bounds(destination_record))
         return { 0, 0 };
     auto destination_byte_length = JS::typed_array_byte_length(destination_record);
+
+    // OPTIMIZATION: Encode directly into a non-shared destination when the input fits.
+    // Keep shared destinations on the existing path to avoid changing shared-memory write semantics.
+    auto& destination_buffer = *destination->viewed_array_buffer();
+    if (!destination_buffer.is_shared_array_buffer()) {
+        auto destination_bytes = Bytes { destination_buffer.data_at(destination->byte_offset()), destination_byte_length };
+        if (auto bytes_written = source.utf16_view().to_utf8_with_replacement_into(destination_bytes); bytes_written.has_value())
+            return { source.length_in_code_units(), *bytes_written };
+    }
 
     // 1. Let read be 0.
     WebIDL::UnsignedLongLong read = 0;
@@ -115,6 +124,15 @@ Bindings::TextEncoderEncodeIntoResult TextEncoder::encode_into(Utf16String const
 
     // 7. Return «[ "read" → read, "written" → written ]».
     return { read, written };
+}
+
+Bindings::TextEncoderEncodeIntoResult TextEncoder::encode_into(Utf16String const& source, GC::Root<JS::Uint8Array> const& destination) const
+{
+    auto result = encode_into_result(source, destination);
+    return {
+        .read = result.read,
+        .written = result.written,
+    };
 }
 
 }

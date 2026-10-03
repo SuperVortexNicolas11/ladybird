@@ -201,6 +201,7 @@ impl From<FieldWidth> for MemoryWidth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FieldAccessKind {
     Load { width: FieldWidth, nonzero: bool },
+    LoadCellPointer { nonzero: bool },
     Store(FieldWidth),
 }
 
@@ -208,6 +209,7 @@ impl FieldAccessKind {
     pub(crate) fn width(self) -> FieldWidth {
         match self {
             Self::Load { width, .. } | Self::Store(width) => width,
+            Self::LoadCellPointer { .. } => FieldWidth::U64,
         }
     }
 
@@ -216,7 +218,10 @@ impl FieldAccessKind {
     }
 
     pub(crate) fn nonzero(self) -> bool {
-        matches!(self, Self::Load { nonzero: true, .. })
+        matches!(
+            self,
+            Self::Load { nonzero: true, .. } | Self::LoadCellPointer { nonzero: true }
+        )
     }
 
     pub(crate) fn memory_operation(self) -> MemoryOperation {
@@ -225,6 +230,8 @@ impl FieldAccessKind {
                 width: FieldWidth::U64,
                 nonzero: true,
             } => MemoryOperation::Load64NonZero,
+            Self::LoadCellPointer { nonzero: true } => MemoryOperation::LoadNonnullCellPointer,
+            Self::LoadCellPointer { nonzero: false } => MemoryOperation::LoadCellPointer,
             Self::Load { width, .. } => MemoryOperation::Load {
                 width: width.into(),
                 signed: false,
@@ -237,7 +244,8 @@ impl FieldAccessKind {
         match self {
             Self::Load {
                 width: FieldWidth::U64, ..
-            } => Some(MemoryOperation::LoadPair(PairWidth::DoubleWord)),
+            }
+            | Self::LoadCellPointer { .. } => Some(MemoryOperation::LoadPair(PairWidth::DoubleWord)),
             Self::Load {
                 width: FieldWidth::U32,
                 nonzero: false,
@@ -529,11 +537,7 @@ impl BranchOperation {
 define_named_intrinsic_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub(crate) enum AssertionOperation {
-        NonZero => "assert_nonzero" signatures [signature!([In AnyGpr])];
-        UnsignedLess => "assert_lt_unsigned" signatures [signature!([In AnyGpr, In AnyGpr])];
-        UnsignedGreaterOrEqual => "assert_ge_unsigned" signatures [signature!([In AnyGpr, In AnyGpr])];
-        TagEqual => "assert_tag" signatures [signature!([In AnyGpr, In AnyGpr])];
-        TagNotEqual => "assert_not_tag" signatures [signature!([In AnyGpr, In AnyGpr])];
+        Assert => "assert" from [];
     }
 }
 
@@ -553,8 +557,8 @@ pub(crate) enum ValueOperation {
     UnboxBoolean,
     ExtractTag { rematerialized: bool },
     ToInt32,
+    Int32ToInt64,
     ToUint32,
-    LogicalNot,
     UnboxObject,
 }
 
@@ -584,9 +588,9 @@ intrinsic_names!(ValueOperation {
     Self::UnboxBoolean => "unbox_bool";
     Self::ExtractTag { rematerialized: false } => "extract_tag" signatures [signature!([In Value] -> ValueTag), signature!([Out ValueTag, In Value])];
     Self::ExtractTag { rematerialized: true } => "rematerialize_extract_tag" from [];
+    Self::Int32ToInt64 => "i64" signatures [signature!([In I32] -> I64)];
     Self::ToInt32 => "i32" signatures [signature!([In AnyGpr] -> I32)];
     Self::ToUint32 => "u32" signatures [signature!([In AnyGpr] -> U32)];
-    Self::LogicalNot => "not_bool";
     Self::UnboxObject => "unbox_object" signatures [signature!([Out AnyGpr, In AnyGpr])];
 });
 
@@ -594,6 +598,7 @@ define_named_intrinsic_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub(crate) enum LowLevelOperation {
         LoadLabel => "load_label" signatures [signature!([Out BytecodeOffset, In BytecodeOffset])];
+        Modulo64 => "mod_i64" signatures [signature!([In I64, In I64] -> I64)];
         DivideModulo => "divmod" signatures [signature!([In I32, In I32] -> (I32, I32)), signature!([Out I32, Out I32, In I32, In I32])];
         Move => "mov" signatures [signature!([Out AnyGpr, In AnyGpr])];
         LoadEffectiveAddress => "lea" signatures [signature!([Out AnyGpr, In Memory])];
@@ -716,10 +721,12 @@ pub(crate) enum FloatUnaryOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FloatConversion {
     Int32ToFloat64,
+    Int64ToFloat64,
     Uint32ToFloat64,
     Float32ToFloat64,
     Float64ToFloat32,
     Float64ToInt32,
+    Float64ToInt64,
     JavaScriptToInt32,
 }
 
@@ -735,7 +742,9 @@ impl FloatingPointOperation {
     pub(crate) fn is_fallible(self) -> bool {
         matches!(
             self,
-            Self::Convert(FloatConversion::Float64ToInt32 | FloatConversion::JavaScriptToInt32)
+            Self::Convert(
+                FloatConversion::Float64ToInt32 | FloatConversion::Float64ToInt64 | FloatConversion::JavaScriptToInt32
+            )
         )
     }
 }
@@ -748,6 +757,8 @@ intrinsic_names!(FloatingPointOperation {
     Self::Unary(FloatUnaryOperation::Floor) => "fp_floor" signatures [signature!([In F64] -> F64), signature!([Out F64, In F64])];
     Self::Unary(FloatUnaryOperation::Ceil) => "fp_ceil" signatures [signature!([In F64] -> F64), signature!([Out F64, In F64])];
     Self::Unary(FloatUnaryOperation::SquareRoot) => "fp_sqrt" signatures [signature!([In F64] -> F64), signature!([Out F64, In F64])];
+    Self::Convert(FloatConversion::Int64ToFloat64) => "i64_to_f64" signatures [signature!([In I64] -> F64)];
+    Self::Convert(FloatConversion::Float64ToInt64) => "double_to_int64" signatures [signature!(fallible [In F64] -> I64)];
     Self::Convert(FloatConversion::Int32ToFloat64) => "to_f64" signatures [signature!([In I32] -> F64)];
     Self::Convert(FloatConversion::Uint32ToFloat64) => "u32_to_f64" signatures [signature!([In U32] -> F64), signature!([Out F64, In U32])];
     Self::Convert(FloatConversion::Float32ToFloat64) => "float_to_double" signatures [signature!([In F32] -> F64), signature!([Out F64, In F32])];
@@ -807,6 +818,7 @@ define_named_intrinsic_enum! {
         JumpSlowPath => "call_jump_slow_path" signatures [signature!([In SlowPath, In Value, In Value, In BytecodeOffset, In BytecodeOffset])];
         Interpreter => "call_interp" signatures [signature!([In FunctionSymbol] -> I32), signature!([In FunctionSymbol, Out AnyGpr])];
         Helper => "call_helper" signatures [signature!([In FunctionSymbol, In AnyGpr, Out AnyGpr])];
+        HelperWithTwoArguments => "call_helper_with_two_arguments" signatures [signature!([In FunctionSymbol, In AnyGpr, In AnyGpr, Out AnyGpr])];
         RawNative => "call_raw_native" signatures [signature!([In AnyGpr] -> (Value, U64)), signature!([In AnyGpr, Out AnyGpr, Out AnyGpr])];
     }
 }
@@ -815,7 +827,7 @@ impl CallOperation {
     pub(crate) fn result_count(self) -> usize {
         match self {
             Self::SlowPath | Self::BinarySlowPath | Self::JumpSlowPath => 0,
-            Self::Interpreter | Self::Helper => 1,
+            Self::Interpreter | Self::Helper | Self::HelperWithTwoArguments => 1,
             Self::RawNative => 2,
         }
     }
@@ -851,6 +863,8 @@ impl ControlOperation {
 pub(crate) enum MemoryOperation {
     Load { width: MemoryWidth, signed: bool },
     Load64NonZero,
+    LoadCellPointer,
+    LoadNonnullCellPointer,
     Store(MemoryWidth),
     LoadPair(PairWidth),
     StorePair(PairWidth),
@@ -864,6 +878,8 @@ intrinsic_names!(MemoryOperation {
     Self::Load { width: MemoryWidth::Word, signed: false } => "load32" signatures [signature!([Out AnyGpr, In Memory])];
     Self::Load { width: MemoryWidth::DoubleWord, signed: false } => "load64" signatures [signature!([Out AnyGpr, In Memory])];
     Self::Load64NonZero => "load64_nonzero" signatures [signature!([Out AnyGpr, In Memory])];
+    Self::LoadCellPointer => "load_cell_ptr" signatures [signature!([Out AnyGpr, In Memory])];
+    Self::LoadNonnullCellPointer => "load_nonnull_cell_ptr" signatures [signature!([Out AnyGpr, In Memory])];
     Self::Load { width: MemoryWidth::Float, signed: false } => "loadf32" signatures [signature!([Out F32, In Memory])];
     Self::LoadPair(PairWidth::Word) => "load_pair32" signatures [signature!([In Memory, In Memory] -> (U32, U32)), signature!([Out AnyGpr, Out AnyGpr, In Memory, In Memory])];
     Self::LoadPair(PairWidth::DoubleWord) => "load_pair64" signatures [signature!([In Memory, In Memory] -> (U64, U64)), signature!([Out AnyGpr, Out AnyGpr, In Memory, In Memory])];
@@ -880,7 +896,7 @@ impl MemoryOperation {
     pub(crate) fn effects(self) -> IntrinsicEffects {
         IntrinsicEffects {
             memory: if self.writes() { ModRef::Write } else { ModRef::Read },
-            may_trap: self == Self::Load64NonZero,
+            may_trap: matches!(self, Self::Load64NonZero | Self::LoadNonnullCellPointer),
             ..IntrinsicEffects::PURE
         }
     }
@@ -897,7 +913,7 @@ impl MemoryOperation {
     pub(crate) fn width(self) -> MemoryWidth {
         match self {
             Self::Load { width, .. } | Self::Store(width) => width,
-            Self::Load64NonZero => MemoryWidth::DoubleWord,
+            Self::Load64NonZero | Self::LoadCellPointer | Self::LoadNonnullCellPointer => MemoryWidth::DoubleWord,
             Self::LoadPair(PairWidth::Word) | Self::StorePair(PairWidth::Word) => MemoryWidth::Word,
             Self::LoadPair(PairWidth::DoubleWord) | Self::StorePair(PairWidth::DoubleWord) => MemoryWidth::DoubleWord,
         }
@@ -978,6 +994,7 @@ pub(crate) enum IntrinsicValueType {
     F64,
     FunctionSymbol,
     I32,
+    I64,
     Label,
     Memory,
     Operand,
@@ -1140,7 +1157,7 @@ mod tests {
             Intrinsic::LowLevel(LowLevelOperation::LoadVm).effects().machine_state,
             ModRef::Read
         );
-        assert!(Intrinsic::Assertion(AssertionOperation::NonZero).effects().may_trap);
+        assert!(Intrinsic::Assertion(AssertionOperation::Assert).effects().may_trap);
         assert_eq!(
             Intrinsic::Call(CallOperation::Interpreter).effects(),
             IntrinsicEffects::UNKNOWN

@@ -63,3 +63,99 @@ test("uses ArraySpeciesCreate", () => {
     expect(slice).toBeInstanceOf(ResultArray);
     expect(slice).toEqual([2, 3]);
 });
+
+describe("species result that already has elements", () => {
+    test("longer packed result is truncated", () => {
+        var array = [1, 2, 3, 4, 5];
+        array.constructor = {
+            [Symbol.species]: function () {
+                return [9, 9, 9, 9, 9, 9];
+            },
+        };
+        var slice = array.slice(0, 2);
+        expect(slice).toEqual([1, 2]);
+        expect(slice).toHaveLength(2);
+    });
+
+    test("bounds prefilled species results across optimized and generic paths", () => {
+        const sliced = extensible => {
+            const source = ["allowed"];
+            const result = ["sentinel", "protected-tail"];
+            if (!extensible) Object.preventExtensions(result);
+            source.constructor = {
+                [Symbol.species]: function () {
+                    return result;
+                },
+            };
+            return source.slice(0, 1);
+        };
+
+        expect(sliced(true)).toEqual(["allowed"]);
+        expect(sliced(false)).toEqual(["allowed"]);
+    });
+
+    test("longer holey result is truncated", () => {
+        var array = [1, 2, 3];
+        array.constructor = {
+            [Symbol.species]: function () {
+                return [9, , 9, 9];
+            },
+        };
+        var slice = array.slice(2);
+        expect(slice).toEqual([3]);
+    });
+
+    test("empty slice truncates the result to zero", () => {
+        var array = [1, 2, 3];
+        array.constructor = {
+            [Symbol.species]: function () {
+                return [9, 9];
+            },
+        };
+        expect(array.slice(2, 1)).toHaveLength(0);
+    });
+
+    test("result that is this", () => {
+        var array = [1, 2, 3, 4, 5];
+        array.constructor = {
+            [Symbol.species]: function () {
+                return array;
+            },
+        };
+        var slice = array.slice(1, 3);
+        expect(slice).toBe(array);
+        expect(array).toEqual([2, 3]);
+    });
+});
+
+describe("array resized before elements are copied", () => {
+    test("shrunk while converting arguments", () => {
+        var array = [1, 2, 3];
+        var start = {
+            valueOf() {
+                array.length = 1;
+                return 0;
+            },
+        };
+        var slice = array.slice(start, 3);
+        expect(slice).toHaveLength(3);
+        expect(slice[0]).toBe(1);
+        expect(1 in slice).toBeFalse();
+        expect(2 in slice).toBeFalse();
+    });
+
+    test("shrunk by the species constructor", () => {
+        var array = [1, 2, 3];
+        array.constructor = {
+            [Symbol.species]: function () {
+                array.length = 1;
+                return [];
+            },
+        };
+        var slice = array.slice(0, 3);
+        expect(slice).toHaveLength(3);
+        expect(slice[0]).toBe(1);
+        expect(1 in slice).toBeFalse();
+        expect(2 in slice).toBeFalse();
+    });
+});

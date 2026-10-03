@@ -5,18 +5,18 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibGC/HeapHashTable.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGUseElement.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/Layout/Box.h>
-#include <LibWeb/Layout/SVGGraphicsBox.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/FragmentIdentifier.h>
@@ -34,21 +34,18 @@ SVGUseElement::SVGUseElement(DOM::Document& document, DOM::QualifiedName qualifi
 {
 }
 
-void SVGUseElement::initialize(JS::Realm& realm)
+void SVGUseElement::initialize_element()
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGUseElement);
-    Base::initialize(realm);
-
     // NOTE: The spec says "The shadow tree is open (inspectable by script), but read-only."
     //       This doesn't actually match other browsers, and there's a spec issue to change it.
     //       Spec bug: https://github.com/w3c/svgwg/issues/875
-    auto shadow_root = realm.create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
     shadow_root->set_user_agent_internal(true);
 
     // The user agent must create a use-element shadow tree whose host is the ‘use’ element itself
     set_shadow_root(shadow_root);
 
-    m_document_observer = realm.create<DOM::DocumentObserver>(realm, document());
+    m_document_observer = DOM::DocumentObserver::create(document());
     m_document_observer->set_document_completely_loaded([this]() {
         // The href processing path already populated the shadow tree for resolved references,
         // unless the referenced subtree changed while the document was still loading.
@@ -173,12 +170,7 @@ void SVGUseElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
-    // https://svgwg.org/svg2-draft/struct.html#UseLayout
-    if (name == SVG::AttributeNames::x) {
-        m_x = AttributeParser::parse_number_percentage(value.value_or({}));
-    } else if (name == SVG::AttributeNames::y) {
-        m_y = AttributeParser::parse_number_percentage(value.value_or({}));
-    } else if (name == SVG::AttributeNames::href || name == SVG::AttributeNames::xlink_href) {
+    if (name == SVG::AttributeNames::href || name == SVG::AttributeNames::xlink_href) {
         // When the ‘href’ attribute is set (or, in the absence of an ‘href’ attribute, an ‘xlink:href’ attribute), the user agent must process the URL.
         process_the_url(value);
     }
@@ -212,25 +204,28 @@ void SVGUseElement::process_the_url(Optional<Utf16String> const& href)
 
 bool SVGUseElement::is_referenced_element_same_document() const
 {
-    return m_href->equals(document().url(), URL::ExcludeFragment::Yes);
+    return m_href->equals(document().base_url(), URL::ExcludeFragment::Yes);
 }
 
-Gfx::AffineTransform SVGUseElement::element_transform() const
+Gfx::AffineTransform SVGUseElement::additional_element_transform() const
 {
     CSSPixelSize viewport_size;
     if (auto* svg_svg_element = first_flat_tree_ancestor_of_type<SVGSVGElement>()) {
         if (auto view_box = svg_svg_element->active_view_box(); view_box.has_value())
             viewport_size = { CSSPixels::nearest_value_for(view_box->width), CSSPixels::nearest_value_for(view_box->height) };
         else if (auto svg_svg_layout_node = svg_svg_element->unsafe_layout_node())
-            viewport_size = { svg_svg_layout_node->computed_values().width().to_px(0), svg_svg_layout_node->computed_values().height().to_px(0) };
+            viewport_size = { svg_svg_layout_node->width().to_px(0), svg_svg_layout_node->height().to_px(0) };
     }
 
-    auto x = m_x.value_or(NumberPercentage::create_number(0)).resolve_relative_to(viewport_size.width().to_float());
-    auto y = m_y.value_or(NumberPercentage::create_number(0)).resolve_relative_to(viewport_size.height().to_float());
+    auto computed_values = this->computed_style();
+    VERIFY(computed_values);
+
+    auto x = computed_values->x().to_px(viewport_size.width()).to_float();
+    auto y = computed_values->y().to_px(viewport_size.height()).to_float();
 
     // The x and y properties define an additional transformation (translate(x,y), where x and y represent the computed value of the corresponding property)
     // to be applied to the ‘use’ element, after any transformations specified with other properties
-    return Base::element_transform().translate(x, y);
+    return Gfx::AffineTransform {}.translate(x, y);
 }
 
 void SVGUseElement::svg_element_changed(SVGElement& svg_element)
@@ -241,7 +236,7 @@ void SVGUseElement::svg_element_changed(SVGElement& svg_element)
     }
 
     // NOTE: We need to check the ancestor because attribute_changed of a child doesn't call children_changed on the parent(s)
-    if (to_clone == &svg_element || to_clone->is_ancestor_of(svg_element)) {
+    if (to_clone == GC::Ref { svg_element } || to_clone->is_ancestor_of(svg_element)) {
         clone_element_tree_as_our_shadow_tree(to_clone);
     }
 }
@@ -253,7 +248,7 @@ void SVGUseElement::svg_element_changed_before_document_complete(SVGElement& svg
         return;
 
     // NOTE: We need to check the ancestor because attribute_changed of a child doesn't call children_changed on the parent(s)
-    if (to_clone == &svg_element || to_clone->is_ancestor_of(svg_element))
+    if (to_clone == GC::Ref { svg_element } || to_clone->is_ancestor_of(svg_element))
         m_needs_document_complete_reclone = true;
 }
 
@@ -297,7 +292,7 @@ GC::Ptr<DOM::Element> SVGUseElement::referenced_element() const
 void SVGUseElement::fetch_the_document(URL::URL const& url)
 {
     m_load_event_delayer.emplace(document());
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(realm(), document().page(), url);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), url);
     m_resource_request->add_callbacks(
         [this] {
             clone_element_tree_as_our_shadow_tree(referenced_element());
@@ -308,14 +303,14 @@ void SVGUseElement::fetch_the_document(URL::URL const& url)
         });
 
     if (m_resource_request->needs_fetching()) {
-        auto request = HTML::create_potential_CORS_request(vm(), url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
+        auto request = HTML::create_potential_CORS_request(url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
         request->set_client(&document().relevant_settings_object());
-        m_resource_request->fetch_resource(realm(), request);
+        m_resource_request->fetch_resource(request);
     }
 }
 
 // https://svgwg.org/svg2-draft/struct.html#UseShadowTree
-void SVGUseElement::clone_element_tree_as_our_shadow_tree(Element* to_clone)
+void SVGUseElement::clone_element_tree_as_our_shadow_tree(GC::Ptr<Element> to_clone)
 {
     shadow_root()->remove_all_children();
 
@@ -362,7 +357,7 @@ bool SVGUseElement::is_valid_reference_element(Element const& reference_element)
 
 bool SVGUseElement::would_create_circular_reference(Element const& target) const
 {
-    auto visited = heap().allocate<GC::HeapHashTable<GC::Ref<Element const>>>();
+    auto visited = GC::Heap::the().allocate<GC::HeapHashTable<GC::Ref<Element const>>>();
     return would_create_circular_reference_impl(target, visited);
 }
 
@@ -401,14 +396,9 @@ GC::Ptr<SVGElement> SVGUseElement::instance_root() const
     return const_cast<DOM::ShadowRoot&>(*shadow_root()).first_child_of_type<SVGElement>();
 }
 
-GC::Ptr<SVGElement> SVGUseElement::animated_instance_root() const
+CSS::ElementBoxKind SVGUseElement::box_kind() const
 {
-    return instance_root();
-}
-
-RefPtr<Layout::Node> SVGUseElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
-{
-    return make_ref_counted<Layout::SVGGraphicsBox>(document(), *this, style);
+    return CSS::ElementBoxKind::SvgGraphics;
 }
 
 }

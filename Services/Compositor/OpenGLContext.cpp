@@ -32,17 +32,19 @@ extern "C" {
 #endif
 #include <Compositor/OpenGLContext.h>
 
-// Enable WebGL if we're on macOS and can use Metal, if Linux can use ANGLE's
-// OpenGL backend for CPU-painting tests, or if we can use shareable Vulkan images.
-#if defined(AK_OS_MACOS) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)) || defined(USE_VULKAN_DMABUF_IMAGES)
+// Enable WebGL if we're on macOS and can use Metal, if Linux can use ANGLE's OpenGL backend for CPU-painting tests,
+// if Windows can use ANGLE's Direct3D 11 backend, or if we can use shareable Vulkan images.
+#if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE) || defined(USE_VULKAN_DMABUF_IMAGES)
 #    define ENABLE_WEBGL 1
 #endif
 
 namespace Compositor {
 
-using namespace Web::WebGL;
+using namespace Compositing::WebGL;
 
 struct OpenGLContext::Impl {
+    AK_ALLOC_WITH_KMALLOC;
+
     EGLDisplay display { EGL_NO_DISPLAY };
     EGLConfig config { EGL_NO_CONFIG_KHR };
     EGLContext context { EGL_NO_CONTEXT };
@@ -147,6 +149,10 @@ OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia
 #ifdef ENABLE_WEBGL
 #    if defined(AK_OS_MACOS) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID))
     bool use_cpu_painting_surface = !skia_backend_context;
+#    elif defined(AK_OS_WINDOWS)
+    // FIXME: Share the drawing buffer with Skia's Direct3D 12 device (via an NT shared handle opened on ANGLE's
+    //        Direct3D 11 device) instead of reading it back to the CPU every frame.
+    bool use_cpu_painting_surface = true;
 #    else
     bool use_cpu_painting_surface = false;
 #    endif
@@ -169,6 +175,8 @@ OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia
         EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE,
         EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE,
         EGL_PLATFORM_SURFACELESS_MESA,
+#    elif defined(AK_OS_WINDOWS)
+        EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
 #    endif
         EGL_NONE,
     };
@@ -439,7 +447,7 @@ bool OpenGLContext::allocate_vkimage_painting_surface()
 }
 #endif
 
-#if defined(AK_OS_MACOS) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID))
+#if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
 void OpenGLContext::allocate_cpu_painting_surface()
 {
     m_painting_surface = Gfx::PaintingSurface::create_with_size(
@@ -563,7 +571,7 @@ void OpenGLContext::allocate_painting_surface_if_needed()
 #        else
     (void)allocate_vkimage_painting_surface();
 #        endif
-#    elif defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)
+#    elif (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)) || defined(AK_OS_WINDOWS)
     allocate_cpu_painting_surface();
 #    endif
     VERIFY(m_painting_surface);
@@ -610,7 +618,7 @@ void OpenGLContext::make_current()
 #endif
 }
 
-void OpenGLContext::present(bool preserve_drawing_buffer)
+void OpenGLContext::present()
 {
 #ifdef ENABLE_WEBGL
     make_current();
@@ -627,24 +635,14 @@ void OpenGLContext::present(bool preserve_drawing_buffer)
 #    elif defined(USE_VULKAN_DMABUF_IMAGES)
     // FIXME: CPU sync for now, but it would be better to export a fence and have Skia wait for it before reading from the surface
     glFinish();
-#    elif defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)
+#    elif (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)) || defined(AK_OS_WINDOWS)
     glFinish();
 #    endif
 
-#    if defined(AK_OS_MACOS) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID))
+#    if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
     if (m_impl->uses_cpu_painting_surface)
         copy_default_framebuffer_to_cpu_painting_surface();
 #    endif
-
-    // "By default, after compositing the contents of the drawing buffer shall be cleared to their default values, as shown in the table above.
-    // This default behavior can be changed by setting the preserveDrawingBuffer attribute of the WebGLContextAttributes object.
-    // If this flag is true, the contents of the drawing buffer shall be preserved until the author either clears or overwrites them."
-    if (!preserve_drawing_buffer) {
-        // FIXME: we're assuming the clear operation won't actually be submitted to the GPU
-        clear_buffer_to_default_values();
-    }
-#else
-    (void)preserve_drawing_buffer;
 #endif
 }
 
@@ -666,9 +664,6 @@ u32 OpenGLContext::default_framebuffer() const
 Vector<String> OpenGLContext::get_supported_opengl_extensions()
 {
 #ifdef ENABLE_WEBGL
-    if (m_requestable_extensions.has_value())
-        return m_requestable_extensions.value();
-
     make_current();
 
     Vector<String> extensions;
@@ -685,10 +680,6 @@ Vector<String> OpenGLContext::get_supported_opengl_extensions()
             extensions.append(MUST(String::from_utf8(extension)));
     }
 
-    // We must cache this, because once extensions have been requested, they're no longer requestable extensions and would
-    // not appear in this list. However, we must always report every supported extension, regardless of what has already
-    // been requested.
-    m_requestable_extensions = extensions;
     return extensions;
 #else
     (void)m_webgl_version;

@@ -18,7 +18,7 @@
 #include <LibWeb/HTML/AutocompleteElement.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
 
@@ -26,14 +26,12 @@ class WEB_API HTMLTextAreaElement final
     : public HTMLElement
     , public FormAssociatedTextControlElement
     , public AutocompleteElement {
-    WEB_PLATFORM_OBJECT(HTMLTextAreaElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLTextAreaElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLTextAreaElement);
     AUTOCOMPLETE_ELEMENT(HTMLElement, HTMLTextAreaElement);
 
 public:
     virtual ~HTMLTextAreaElement() override;
-
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     Utf16FlyString type() const
     {
@@ -98,7 +96,7 @@ public:
     virtual void set_dirty_value_flag(bool flag) override { m_dirty_value = flag; }
 
     bool user_validity() const { return m_user_validity; }
-    void set_user_validity(bool flag) { m_user_validity = flag; }
+    void set_user_validity(bool);
 
     u32 text_length() const;
 
@@ -151,10 +149,8 @@ private:
     virtual EventResult handle_return_key(Utf16FlyString const& ui_input_type) override;
 
     virtual bool is_html_textarea_element() const final { return true; }
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     void set_raw_value(Utf16String);
 

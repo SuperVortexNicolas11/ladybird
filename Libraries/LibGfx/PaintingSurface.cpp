@@ -15,6 +15,7 @@
 #include <core/SkPaint.h>
 #include <core/SkRect.h>
 #include <core/SkSurface.h>
+#include <core/SkSurfaceProps.h>
 #include <gpu/ganesh/GrBackendSurface.h>
 #include <gpu/ganesh/GrDirectContext.h>
 #include <gpu/ganesh/SkSurfaceGanesh.h>
@@ -35,6 +36,8 @@
 namespace Gfx {
 
 struct PaintingSurface::Impl {
+    AK_ALLOC_WITH_KMALLOC;
+
     RefPtr<SkiaBackendContext> context;
     IntSize size;
     sk_sp<SkSurface> surface;
@@ -133,7 +136,10 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::create_with_size(IntSize size, B
     auto image_info = SkImageInfo::Make(size.width(), size.height(), sk_color_type, sk_alpha_type, SkColorSpace::MakeSRGB());
 
     if (context) {
-        auto surface = SkSurfaces::RenderTarget(context->sk_context(), skgpu::Budgeted::kNo, image_info);
+        // NB: Dynamic MSAA lets Skia render complex antialiased paths on the GPU instead of
+        //     rasterizing coverage masks on the CPU and uploading them as textures.
+        SkSurfaceProps surface_properties { SkSurfaceProps::kDynamicMSAA_Flag, kUnknown_SkPixelGeometry };
+        auto surface = SkSurfaces::RenderTarget(context->sk_context(), skgpu::Budgeted::kNo, image_info, 0, &surface_properties);
         if (surface)
             return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr)));
         dbgln("Unable to create GPU surface for size {}x{}, falling back to CPU", size.width(), size.height());
@@ -160,7 +166,7 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::wrap_bitmap(Bitmap& bitmap)
 NonnullRefPtr<PaintingSurface> PaintingSurface::create_from_shared_image_buffer(SharedImageBuffer& shared_image_buffer, NonnullRefPtr<SkiaBackendContext> context, Origin origin)
 {
     auto const& iosurface_handle = shared_image_buffer.iosurface_handle();
-    auto metal_texture = context->metal_context().create_texture_from_iosurface(iosurface_handle);
+    auto metal_texture = context->metal_context().create_texture_from_iosurface(iosurface_handle, MetalTextureFormat::BGRA8, 0);
     IntSize const size { metal_texture->width(), metal_texture->height() };
     auto image_info = SkImageInfo::Make(size.width(), size.height(), kBGRA_8888_SkColorType, kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
     GrMtlTextureInfo mtl_info;
@@ -204,13 +210,13 @@ void PaintingSurface::read_into_bitmap(Bitmap& bitmap, IntPoint source_position)
     m_impl->surface->readPixels(pixmap, source_position.x(), source_position.y());
 }
 
-void PaintingSurface::write_from_bitmap(Bitmap const& bitmap)
+void PaintingSurface::write_from_bitmap(Bitmap const& bitmap, IntPoint destination_position)
 {
     auto color_type = to_skia_color_type(bitmap.format());
     auto alpha_type = to_skia_alpha_type(bitmap.format(), bitmap.alpha_type());
     auto image_info = SkImageInfo::Make(bitmap.width(), bitmap.height(), color_type, alpha_type, SkColorSpace::MakeSRGB());
     SkPixmap const pixmap(image_info, bitmap.begin(), bitmap.pitch());
-    m_impl->surface->writePixels(pixmap, 0, 0);
+    m_impl->surface->writePixels(pixmap, destination_position.x(), destination_position.y());
 }
 
 void PaintingSurface::copy_from_surface(PaintingSurface& source)

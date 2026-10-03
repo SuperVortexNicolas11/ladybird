@@ -1,11 +1,12 @@
-include(audio)
-
 set(SOURCES
     ConnectionFromClient.cpp
     ConsoleGlobalEnvironmentExtensions.cpp
     DevToolsConsoleClient.cpp
+    DevToolsDebugger.cpp
+    DevToolsIndexedDB.cpp
     PageClient.cpp
     PageHost.cpp
+    TestConnection.cpp
     WebContentCompositorHost.cpp
     WebContentConsoleClient.cpp
     WebDriverConnection.cpp
@@ -20,7 +21,7 @@ if (ANDROID)
         ${LADYBIRD_SOURCE_DIR}/UI/Android/src/main/cpp/JNIHelpers.cpp
         ${SOURCES}
     )
-    target_link_libraries(webcontentservice PRIVATE android)
+    target_link_libraries(webcontentservice PRIVATE android LibWebView)
 else()
     add_library(webcontentservice STATIC ${SOURCES})
     set_target_properties(webcontentservice PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
@@ -30,7 +31,10 @@ target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${CMAKE_CU
 target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${LADYBIRD_SOURCE_DIR}>)
 target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${LADYBIRD_SOURCE_DIR}/Services/>)
 
-target_link_libraries(webcontentservice PUBLIC LibCore LibCrypto LibDevTools LibFileSystem LibGfx LibHTTP LibIPC LibJS LibMain LibMedia LibWasm LibWeb LibWebSocket LibRequests LibWebView LibImageDecoderClient LibGC)
+target_link_libraries(webcontentservice PUBLIC LibCompositing LibCore LibCrypto LibDevTools LibFileSystem LibGfx LibHTTP LibIPC LibJS LibMain LibMedia LibWasm LibWeb LibRequests LibImageDecoderClient LibMediaClient LibGC)
+if (ENABLE_CRANELIFT_JIT)
+    target_link_libraries(webcontentservice PUBLIC LibWasmCompilerClient)
+endif()
 target_link_libraries(webcontentservice PRIVATE OpenSSL::Crypto OpenSSL::SSL)
 target_link_libraries(webcontentservice PRIVATE SDL3::SDL3)
 target_compile_options(webcontentservice PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wexit-time-destructors>)
@@ -57,9 +61,13 @@ target_sources(webcontentservice PUBLIC FILE_SET server TYPE HEADERS
     BASE_DIRS ${LADYBIRD_SOURCE_DIR}/Services
     FILES ConnectionFromClient.h
           ConsoleGlobalEnvironmentExtensions.h
+          DevToolsDebugger.h
+          DevToolsIndexedDB.h
           Forward.h
           PageHost.h
           WebContentCompositorHost.h
           WebContentConsoleClient.h
           WebDriverConnection.h
 )
+
+ladybird_sign_helper_process(WebContent ALLOW_JIT)

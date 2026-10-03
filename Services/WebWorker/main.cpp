@@ -5,9 +5,13 @@
  */
 
 #include <LibCore/ArgsParser.h>
+#include <LibCore/CrashHandler.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/Platform/TaskRole.h>
+#include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
+#include <LibCrypto/OpenSSL.h>
 #include <LibCrypto/OpenSSLForward.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibIPC/SingleServer.h>
@@ -15,32 +19,37 @@
 #include <LibIPC/TransportHandle.h>
 #include <LibImageDecoderClient/Client.h>
 #include <LibMain/Main.h>
+#include <LibMediaClient/Client.h>
 #include <LibRequests/RequestClient.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
-#include <LibWeb/HTML/UniversalGlobalScope.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
-#include <LibWeb/Platform/FontPlugin.h>
-#include <LibWebView/Plugins/ImageCodecPlugin.h>
-#include <LibWebView/Utilities.h>
+#include <LibWeb/Platform/RemoteImageCodecPlugin.h>
+#include <LibWebCommon/WebView/Utilities.h>
 #include <Services/RendererSandbox.h>
 #include <WebWorker/ConnectionFromClient.h>
+
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+#    include <LibWasm/Types.h>
+#    include <LibWasmCompilerClient/State.h>
+#endif
 
 #include <openssl/thread.h>
 
 static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle);
 static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle);
 
-static ErrorOr<Web::Bindings::AgentType> agent_type_from_string(StringView type)
+static ErrorOr<Web::HTML::AgentType> agent_type_from_string(StringView type)
 {
     if (type == "dedicated"sv)
-        return Web::Bindings::AgentType::DedicatedWorker;
+        return Web::HTML::AgentType::DedicatedWorker;
     if (type == "shared"sv)
-        return Web::Bindings::AgentType::SharedWorker;
+        return Web::HTML::AgentType::SharedWorker;
     if (type == "service"sv)
-        return Web::Bindings::AgentType::ServiceWorker;
+        return Web::HTML::AgentType::ServiceWorker;
 
     return Error::from_string_literal("Invalid worker type, must be one of: 'dedicated', 'shared', or 'service'");
 }
@@ -52,15 +61,17 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     StringView serenity_resource_root;
     StringView worker_type_string;
     StringView mach_server_name;
-    StringView cache_path;
     Vector<ByteString> certificates;
     bool expose_experimental_interfaces = false;
     bool enable_http_memory_cache = false;
     bool wait_for_debugger = false;
     bool file_origins_are_tuple_origins = false;
     bool disable_sandbox = false;
+    bool enable_test_mode = false;
 
+    int crash_report_fd = -1;
     Core::ArgsParser args_parser;
+    args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
     args_parser.add_option(serenity_resource_root, "Absolute path to directory for serenity resources", "serenity-resource-root", 'r', "serenity-resource-root");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
     args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
@@ -68,14 +79,24 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
     args_parser.add_option(worker_type_string, "Type of WebWorker to start (dedicated, shared, or service)", "type", 't', "type");
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
-    args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
     args_parser.add_option(file_origins_are_tuple_origins, "Treat file:// URLs as having tuple origins", "tuple-file-origins");
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
+    args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
 
     args_parser.parse(arguments);
 
+    if (crash_report_fd >= 0) {
+        if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
+            warnln("Could not install crash report handler: {}", result.error());
+    }
+
     if (wait_for_debugger)
         Core::Process::wait_for_debugger_and_break();
+
+    if (auto result = Core::Platform::adopt_foreground_application_task_role(); result.is_error())
+        warnln("Could not adopt the foreground application task role: {}", result.error());
+    if (auto result = Core::Platform::set_current_thread_qos(Core::Platform::ThreadQoS::UserInitiated); result.is_error())
+        warnln("Could not set main thread QoS: {}", result.error());
 
     if (file_origins_are_tuple_origins)
         URL::set_file_scheme_urls_have_tuple_origins();
@@ -91,18 +112,16 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     OPENSSL_TRY(OSSL_set_max_threads(nullptr, Core::System::hardware_concurrency()));
 
-    Web::HTML::UniversalGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
+    Web::HTML::WindowOrWorkerGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
-
-    Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(false));
 
     Web::Bindings::initialize_main_thread_vm(worker_type);
 
     if (!disable_sandbox)
-        TRY(RendererSandbox::apply_sandbox({}, cache_path));
+        TRY(RendererSandbox::apply_sandbox(mach_server_name, RendererSandbox::AudioAccess::No));
 
-    auto client = TRY(IPC::take_over_accepted_client_from_system_server<WebWorker::ConnectionFromClient>(mach_server_name));
+    auto client = TRY(IPC::take_over_accepted_client_from_system_server<WebWorker::ConnectionFromClient>(mach_server_name, enable_test_mode));
 
     auto& heap = Web::Bindings::main_thread_vm().heap();
     client->on_request_server_connection = [&heap](auto const& handle) {
@@ -113,6 +132,20 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         if (auto result = connect_to_image_decoder(handle); result.is_error())
             dbgln("Failed to connect to image decoder: {}", result.error());
     };
+
+    MediaClient::Client::set_transport_factory([client] {
+        return client->request_media_server_transport();
+    });
+
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    Wasm::set_cranelift_compile_callback([](Core::AnonymousBuffer const& buffer) {
+        return WasmCompilerClient::compiler_state().compile(buffer);
+    });
+
+    client->on_wasm_compiler_connection = [](auto handle) {
+        WasmCompilerClient::compiler_state().replace_connection(move(handle));
+    };
+#endif
 
     return event_loop.exec();
 }
@@ -141,8 +174,8 @@ static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle
     new_client->transport().set_peer_pid(response->peer_pid());
 #endif
     if (Web::Platform::ImageCodecPlugin::is_initialized())
-        static_cast<WebView::ImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
+        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
     else
-        Web::Platform::ImageCodecPlugin::install(*new WebView::ImageCodecPlugin(move(new_client)));
+        Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(move(new_client)));
     return {};
 }

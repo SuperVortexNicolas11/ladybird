@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/SVGTextPathElement.h>
-#include <LibWeb/Layout/SVGTextPathBox.h>
+#include <LibGC/Heap.h>
+#include <LibURL/URL.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGTextPathElement.h>
 
@@ -23,29 +24,14 @@ void SVGTextPathElement::attribute_changed(Utf16FlyString const& name, Optional<
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == SVG::AttributeNames::startOffset)
-        m_start_offset = AttributeParser::parse_number_percentage(value.value_or({}));
+        m_start_offset = parse_number_percentage(value.value_or({}));
 }
 
-GC::Ptr<SVGGeometryElement const> SVGTextPathElement::path_or_shape() const
+Optional<Utf16String> SVGTextPathElement::href_attribute_value() const
 {
-    auto href = has_attribute(AttributeNames::href) ? get_attribute(AttributeNames::href) : get_attribute(AttributeNames::xlink_href);
-    if (!href.has_value())
-        return {};
-    return try_resolve_url_to<SVGGeometryElement const>(*href);
-}
-
-// https://svgwg.org/svg2-draft/text.html#TextPathElementStartOffsetAttribute
-float SVGTextPathElement::start_offset_for_path_length(float path_length) const
-{
-    if (!m_start_offset.has_value())
-        return 0;
-    return m_start_offset->resolve_relative_to(path_length);
-}
-
-void SVGTextPathElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGTextPathElement);
-    Base::initialize(realm);
+    if (has_attribute(AttributeNames::href))
+        return get_attribute(AttributeNames::href);
+    return get_attribute(AttributeNames::xlink_href);
 }
 
 void SVGTextPathElement::visit_edges(Cell::Visitor& visitor)
@@ -54,9 +40,9 @@ void SVGTextPathElement::visit_edges(Cell::Visitor& visitor)
     SVGURIReferenceMixin::visit_edges(visitor);
 }
 
-RefPtr<Layout::Node> SVGTextPathElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+CSS::ElementBoxKind SVGTextPathElement::box_kind() const
 {
-    return make_ref_counted<Layout::SVGTextPathBox>(document(), *this, style);
+    return CSS::ElementBoxKind::SvgTextPath;
 }
 
 };

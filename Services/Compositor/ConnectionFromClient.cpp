@@ -5,19 +5,23 @@
  */
 
 #include <AK/IDAllocator.h>
+#include <AK/Math.h>
 #include <Compositor/ConnectionFromClient.h>
 #include <Compositor/ConnectionFromWebContent.h>
+#include <LibCompositing/PausedDebuggerOverlay.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
+#include <LibGfx/Font/FontDatabase.h>
+#include <LibGfx/Font/SharedFontProvider.h>
 #include <LibIPC/Transport.h>
 
 namespace Compositor {
 
 static IDAllocator s_web_content_connection_ids;
 
-ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, RefPtr<Gfx::SkiaBackendContext> skia_backend_context, bool async_scrolling_enabled)
+ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, RefPtr<Gfx::SkiaBackendContext> skia_backend_context)
     : IPC::ConnectionFromClient<CompositorControlClientEndpoint, CompositorControlServerEndpoint>(*this, move(transport), 1)
-    , m_compositor_state(CompositorState::create(move(skia_backend_context), async_scrolling_enabled))
+    , m_compositor_state(CompositorState::create(move(skia_backend_context)))
 {
     m_compositor_state->set_client(*this);
 }
@@ -29,14 +33,34 @@ void ConnectionFromClient::die()
     Core::Process::terminate_immediately(0);
 }
 
-void ConnectionFromClient::did_allocate_backing_stores(Web::Compositor::CompositorContextId context_id, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& backing_stores)
+void ConnectionFromClient::did_allocate_backing_stores(Web::CompositorContextId context_id, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& backing_stores)
 {
     async_did_allocate_backing_stores(context_id, move(bitmap_ids), move(backing_stores));
 }
 
-void ConnectionFromClient::did_present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id)
+void ConnectionFromClient::did_add_backing_stores(Web::CompositorContextId context_id, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& backing_stores)
+{
+    async_did_add_backing_stores(context_id, move(bitmap_ids), move(backing_stores));
+}
+
+void ConnectionFromClient::did_retire_backing_stores(Web::CompositorContextId context_id, Vector<i32> bitmap_ids)
+{
+    async_did_retire_backing_stores(context_id, move(bitmap_ids));
+}
+
+void ConnectionFromClient::did_present_frame(Web::CompositorContextId context_id, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id)
 {
     async_did_present_frame(context_id, content_rect, damage_rect, bitmap_id);
+}
+
+void ConnectionFromClient::did_consume_input_event(Web::CompositorContextId context_id, u64 event_id)
+{
+    async_did_consume_input_event(context_id, event_id);
+}
+
+void ConnectionFromClient::did_not_dispatch_input_event(Web::CompositorContextId context_id, u64 event_id)
+{
+    async_did_not_dispatch_input_event(context_id, event_id);
 }
 
 Messages::CompositorControlServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
@@ -46,6 +70,80 @@ Messages::CompositorControlServer::InitTransportResponse ConnectionFromClient::i
     return Core::System::getpid();
 #endif
     VERIFY_NOT_REACHED();
+}
+
+void ConnectionFromClient::set_font_service_transport(IPC::TransportHandle handle)
+{
+    auto transport = handle.create_transport();
+    if (transport.is_error()) {
+        dbgln("Compositor: Unable to create font service transport: {}", transport.error());
+        return;
+    }
+
+    m_font_client = FontClient::construct(transport.release_value());
+#ifdef AK_OS_WINDOWS
+    auto response = m_font_client->send_sync_but_allow_failure<FontClient::InitTransport>(Core::System::getpid());
+    if (!response) {
+        dbgln("Compositor: Unable to initialize font service transport");
+        m_font_client = nullptr;
+        return;
+    }
+    m_font_client->transport().set_peer_pid(response->peer_pid());
+#endif
+}
+
+void ConnectionFromClient::set_font_catalog(IPC::File file, u64 size, u64 generation)
+{
+    if (m_font_provider) {
+        if (auto result = m_font_provider->replace_catalog(move(file), size, generation); result.is_error())
+            dbgln("Compositor: Unable to replace font catalog: {}", result.error());
+        return;
+    }
+
+    Gfx::SharedFontProviderCallbacks callbacks;
+    callbacks.open_font = [this](u64 requested_generation, u64 face_id) {
+        if (!m_font_client)
+            return Gfx::BrokeredFont {};
+        auto response = m_font_client->send_sync_but_allow_failure<Messages::CompositorFontServer::OpenSystemFont>(requested_generation, face_id);
+        if (!response)
+            return Gfx::BrokeredFont {};
+        return response->take_font();
+    };
+    callbacks.match_font = [this](String const& family, u16 weight, u16 width, u8 slope) {
+        if (!m_font_client)
+            return Gfx::BrokeredFont {};
+        auto response = m_font_client->send_sync_but_allow_failure<Messages::CompositorFontServer::MatchSystemFont>(family, weight, width, slope);
+        if (!response)
+            return Gfx::BrokeredFont {};
+        return response->take_font();
+    };
+    callbacks.match_font_for_code_point = [this](u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) {
+        if (!m_font_client)
+            return Gfx::BrokeredFont {};
+        auto response = m_font_client->send_sync_but_allow_failure<Messages::CompositorFontServer::MatchSystemFontForCodePoint>(code_point, weight, width, slope, prefer_color_emoji);
+        if (!response)
+            return Gfx::BrokeredFont {};
+        return response->take_font();
+    };
+    callbacks.resolve_generic_family = [this](String const& family, u16 weight, u8 slope) -> Optional<FlyString> {
+        if (!m_font_client)
+            return {};
+        auto response = m_font_client->send_sync_but_allow_failure<Messages::CompositorFontServer::ResolveGenericFont>(family, weight, slope);
+        if (!response)
+            return {};
+        auto resolved_family = response->take_resolved_family();
+        if (!resolved_family.has_value())
+            return {};
+        return FlyString { resolved_family.release_value() };
+    };
+
+    auto provider = Gfx::SharedFontProvider::create_from_catalog_file_or_empty(move(file), size, generation, move(callbacks));
+    if (provider.is_error()) {
+        dbgln("Compositor: Unable to install fallback font catalog: {}", provider.error());
+        return;
+    }
+    m_font_provider = provider.value().ptr();
+    Gfx::FontDatabase::the().install_system_font_provider(provider.release_value());
 }
 
 Messages::CompositorControlServer::ConnectWebContentResponse ConnectionFromClient::connect_web_content()
@@ -62,44 +160,71 @@ Messages::CompositorControlServer::ConnectWebContentResponse ConnectionFromClien
     return { move(paired_transport.remote_handle), web_content_connection_id };
 }
 
-void ConnectionFromClient::create_context(Web::Compositor::CompositorContextId context_id, Optional<u64> page_id, i32 web_content_connection_id)
+void ConnectionFromClient::create_context(Web::CompositorContextId context_id, Optional<u64> page_id, i32 web_content_connection_id)
 {
     auto* connection = web_content_connection(web_content_connection_id);
-    VERIFY(connection);
+    if (!connection) {
+        dbgln("Compositor: Ignoring context {} for WebContent connection {}, which is already gone", context_id, web_content_connection_id);
+        return;
+    }
+
     m_compositor_state->create_context(context_id, page_id, *connection);
 }
 
-void ConnectionFromClient::viewport_size_updated(Web::Compositor::CompositorContextId context_id, Gfx::IntSize viewport_size, Web::Compositor::WindowResizingInProgress window_resize_in_progress)
+void ConnectionFromClient::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     m_compositor_state->viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
 }
 
-void ConnectionFromClient::set_display_metadata(Web::Compositor::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
+void ConnectionFromClient::set_paused_debugger_overlay(Web::CompositorContextId context_id, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action_value)
+{
+    if (!isfinite(device_pixel_ratio) || device_pixel_ratio <= 0) {
+        did_misbehave("Invalid device pixel ratio");
+        return;
+    }
+
+    Optional<Compositing::PausedDebuggerOverlayAction> hovered_action;
+    if (hovered_action_value.has_value()) {
+        hovered_action = Compositing::paused_debugger_overlay_action_from_underlying(*hovered_action_value);
+        if (!hovered_action.has_value()) {
+            did_misbehave("Invalid paused debugger overlay action");
+            return;
+        }
+    }
+    m_compositor_state->set_paused_debugger_overlay(context_id, visible, device_pixel_ratio, move(font_family), hovered_action);
+}
+
+void ConnectionFromClient::set_display_metadata(Web::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
 {
     m_compositor_state->set_display_metadata(context_id, display_id, refresh_rate);
 }
 
-Messages::CompositorControlServer::HandleMouseEventResponse ConnectionFromClient::handle_mouse_event(Web::Compositor::CompositorContextId context_id, Web::MouseEvent event)
+void ConnectionFromClient::set_context_visibility(Web::CompositorContextId context_id, Compositing::ContextVisibility visibility)
 {
-    return m_compositor_state->handle_mouse_event(context_id, event);
+    m_compositor_state->set_context_visibility(context_id, visibility);
 }
 
-Messages::CompositorControlServer::DispatchMouseEventToWebContentResponse ConnectionFromClient::dispatch_mouse_event_to_web_content(Web::Compositor::CompositorContextId context_id, Web::MouseEvent event)
+void ConnectionFromClient::handle_and_dispatch_mouse_event(Web::CompositorContextId context_id, Web::MouseEvent event)
 {
-    return m_compositor_state->dispatch_mouse_event_to_web_content(context_id, event);
+    m_compositor_state->handle_and_dispatch_mouse_event(context_id, move(event));
 }
 
-Messages::CompositorControlServer::HandlePinchEventResponse ConnectionFromClient::handle_pinch_event(Web::Compositor::CompositorContextId context_id, Web::PinchEvent event)
+Messages::CompositorControlServer::HandleKeyEventResponse ConnectionFromClient::handle_key_event(Web::CompositorContextId context_id, Web::KeyEvent event)
 {
-    return m_compositor_state->handle_pinch_event(context_id, event);
+    return m_compositor_state->handle_key_event(context_id, event);
 }
 
-Messages::CompositorControlServer::AsyncScrollByResponse ConnectionFromClient::async_scroll_by(Web::Compositor::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels)
+Messages::CompositorControlServer::DispatchKeyEventToWebContentResponse ConnectionFromClient::dispatch_key_event_to_web_content(Web::CompositorContextId context_id, Web::KeyEvent event)
 {
-    return m_compositor_state->async_scroll_by(context_id, position, delta_in_device_pixels);
+    return m_compositor_state->dispatch_key_event_to_web_content(context_id, event);
 }
 
-void ConnectionFromClient::presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId context_id, i32 bitmap_id)
+void ConnectionFromClient::handle_pinch_event(Web::CompositorContextId context_id, Web::PinchEvent event)
+{
+    m_compositor_state->handle_pinch_event(context_id, event);
+}
+
+void ConnectionFromClient::presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id)
 {
     m_compositor_state->presented_bitmap_ready_to_paint(context_id, bitmap_id);
 }
@@ -107,6 +232,11 @@ void ConnectionFromClient::presented_bitmap_ready_to_paint(Web::Compositor::Comp
 void ConnectionFromClient::set_client_gpu_presentation_capability(bool supported, u64 adapter_luid)
 {
     m_compositor_state->set_client_gpu_presentation_capability(supported, adapter_luid);
+}
+
+void ConnectionFromClient::set_synthesizes_scroll_momentum(bool synthesizes_scroll_momentum)
+{
+    m_compositor_state->set_synthesizes_scroll_momentum(synthesizes_scroll_momentum);
 }
 
 void ConnectionFromClient::crash()

@@ -7,8 +7,10 @@
 
 #pragma once
 
+#include <AK/Function.h>
+#include <AK/kmalloc.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Omnibox.h>
-#include <LibWebView/PrivateBrowsing.h>
 #include <LibWebView/Settings.h>
 
 #include <QLineEdit>
@@ -32,6 +34,8 @@ class LocationEdit final
     Q_OBJECT
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     LocationEdit(QWidget*, WebView::IsPrivate);
 
     void set_trailing_action(QAction*);
@@ -43,6 +47,8 @@ public:
     bool url_is_hidden() const { return m_url_is_hidden; }
     void set_url_is_hidden(bool);
     void show_autocomplete();
+
+    Function<void(String, Optional<URL::URL>, WebView::OmniboxDestinationKind)> on_navigation;
 
 signals:
     void focus_return_requested();
@@ -56,7 +62,7 @@ private:
     virtual void mouseReleaseEvent(QMouseEvent* event) override;
     virtual void resizeEvent(QResizeEvent* event) override;
 
-    virtual void search_engine_changed() override;
+    virtual void search_engine_settings_changed() override;
 
     void show_full_url_preserving_display_selection();
     int serialized_url_position_for_display_position(int) const;

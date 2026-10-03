@@ -16,13 +16,14 @@ namespace Web::HTML {
 
 // https://html.spec.whatwg.org/multipage/media.html#texttrackcue
 class TextTrackCue : public DOM::EventTarget {
-    WEB_PLATFORM_OBJECT(TextTrackCue, DOM::EventTarget);
+    WEB_WRAPPABLE(TextTrackCue, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(TextTrackCue);
 
 public:
     virtual ~TextTrackCue() override;
 
     GC::Ptr<TextTrack> track() { return m_track; }
+    static constexpr size_t track_offset() { return offsetof(TextTrackCue, m_track); }
 
     Utf16String const& id() const { return m_identifier; }
     void set_id(Utf16View id) { m_identifier = Utf16String::from_utf16(id); }
@@ -43,9 +44,7 @@ public:
     void set_onexit(WebIDL::CallbackType*);
 
 protected:
-    TextTrackCue(JS::Realm&, GC::Ptr<TextTrack>);
-
-    virtual void initialize(JS::Realm&) override;
+    TextTrackCue(GC::Ptr<TextTrack>);
     virtual void visit_edges(Visitor&) override;
 
     GC::Ptr<TextTrack> m_track;

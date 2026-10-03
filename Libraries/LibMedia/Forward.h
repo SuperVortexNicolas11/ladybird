@@ -22,6 +22,7 @@ class DecoderError;
 class Demuxer;
 class DisplayingVideoSink;
 class FrameQueueItem;
+class FrameScanTimeline;
 class IncrementallyPopulatedStream;
 class MediaStream;
 class MediaStreamCursor;
@@ -33,6 +34,7 @@ class Track;
 class VideoDecoder;
 class VideoFrame;
 class VideoProducer;
+class VideoPresentationServerConnection;
 class VideoSink;
 
 }

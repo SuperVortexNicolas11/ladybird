@@ -41,23 +41,29 @@ public:
     GC::Ptr<Element const> parent_element() const;
     Element* flat_tree_parent_element() const;
     Optional<AbstractElement> element_to_inherit_style_from() const;
-    Optional<AbstractElement> previous_in_tree_order() { return walk_layout_tree(WalkMethod::Previous); }
-    Optional<AbstractElement> previous_sibling_in_tree_order() { return walk_layout_tree(WalkMethod::PreviousSibling); }
-    bool is_before(AbstractElement const&) const;
+    Optional<AbstractElement> highlight_inheritance_parent() const;
+    GC::Ptr<Node> root();
 
-    void set_inheritance_override(GC::Ref<Element> element) { m_inheritance_override = element; }
-
-    CSS::ComputedValues const* computed_values() const;
+    [[nodiscard]] CSS::ComputedStyleRecordView computed_style() const;
+    [[nodiscard]] CSS::StyleRecordID style_record_identity() const;
+    [[nodiscard]] bool has_style() const { return !!style_record_identity(); }
+    [[nodiscard]] void const* style_record_payloads() const;
+    template<typename StyleGroup>
+    StyleGroup const* style_group() const
+    {
+        auto const* payloads = static_cast<void const* const*>(style_record_payloads());
+        if (!payloads)
+            return nullptr;
+        auto const* payload = payloads[StyleGroup::style_group_index];
+        VERIFY(payload);
+        return static_cast<StyleGroup const*>(payload);
+    }
     GC::Ptr<CSS::CSSStyleProperties const> inline_style() const;
 
     void set_custom_property_data(RefPtr<CSS::CustomPropertyData const>);
+    void replace_custom_property_data(Badge<CSS::StyleComputer>, RefPtr<CSS::CustomPropertyData const>);
     [[nodiscard]] RefPtr<CSS::CustomPropertyData const> custom_property_data() const;
     RefPtr<CSS::StyleValue const> get_custom_property(Utf16FlyString const& name) const;
-
-    bool has_non_empty_counters_set() const;
-    Optional<CSS::CountersSet const&> counters_set() const;
-    CSS::CountersSet& ensure_counters_set();
-    void set_counters_set(OwnPtr<CSS::CountersSet>&&);
 
     Vector<GC::Ref<CSS::CSSAnimation>> const* css_defined_animations() const;
     void set_css_defined_animations(Vector<GC::Ref<CSS::CSSAnimation>>&&);
@@ -70,16 +76,8 @@ public:
     CSS::StyleScope const& style_scope() const;
 
 private:
-    enum class WalkMethod : u8 {
-        Previous,
-        PreviousSibling,
-    };
-    Optional<AbstractElement> walk_layout_tree(WalkMethod);
-
     GC::Ref<Element> m_element;
     Optional<CSS::PseudoElement> m_pseudo_element;
-
-    GC::Ptr<Element> m_inheritance_override;
 };
 
 }

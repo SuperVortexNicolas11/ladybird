@@ -5,7 +5,6 @@
  */
 
 #include <AK/TemporaryChange.h>
-#include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Bindings/InputEvent.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Document.h>
@@ -78,6 +77,12 @@ void UndoStep::merge(UndoStep& other)
         if (m_starting_selection.text_control) {
             m_starting_selection.text_control_start = m_ending_selection.text_control_start;
         } else {
+            // INTEROP: If backspacing exhausted the original text node, undo anchors the restored selection in the
+            //          following deletion's text run, rather than in the detached whitespace node.
+            if (m_starting_selection.anchor_node && !m_starting_selection.anchor_node->parent()) {
+                m_starting_selection.anchor_node = other.m_starting_selection.anchor_node;
+                m_starting_selection.anchor_offset = other.m_starting_selection.anchor_offset;
+            }
             m_starting_selection.focus_node = m_ending_selection.focus_node;
             m_starting_selection.focus_offset = m_ending_selection.focus_offset;
         }
@@ -177,9 +182,9 @@ void UndoStep::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_ending_selection.text_control);
 }
 
-GC::Ref<EditingHistory> EditingHistory::create(JS::Realm& realm)
+GC::Ref<EditingHistory> EditingHistory::create()
 {
-    return realm.heap().allocate<EditingHistory>();
+    return GC::Heap::the().allocate<EditingHistory>();
 }
 
 static SelectionSnapshot capture_selection(DOM::Node& editing_host)
@@ -227,11 +232,12 @@ static SelectionSnapshot capture_selection(DOM::Node& editing_host)
 //          execCommand() and the keyboard shortcuts.
 static void dispatch_history_input_event(DOM::Document& document, GC::Ref<DOM::Node> editing_host, Utf16FlyString const& input_type)
 {
+    (void)document;
     Bindings::InputEventInit event_init {};
     event_init.bubbles = true;
     event_init.input_type = input_type;
 
-    auto event = UIEvents::InputEvent::create_from_platform_event(document.realm(), HTML::EventNames::input, event_init);
+    auto event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, event_init);
     event->set_is_trusted(true);
     editing_host->dispatch_event(event);
 }
@@ -264,7 +270,7 @@ void EditingHistory::end_recording()
     // NB: Decide this before merging, since merging moves the commands into the open step.
     bool closes_coalescing = step->performed_lasting_node_removal();
 
-    if (m_open_step && !m_undo_stack.is_empty() && m_open_step == m_undo_stack.last().ptr()
+    if (m_open_step && !m_undo_stack.is_empty() && m_open_step == m_undo_stack.last()
         && m_open_step->editing_host() == step->editing_host()
         && m_open_step->accepts_merge_of(step->category())) {
         // NB: The redo stack is necessarily empty here: it only fills up through undo, which
@@ -315,6 +321,24 @@ void EditingHistory::selection_changed()
 {
     // Selection changes performed by the recorded command itself or by history application do
     // not end coalescence; everything else (caret movement, clicks, script) does.
+    if (auto step = m_undo_step_being_recorded; step && !m_proxy_mutation_depth
+        && (step->category() == UndoStep::Category::BackwardDeletion || step->category() == UndoStep::Category::ForwardDeletion)
+        && is_collapsed(step->starting_selection())) {
+        // INTEROP: Record the range selected by a delete command before it removes content. Reconstructing this
+        //          from the ending caret loses the image boundary when deletion also removes an inline wrapper.
+        auto selected_content = capture_selection(step->editing_host());
+        if (!is_collapsed(selected_content)) {
+            if (step->category() == UndoStep::Category::BackwardDeletion && selected_content.anchor_node && selected_content.focus_node
+                && DOM::position_of_boundary_point_relative_to_other_boundary_point(
+                       { *selected_content.anchor_node, static_cast<WebIDL::UnsignedLong>(selected_content.anchor_offset) },
+                       { *selected_content.focus_node, static_cast<WebIDL::UnsignedLong>(selected_content.focus_offset) })
+                    == DOM::RelativeBoundaryPointPosition::Before) {
+                swap(selected_content.anchor_node, selected_content.focus_node);
+                swap(selected_content.anchor_offset, selected_content.focus_offset);
+            }
+            step->set_starting_selection(selected_content);
+        }
+    }
     if (m_undo_step_being_recorded || m_applying_history_step)
         return;
     m_open_step = nullptr;
@@ -472,7 +496,7 @@ EventResult perform_history_action(DOM::Document& document, HistoryAction action
     event_init.bubbles = true;
     event_init.cancelable = true;
     event_init.input_type = input_type;
-    auto event = UIEvents::InputEvent::create_from_platform_event(document.realm(), UIEvents::EventNames::beforeinput, event_init);
+    auto event = UIEvents::InputEvent::create_from_platform_event(UIEvents::EventNames::beforeinput, event_init);
     event->set_is_trusted(true);
     if (!step->editing_host()->dispatch_event(event))
         return EventResult::Handled;

@@ -9,19 +9,20 @@
 
 #include <AK/DistinctNumeric.h>
 #include <AK/Variant.h>
+#include <LibCompositing/Forward.h>
 #include <LibGC/Forward.h>
 #include <LibGfx/Forward.h>
 #include <LibIPC/Forward.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Bindings/Forward.h>
+#include <LibWeb/CSS/StyleEngineIdentifiers.h>
+#include <LibWeb/CSS/StyleRecordID.h>
 #include <LibWeb/Export.h>
+#include <LibWebCommon/Forward.h>
 
 namespace Web {
 
-struct AsyncScrollOperation;
 class AutoScrollHandler;
-class CSSPixels;
-class DisplayListRecordingContext;
 class DragAndDropEventHandler;
 class ElementResizeAction;
 class EventHandler;
@@ -37,35 +38,31 @@ class XMLDocumentBuilder;
 enum class InvalidateDisplayList;
 enum class TraversalDecision;
 
-AK_TYPEDEF_DISTINCT_NUMERIC_GENERAL(i64, UniqueNodeID, Comparison, Increment, CastToUnderlying);
+struct AsyncScrollOperation;
+struct RemoteInputEventTarget;
 
 }
 
 namespace Web::Compositor {
 
+class CompositorConnection;
 class CompositorContextHandle;
 class CompositorHost;
+class CompositorHostBase;
+class NavigablePresenter;
+struct CompositorFrame;
 
 }
 
 namespace Web::Painting {
 
-class AccumulatedVisualContextTree;
 class BackingStore;
-class Canvas2DCommandStream;
-struct Canvas2DCommandStreamSegment;
 class ChromeWidget;
-class CanvasSurfaceRegistry;
-class DevicePixelConverter;
-class DisplayList;
-class DisplayListPlayerSkia;
-class DisplayListRecorder;
-class DisplayListResourceStorage;
-struct DisplayListResourceSet;
+class ChromeWidgetRegistry;
 enum class PaintCommandCacheMode : u8;
 struct GradientPaintStyle;
 struct PatternPaintStyle;
-class ScrollStateSnapshot;
+class Scrollbar;
 
 }
 
@@ -94,11 +91,25 @@ enum class StateAndProperties;
 namespace Web::Bindings {
 
 class Intrinsics;
+enum class NamedPropertyDeletionResult : u8;
 class OptionConstructor;
+class PlatformObject;
+class Wrappable;
+class WrapperWorld;
+
+enum class WrapperWorldType : u8 {
+    Main,
+    Internal,
+    Extension,
+};
 
 enum class AudioContextLatencyCategory : u8;
 enum class CanPlayTypeResult : u8;
+enum class CanvasColorType : u8;
 enum class CanvasFillRule : u8;
+enum class CanvasDirection : u8;
+enum class CanvasLineCap : u8;
+enum class CanvasLineJoin : u8;
 enum class CanvasTextAlign : u8;
 enum class CanvasTextBaseline : u8;
 enum class ColorGamut : u8;
@@ -106,16 +117,16 @@ enum class DOMParserSupportedType : u8;
 enum class EndingType : u8;
 enum class HdrMetadataType : u8;
 enum class ImageSmoothingQuality : u8;
-enum class LockMode : u8;
+enum class IDBCursorDirection : u8;
 enum class MediaDecodingType : u8;
 enum class MediaEncodingType : u8;
 enum class MediaStreamTrackState : u8;
 enum class OffscreenRenderingContextId : u8;
+enum class PredefinedColorSpace : u8;
 enum class ReadableStreamReaderMode : u8;
 enum class ReferrerPolicy : u8;
 enum class RenderBlockingStatusType : u8;
 enum class RequestCache : u8;
-enum class RequestCredentials : u8;
 enum class RequestDestination : u8;
 enum class RequestDuplex : u8;
 enum class RequestMode : u8;
@@ -123,7 +134,10 @@ enum class RequestPriority : u8;
 enum class RequestRedirect : u8;
 enum class ResizeObserverBoxOptions : u8;
 enum class ResponseType : u8;
-enum class TextTrackKind : u8;
+enum class ServiceWorkerState : u8;
+enum class ServiceWorkerUpdateViaCache : u8;
+enum class ShadowRootMode : u8;
+enum class SlotAssignmentMode : u8;
 enum class TransferFunction : u8;
 enum class XMLHttpRequestResponseType : u8;
 
@@ -141,9 +155,6 @@ namespace Web::Clipboard {
 class Clipboard;
 class ClipboardItem;
 
-struct SystemClipboardItem;
-struct SystemClipboardRepresentation;
-
 }
 
 namespace Web::Compression {
@@ -159,7 +170,6 @@ class Policy;
 class PolicyList;
 class SecurityPolicyViolationEvent;
 class Violation;
-struct SerializedPolicy;
 
 }
 
@@ -189,7 +199,6 @@ class StyleSourceDirective;
 class StyleSourceElementDirective;
 class WebRTCDirective;
 class WorkerSourceDirective;
-struct SerializedDirective;
 
 }
 
@@ -219,42 +228,37 @@ class SubtleCrypto;
 
 namespace Web::CSS {
 
+enum class ElementBoxKind : u8;
+
 class AbstractImageStyleValue;
 class AbstractOrHypotheticalElement;
 class AnchorStyleValue;
-class AnchorSizeStyleValue;
 class Angle;
 class AnglePercentage;
 class AngleStyleValue;
 class BackgroundSizeStyleValue;
-class BasicShapeStyleValue;
 class BlurFilterStyleValue;
-class BooleanExpression;
 class BorderImageSliceStyleValue;
 class BorderRadiusRectStyleValue;
 class BorderRadiusStyleValue;
 class CalculatedStyleValue;
-class CascadedProperties;
 class CustomPropertyData;
 class Clip;
 class ColorFilterStyleValue;
 class ColorFunctionStyleValue;
-class ColorInterpolationMethodStyleValue;
-class ColorMixStyleValue;
 class ColorSchemeStyleValue;
 class ColorStyleValue;
-class ComputedProperties;
+class ComputedStyleWorkingSet;
 class ComputedValues;
+class ComputedStyleRecordView;
 class ConicGradientStyleValue;
 class ContainerQuery;
 class ContentStyleValue;
-class ContrastColorStyleValue;
 class CounterDefinitionsStyleValue;
 class CounterStyle;
 class CounterStyleStyleValue;
 class CounterStyleSystemStyleValue;
 class CounterStyleValue;
-class CountersSet;
 class CSSAnimation;
 class CSSConditionRule;
 class CSSContainerRule;
@@ -305,6 +309,7 @@ class CSSStyleDeclaration;
 class CSSStyleProperties;
 class CSSStyleRule;
 class CSSStyleSheet;
+class StyleSheetState;
 class CSSStyleValue;
 class CSSSupportsRule;
 class CSSTransformComponent;
@@ -319,16 +324,13 @@ class DimensionStyleValue;
 class Display;
 class DisplayStyleValue;
 class DropShadowFilterStyleValue;
-class EasingStyleValue;
 class EdgeStyleValue;
-class EmptyOptionalStyleValue;
-class ExplicitGridTrack;
-class FeatureValue;
 class FilterStyleValue;
 class Flex;
 class FlexStyleValue;
 class FontComputer;
 class FontFace;
+class FontFaceState;
 class FontFaceSet;
 class FontSourceStyleValue;
 class FontStyleStyleValue;
@@ -336,22 +338,10 @@ class Frequency;
 class FrequencyPercentage;
 class FrequencyStyleValue;
 class FunctionStyleValue;
-class GridAutoFlowStyleValue;
-class GridLineNames;
-class GridMinMax;
-class GridRepeat;
-class GridSize;
-class GridTemplateAreaStyleValue;
-class GridTrackPlacement;
-class GridTrackPlacementStyleValue;
-class GridTrackSizeList;
-class GridTrackSizeListStyleValue;
-class GuaranteedInvalidStyleValue;
 class HueRotateFilterStyleValue;
 class ImageSetStyleValue;
 class ImageStyleValue;
 class IntegerStyleValue;
-class InvalidationSet;
 class KeywordStyleValue;
 class Length;
 class LengthBox;
@@ -387,12 +377,10 @@ class Resolution;
 class ResolutionStyleValue;
 class Screen;
 class ScreenOrientation;
-class ScrollbarGutterStyleValue;
 class Selector;
 class ShadowStyleValue;
 class ShorthandStyleValue;
 class Size;
-class SizeFeature;
 class ScrollbarColorStyleValue;
 class StringStyleValue;
 class StyleComputer;
@@ -400,19 +388,16 @@ class StylePropertyMap;
 class StylePropertyMapReadOnly;
 class StyleScope;
 class StyleSheet;
+class StyleSheetImport;
 class StyleSheetList;
 class StyleValue;
 class StyleValueList;
 class SuperellipseStyleValue;
-class Supports;
 class SVGPaint;
 class TextIndentStyleValue;
-class TextUnderlinePositionStyleValue;
 class Time;
 class TimePercentage;
 class TimeStyleValue;
-template<typename T>
-class TokenStream;
 class TransformationStyleValue;
 class TreeCountingFunctionStyleValue;
 class TupleStyleValue;
@@ -422,12 +407,11 @@ class URL;
 class URLStyleValue;
 class VisualViewport;
 
-enum class FeatureComparison : u8;
 enum class FontFeatureValueType : u8;
 enum class Keyword : u16;
+enum class LayoutTreeRebuildRoot : u8;
 enum class MediaFeatureID : u8;
 enum class PropertyID : u16;
-enum class SizeFeatureID : u8;
 enum class ValueType : u8;
 enum class AnimatedPropertyResultOfTransition : u8;
 
@@ -487,16 +471,12 @@ enum class WritingMode : u8;
 struct BackgroundLayerData;
 struct CalculationContext;
 struct CalculationResolutionContext;
+struct ColorResolutionContext;
 struct ComputationContext;
-struct FunctionParameterInternal;
 struct CustomPropertyRegistration;
-struct GridRepeatParams;
 struct LogicalAliasMappingContext;
 struct NormalGap;
-struct RandomCachingKey;
 struct RequiredInvalidationAfterStyleChange;
-struct StyleSheetIdentifier;
-struct TransitionProperties;
 
 // https://drafts.css-houdini.org/css-typed-om-1/#typedefdef-cssnumberish
 using CSSNumberish = Variant<double, GC::Ref<CSSNumericValue>>;
@@ -506,30 +486,18 @@ using StyleValueTuple = Vector<ValueComparingRefPtr<StyleValue const>>;
 
 }
 
-namespace Web::CSS::Invalidation {
+namespace Web::CSS::Parser::ValueParserFFI {
 
-class StyleInvalidator;
+struct FfiMediaFeatureValue;
 
 }
 
 namespace Web::CSS::Parser {
 
-class ComponentValue;
-class GuardedSubstitutionContexts;
 class Parser;
-class RustTokenizer;
-class SyntaxNode;
-class Token;
-class Tokenizer;
+class RustSyntaxHandle;
 
-struct ArbitrarySubstitutionReplacementContext;
-struct AtRule;
-struct Declaration;
-struct Function;
-struct GuaranteedInvalidValue;
 struct ParsingParams;
-struct QualifiedRule;
-struct SimpleBlock;
 
 }
 
@@ -546,6 +514,7 @@ class CDATASection;
 class CaretPosition;
 class CharacterData;
 class Comment;
+class CommitMessages;
 class CustomEvent;
 class Document;
 class DocumentFragment;
@@ -563,12 +532,14 @@ class EventHandler;
 class EventTarget;
 class HTMLCollection;
 class IDLEventListener;
+class InvalidationJournal;
 class LiveNodeList;
 class MutationObserver;
 class MutationRecord;
 class NamedNodeMap;
 class Node;
 class NodeFilter;
+class NodeIdentity;
 class NodeIterator;
 class NodeList;
 class ParentNode;
@@ -581,8 +552,10 @@ class RegisteredObserver;
 class SelectorQuery;
 class ShadowRoot;
 class SlotRegistry;
+class SlottableMixin;
 class StaticNodeList;
 class StaticRange;
+class SubtreeInsertionScope;
 class SyntheticPseudoElement;
 class Text;
 class TreeWalker;
@@ -590,6 +563,11 @@ class XMLDocument;
 
 enum class QuirksMode;
 enum class SetNeedsLayoutReason;
+enum class UpdateLayoutReason;
+
+using HTMLSerializationOptions = Bindings::GetHTMLOptions;
+using ShadowRootMode = Bindings::ShadowRootMode;
+using SlotAssignmentMode = Bindings::SlotAssignmentMode;
 
 }
 
@@ -658,7 +636,6 @@ class Request;
 class Response;
 
 struct BodyWithType;
-struct ConnectionTimingInfo;
 
 }
 
@@ -704,6 +681,8 @@ class DOMRectReadOnly;
 
 namespace Web::HTML {
 
+enum class CheckIfUnloadingIsCanceledResult;
+
 class AnimationFrameCallbackDriver;
 class AudioTrack;
 class AudioTrackList;
@@ -712,7 +691,8 @@ class BarProp;
 class BeforeUnloadEvent;
 class BroadcastChannel;
 class BrowsingContext;
-class BrowsingContextGroup;
+class Canvas2DContextBase;
+class CanvasHost;
 class CanvasRenderingContext2D;
 class RemoteCanvas2DTransport;
 class ClassicScript;
@@ -742,6 +722,7 @@ class FormAssociatedElement;
 class FormAssociatedTextControlElement;
 class FormDataEvent;
 class History;
+class HistoryExecutor;
 class HTMLAllCollection;
 class HTMLAnchorElement;
 class HTMLAreaElement;
@@ -770,6 +751,7 @@ class HTMLHeadElement;
 class HTMLHeadingElement;
 class HTMLHRElement;
 class HTMLHtmlElement;
+class HTMLHyperlinkElementUtils;
 class HTMLIFrameElement;
 class HTMLImageElement;
 class HTMLInputElement;
@@ -839,6 +821,8 @@ class Navigable;
 class NavigableContainer;
 class NavigateEvent;
 class Navigation;
+struct NavigationAPIMethodTracker;
+class NavigationActivation;
 class NavigationCurrentEntryChangeEvent;
 class NavigationDestination;
 class NavigationHistoryEntry;
@@ -855,9 +839,11 @@ class PopoverTargetAttributes;
 class PreloadEntry;
 struct PreloadKey;
 class PromiseRejectionEvent;
+class RadioButtonGroupRegistry;
 class RadioNodeList;
+class RemoteNavigable;
+class RemoteWindow;
 class ScriptRegistry;
-class SelectedFile;
 class SessionHistoryEntry;
 class SharedResourceRequest;
 class SharedWorker;
@@ -877,7 +863,6 @@ class TimeRanges;
 class ToggleEvent;
 class TrackEvent;
 class TransferDataDecoder;
-class TransferDataEncoder;
 class UserActivation;
 class UserScrollGestureHold;
 class ValidityState;
@@ -891,30 +876,34 @@ class WorkerAgentParent;
 class WorkerDebugConsoleClient;
 class WorkerEnvironmentSettingsObject;
 class WorkerGlobalScope;
+class Worklet;
+class WorkletEnvironmentSettingsObject;
+class WorkletGlobalScope;
 class WorkerLocation;
 class WorkerNavigator;
 class XMLSerializer;
 
-enum class AllowMultipleFiles;
+using CanvasColorType = Bindings::CanvasColorType;
+using CanvasDirection = Bindings::CanvasDirection;
+using CanvasLineCap = Bindings::CanvasLineCap;
+using CanvasLineJoin = Bindings::CanvasLineJoin;
+using CanvasTextAlign = Bindings::CanvasTextAlign;
+using CanvasTextBaseline = Bindings::CanvasTextBaseline;
+using ImageSmoothingQuality = Bindings::ImageSmoothingQuality;
+using NavigationType = Bindings::NavigationType;
+using PredefinedColorSpace = Bindings::PredefinedColorSpace;
 enum class RequireWellFormed;
 enum class SelectionDirection : u8;
-enum class SandboxingFlagSet : u32;
 
 struct Agent;
-struct BroadcastChannelMessage;
 struct DeserializedTransferRecord;
-struct EmbedderPolicy;
 struct Environment;
 struct EnvironmentSettingsObject;
 struct NavigationParams;
-struct OpenerPolicy;
-struct OpenerPolicyEnforcementResult;
+struct PreparedNavigation;
 struct PaintConfig;
 struct PolicyContainer;
-struct POSTResource;
 struct SerializedFormData;
-struct SerializedPolicyContainer;
-struct SerializedTransferRecord;
 struct SourceSnapshotParams;
 struct ToggleTaskTracker;
 
@@ -946,6 +935,8 @@ class Key;
 class ObjectStore;
 class RequestList;
 
+using CursorDirection = Bindings::IDBCursorDirection;
+
 }
 
 namespace Web::Internals {
@@ -967,31 +958,12 @@ class IntersectionObserverEntry;
 
 namespace Web::Layout {
 
-class AudioBox;
-class BlockContainer;
+class ImageProvider;
 class Box;
-class ButtonBox;
-class CheckBox;
-class FieldSetBox;
-class ImageBox;
-class InlineNode;
-class Label;
-class LegendBox;
-class ListItemBox;
-class ListItemMarkerBox;
-class LayoutRustBridge;
 class Node;
 class NodeArena;
 class NodeWithStyle;
-class NodeWithStyleAndBoxModelMetrics;
-class RadioButton;
-class ReplacedBox;
-class SVGSVGBox;
-class TableWrapper;
 class TextNode;
-class TextOffsetMapping;
-class LayoutTreeBuilderAccess;
-class VideoBox;
 class Viewport;
 
 }
@@ -1025,13 +997,12 @@ class SourceBufferList;
 
 namespace Web::MimeSniff {
 
-class MimeType;
-
 }
 
 namespace Web::NavigationTiming {
 
 class PerformanceNavigation;
+class PerformanceNavigationTiming;
 class PerformanceTiming;
 
 }
@@ -1044,23 +1015,8 @@ class Notification;
 
 namespace Web::Painting {
 
-class AudioPaintable;
-class CheckBoxPaintable;
-class FieldSetPaintable;
-class MediaPaintable;
-class Paintable;
-class Paintable;
-class PaintableFragment;
-class PaintableWithLines;
-class ScrollStateSnapshot;
-class StackingContext;
-class VideoPaintable;
-class ViewportPaintable;
-
-enum class PaintPhase;
-struct BorderRadiiData;
-struct BorderRadiusData;
-struct LinearGradientData;
+class BoxViewRepaintAccess;
+class DocumentPaintState;
 
 }
 
@@ -1087,8 +1043,6 @@ class Timer;
 
 namespace Web::ReferrerPolicy {
 
-enum class ReferrerPolicy;
-
 }
 
 namespace Web::RequestIdleCallback {
@@ -1100,6 +1054,8 @@ class IdleDeadline;
 namespace Web::ResizeObserver {
 
 class ResizeObserver;
+
+using ObservedBox = Bindings::ResizeObserverBoxOptions;
 
 }
 
@@ -1129,6 +1085,10 @@ class CacheStorage;
 class ServiceWorker;
 class ServiceWorkerContainer;
 class ServiceWorkerRegistration;
+
+using ServiceWorkerState = Bindings::ServiceWorkerState;
+using ServiceWorkerUpdateViaCache = Bindings::ServiceWorkerUpdateViaCache;
+using WorkerType = Bindings::WorkerType;
 
 }
 
@@ -1178,10 +1138,7 @@ class NavigatorStorage;
 class StorageBottle;
 class StorageBucket;
 class StorageManager;
-class StorageShed;
 class StorageShelf;
-
-struct StorageEndpoint;
 
 }
 
@@ -1295,30 +1252,42 @@ class Module;
 class Table;
 class WebAssemblyModule;
 
+namespace Detail {
+
+class WebAssemblyCache;
+
+}
+
 }
 
 namespace Web::WebAudio {
 
 class AudioBuffer;
+class AudioWorklet;
+class AudioWorkletGlobalScope;
+class AudioWorkletNode;
+class AudioWorkletProcessor;
 class AudioBufferSourceNode;
 class AudioContext;
 class AudioDestinationNode;
 class AudioListener;
 class AudioNode;
 class AudioParam;
+class AudioParamMap;
 class AudioScheduledSourceNode;
 class BaseAudioContext;
 class BiquadFilterNode;
 class ControlMessageQueue;
+class ConvolverNode;
 class DynamicsCompressorNode;
 class GainNode;
+class MediaStreamAudioDestinationNode;
+class MediaStreamAudioSourceNode;
 class OfflineAudioCompletionEvent;
 class OfflineAudioContext;
 class OscillatorNode;
 class PannerNode;
 class PeriodicWave;
-
-enum class AudioContextState;
 
 }
 

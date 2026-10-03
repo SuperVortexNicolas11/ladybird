@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/OwnPtr.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
@@ -18,8 +19,8 @@
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/WebIDL/Types.h>
 #include <LibWeb/XHR/FormDataEntry.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
 
@@ -30,6 +31,10 @@ enum class SelectionDirection : u8 {
     None,
 };
 
+using SelectionMode = Bindings::SelectionMode;
+
+using ValidityStateFlags = Bindings::ValidityStateFlags;
+
 class WEB_API FormAssociatedElement {
 public:
     // NB: FACE stands for form-associated custom element.
@@ -37,8 +42,8 @@ public:
 
     virtual bool is_form_associated_element() const;
 
-    HTMLFormElement* form() { return m_form; }
-    HTMLFormElement const* form() const { return m_form; }
+    HTMLFormElement* form();
+    HTMLFormElement const* form() const;
 
     void set_form(HTMLFormElement*);
 
@@ -48,6 +53,8 @@ public:
     bool enabled() const;
 
     void set_parser_inserted(Badge<HTMLParser>);
+
+    static void reposition_associated_elements_after_move(Badge<DOM::Element>, DOM::Node& moved_subtree_root);
 
     // https://html.spec.whatwg.org/multipage/forms.html#category-listed
     virtual bool is_listed() const;
@@ -133,21 +140,21 @@ public:
 
     void update_face_disabled_state();
 
-    Bindings::ValidityStateFlags const& face_validity_flags() const { return m_face_validity_flags; }
-    void set_face_validity_flags(Badge<ElementInternals>, Bindings::ValidityStateFlags const& value);
+    ValidityStateFlags const& face_validity_flags() const;
+    void set_face_validity_flags(Badge<ElementInternals>, ValidityStateFlags const& value);
 
-    Utf16String const& face_validation_message() const { return m_face_validation_message; }
+    Utf16String const& face_validation_message() const;
     void set_face_validation_message(Badge<ElementInternals>, Utf16View value);
 
     void set_face_validation_anchor(Badge<ElementInternals>, GC::Ptr<HTMLElement> value);
 
-    FACESubmissionValue const& face_submission_value() const { return m_face_submission_value; }
+    FACESubmissionValue const& face_submission_value() const;
     void set_face_submission_value(Badge<ElementInternals>, FACESubmissionValue const& value);
 
-    FACESubmissionValue const& face_state() const { return m_face_state; }
+    FACESubmissionValue const& face_state() const;
     void set_face_state(Badge<ElementInternals>, FACESubmissionValue const& value);
 
-    void set_custom_validity_error_message(Badge<ElementInternals>, Utf16View value) { m_custom_validity_error_message = Utf16String::from_utf16(value); }
+    void set_custom_validity_error_message(Badge<ElementInternals>, Utf16View value);
 
 protected:
     FormAssociatedElement() = default;
@@ -156,47 +163,66 @@ protected:
     virtual void form_associated_element_was_inserted();
     virtual void form_associated_element_was_removed(DOM::Node*);
     virtual void form_associated_element_was_moved(GC::Ptr<DOM::Node>);
+    virtual void form_associated_element_form_owner_changed();
     virtual void form_associated_element_attribute_changed(Utf16FlyString const&, Optional<Utf16String> const&, Optional<Utf16String> const&, Optional<Utf16FlyString> const&);
 
     void form_node_was_inserted();
     void form_node_was_removed();
     void form_node_was_moved();
     void form_node_attribute_changed(Utf16FlyString const&, Optional<Utf16String> const&);
+    void submit_button_state_changed();
 
-    void visit_edges(JS::Cell::Visitor&);
+    struct FACERareData {
+        AK_ALLOC_WITH_KMALLOC;
+
+        ValidityStateFlags validity_flags {};
+
+        // https://html.spec.whatwg.org/multipage/custom-elements.html#face-validation-message
+        // Each form-associated custom element has a validation message string. It is the empty string initially.
+        Utf16String validation_message;
+
+        // https://html.spec.whatwg.org/multipage/custom-elements.html#face-validation-anchor
+        // Each form-associated custom element has a validation anchor element. It is null initially.
+        GC::Weak<HTMLElement> validation_anchor;
+
+        // https://html.spec.whatwg.org/multipage/custom-elements.html#face-submission-value
+        // Each form-associated custom element has submission value. It is used to provide one or more entries on form
+        // submission. The initial value is null, and it can be null, a string, a File, or a list of entries.
+        FACESubmissionValue submission_value;
+
+        // https://html.spec.whatwg.org/multipage/custom-elements.html#face-state
+        // Each form-associated custom element has state. The initial value is null, and it can be null, a string, a File,
+        // or a list of entries.
+        FACESubmissionValue state;
+
+        // AD-HOC: Cache the disabled state to detect changes and enqueue formDisabledCallback.
+        bool disabled_state { false };
+    };
+
+    struct RareData {
+        void visit_edges(JS::Cell::Visitor&);
+
+        GC::Weak<HTMLFormElement> form;
+
+        // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#parser-inserted-flag
+        bool parser_inserted { false };
+
+        bool in_associated_elements_list { false };
+
+        // State used only by form-associated custom elements.
+        OwnPtr<FACERareData> face_rare_data;
+
+        // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#custom-validity-error-message
+        Utf16String custom_validity_error_message;
+    };
+
+    virtual RareData* form_associated_rare_data() = 0;
+    virtual RareData const* form_associated_rare_data() const = 0;
+    virtual RareData& ensure_form_associated_rare_data() = 0;
 
 private:
-    GC::Weak<HTMLFormElement> m_form;
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#parser-inserted-flag
-    bool m_parser_inserted { false };
-
-    Bindings::ValidityStateFlags m_face_validity_flags {};
-
-    // https://html.spec.whatwg.org/multipage/custom-elements.html#face-validation-message
-    // Each form-associated custom element has a validation message string. It is the empty string initially.
-    Utf16String m_face_validation_message;
-
-    // https://html.spec.whatwg.org/multipage/custom-elements.html#face-validation-anchor
-    // Each form-associated custom element has a validation anchor element. It is null initially.
-    GC::Weak<HTMLElement> m_face_validation_anchor;
-
-    // https://html.spec.whatwg.org/multipage/custom-elements.html#face-submission-value
-    // Each form-associated custom element has submission value. It is used to provide one or more entries on form submission.
-    // The initial value of submission value is null, and submission value can be null, a string, a File, or a list of entries.
-    FACESubmissionValue m_face_submission_value;
-
-    // https://html.spec.whatwg.org/multipage/custom-elements.html#face-state
-    // Each form-associated custom element has state. It is information with which the user agent can restore a user's input
-    // for the element. The initial value of state is null, and state can be null, a string, a File, or a list of entries.
-    FACESubmissionValue m_face_state;
-
-    // AD-HOC: Cached disabled state for form-associated custom elements, used to detect changes
-    //         and enqueue formDisabledCallback. Only meaningful for FACEs.
-    bool m_face_disabled_state { false };
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#custom-validity-error-message
-    Utf16String m_custom_validity_error_message;
+    FACERareData const& face_rare_data() const;
+    FACERareData& ensure_face_rare_data();
 };
 
 enum class SelectionSource {
@@ -237,6 +263,7 @@ public:
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setrangetext
     WebIDL::ExceptionOr<void> set_range_text_binding(Utf16View replacement);
     WebIDL::ExceptionOr<void> set_range_text_binding(Utf16View replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, Bindings::SelectionMode = Bindings::SelectionMode::Preserve);
+    WebIDL::ExceptionOr<void> set_range_text(Utf16String const& replacement);
     WebIDL::ExceptionOr<void> set_range_text(Utf16View replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, Bindings::SelectionMode = Bindings::SelectionMode::Preserve);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setselectionrange
@@ -281,6 +308,8 @@ public:
 protected:
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
     void relevant_value_was_changed();
+
+    static void set_own_inline_style(DOM::Element&, CSS::CSSStyleProperties const& defaults);
 
 private:
     virtual GC::Ref<JS::Cell> as_cell() override;

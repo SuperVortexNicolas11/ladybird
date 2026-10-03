@@ -18,7 +18,7 @@
 #include <LibWeb/CSS/Units.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/PixelUnits.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::CSS {
 
@@ -61,6 +61,7 @@ public:
     struct ResolutionContext {
         [[nodiscard]] static ResolutionContext for_document(DOM::Document const&);
         [[nodiscard]] static ResolutionContext for_element(DOM::AbstractElement const&);
+        [[nodiscard]] static ResolutionContext for_element(DOM::AbstractElement const&, ComputedValues const&);
         [[nodiscard]] static ResolutionContext for_layout_node(Layout::NodeWithStyle const&);
 
         CSSPixelRect viewport_rect;

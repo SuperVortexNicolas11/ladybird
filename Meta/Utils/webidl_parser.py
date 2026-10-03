@@ -15,6 +15,65 @@ from typing import Tuple
 
 from Utils.lexer import Lexer
 
+ALLOWED_EXTENDED_ATTRIBUTES = frozenset(
+    {
+        "AllowResizable",
+        "AllowShared",
+        "AttributeCallbackName",
+        "CEReactions",
+        "CachedAttribute",
+        "Clamp",
+        "CreatesPromise",
+        "Default",
+        "DefinesAsyncIteratorReturn",
+        "EnforceRange",
+        "Enumerated",
+        "Experimental",
+        "Exposed",
+        "FIXME",
+        "DirectGetter",
+        "FlyString",
+        "GenerateToValue",
+        "Global",
+        "HTMLConstructor",
+        "ImplementedAs",
+        "ImplementedInBindings",
+        "InvalidValueDefault",
+        "LegacyFactoryFunction",
+        "LegacyLenientSetter",
+        "LegacyLenientThis",
+        "LegacyNamespace",
+        "LegacyNoInterfaceObject",
+        "LegacyNullToEmptyString",
+        "LegacyOverrideBuiltIns",
+        "LegacyTreatNonObjectAsNull",
+        "LegacyUnenumerableNamedProperties",
+        "LegacyUnforgeable",
+        "LegacyWindowAlias",
+        "MissingValueDefault",
+        "NeedsArgumentCount",
+        "NeedsCallerRealm",
+        "NewObject",
+        "PutForwards",
+        "RealmFreeConstructor",
+        "Reflect",
+        "ReflectRange",
+        "ReflectSetter",
+        "Replaceable",
+        "ReturnsJSValue",
+        "SameObject",
+        "SecureContext",
+        "Serializable",
+        "Transferable",
+        "URL",
+        "Unscopable",
+        "Utf16FlyString",
+        "WithFinalizer",
+        "WithGCVisitor",
+        "WithInitializer",
+    }
+)
+
 
 @dataclass(frozen=True)
 class IDLType:
@@ -170,6 +229,7 @@ class AsyncIterableDeclaration:
     value_type: IDLType
     parameters: List[OperationParameter] = field(default_factory=list)
     key_type: Optional[IDLType] = None
+    extended_attributes: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -229,6 +289,7 @@ class Interface:
     indexed_property_setter: Optional[SpecialOperation] = None
     maplike: Optional[MaplikeDeclaration] = None
     setlike: Optional[SetlikeDeclaration] = None
+    has_non_constant_member: bool = False
 
     @property
     def is_namespace(self) -> bool:
@@ -642,6 +703,8 @@ class Parser:
                 interface.constants.append(self.parse_constant())
                 continue
 
+            interface.has_non_constant_member = True
+
             if self.consume_optional_keyword("static"):
                 readonly = self.consume_optional_keyword("readonly")
                 if readonly or self.next_is_keyword("attribute"):
@@ -697,7 +760,7 @@ class Parser:
                 continue
 
             if self.next_is_keyword("async"):
-                interface.async_iterable = self.parse_async_iterable_declaration()
+                interface.async_iterable = self.parse_async_iterable_declaration(extended_attributes)
                 continue
 
             if self.next_is_keyword("getter"):
@@ -752,7 +815,7 @@ class Parser:
             key_type=key_type,
         )
 
-    def parse_async_iterable_declaration(self) -> AsyncIterableDeclaration:
+    def parse_async_iterable_declaration(self, extended_attributes: Dict[str, str]) -> AsyncIterableDeclaration:
         self.consume_keyword("async")
         self.consume_whitespace()
         self.consume_keyword("iterable")
@@ -769,6 +832,7 @@ class Parser:
             value_type=value_type,
             key_type=key_type,
             parameters=parameters,
+            extended_attributes=extended_attributes,
         )
 
     def parse_iterable_type_parameters(self) -> Tuple[Optional[IDLType], IDLType]:
@@ -979,6 +1043,9 @@ class Parser:
                 break
 
             name = self.parse_identifier()
+            if name not in ALLOWED_EXTENDED_ATTRIBUTES:
+                self.raise_parse_error(f"unsupported extended attribute '{name}'")
+
             value = ""
             if self.lexer.consume_specific("="):
                 value = self.consume_until_top_level(",", "]").strip()

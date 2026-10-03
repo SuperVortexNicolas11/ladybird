@@ -8,13 +8,13 @@
 
 #include <AK/Badge.h>
 #include <AK/OwnPtr.h>
-#include <AK/WeakPtr.h>
 #include <LibGC/CellAllocator.h>
 #include <LibJS/Heap/Cell.h>
+#include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/PixelUnits.h>
 #include <LibWeb/TreeNode.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::Animations {
 
@@ -33,11 +33,10 @@ public:
     virtual Layout::NodeWithStyle* layout_node() const = 0;
     virtual Layout::NodeWithStyle* unsafe_layout_node() const = 0;
 
-    virtual RefPtr<CSS::ComputedValues const> computed_values() const = 0;
-    virtual void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) = 0;
+    virtual Node& root() const = 0;
 
-    virtual RefPtr<CSS::CustomPropertyData const> custom_property_data() const = 0;
-    virtual void set_custom_property_data(RefPtr<CSS::CustomPropertyData const> value) = 0;
+    virtual CSS::StyleRecordID style_record_identity() const = 0;
+    virtual void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) = 0;
 };
 
 class WEB_API SyntheticPseudoElement : public PseudoElement {
@@ -45,39 +44,37 @@ class WEB_API SyntheticPseudoElement : public PseudoElement {
     GC_DECLARE_ALLOCATOR(SyntheticPseudoElement);
 
 public:
-    SyntheticPseudoElement();
+    explicit SyntheticPseudoElement(CSS::PseudoElement type);
+    SyntheticPseudoElement(CSS::PseudoElement type, GC::Ref<Element> originating_element);
     virtual ~SyntheticPseudoElement() override;
 
-    Layout::NodeWithStyle* layout_node() const override { return m_layout_node.ptr(); }
-    Layout::NodeWithStyle* unsafe_layout_node() const override { return m_layout_node.ptr(); }
-    void set_layout_node(Layout::NodeWithStyle*);
+    CSS::PseudoElement type() const { return m_type; }
 
-    RefPtr<CSS::ComputedValues const> computed_values() const override;
+    Layout::NodeWithStyle* layout_node() const override { return unsafe_layout_node(); }
+    Layout::NodeWithStyle* unsafe_layout_node() const override;
+
+    virtual Node& root() const override;
+
+    virtual CSS::StyleRecordID style_record_identity() const override { return m_style_record_identity; }
     void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) override;
-    void set_computed_style(RefPtr<CSS::ComputedValues const>);
-    void refresh_computed_values(NonnullRefPtr<CSS::ComputedValues const>);
-    void set_computed_values_in_display_none_subtree();
-
-    RefPtr<CSS::CustomPropertyData const> custom_property_data() const override;
-    void set_custom_property_data(RefPtr<CSS::CustomPropertyData const> value) override;
-
-    bool has_non_empty_counters_set() const { return m_counters_set; }
-    Optional<CSS::CountersSet const&> counters_set() const;
-    CSS::CountersSet& ensure_counters_set();
-    void set_counters_set(OwnPtr<CSS::CountersSet>&&);
+    void set_computed_style(CSS::StyleRecordID);
+    void clear_computed_style(RefPtr<CSS::ComputedValues const> style_to_preserve_for_detachment = nullptr);
+    void refresh_computed_style(CSS::StyleRecordID);
 
     CSSPixelPoint scroll_offset() const { return m_scroll_offset; }
-    void set_scroll_offset(CSSPixelPoint value) { m_scroll_offset = value; }
+    void set_scroll_offset(CSSPixelPoint);
+    void publish_scroll_offset() const;
 
     virtual void visit_edges(JS::Cell::Visitor&) override;
 
 private:
-    struct CustomPropertyDataStorage;
+    void replace_style_record(CSS::StyleRecordID);
 
-    WeakPtr<Layout::NodeWithStyle> m_layout_node;
-    RefPtr<CSS::ComputedValues const> m_computed_values;
-    OwnPtr<CustomPropertyDataStorage> m_custom_property_data;
-    OwnPtr<CSS::CountersSet> m_counters_set;
+    CSS::PseudoElement m_type;
+    GC::Ptr<Element> m_originating_element;
+    // The authoritative StyleEngine record. C++ compatibility consumers borrow the record-owned
+    // computed-values view rather than retaining one complete style per pseudo-element.
+    CSS::StyleRecordID m_style_record_identity;
     CSSPixelPoint m_scroll_offset {};
 };
 
@@ -89,7 +86,8 @@ class SyntheticPseudoElementTreeNode
     GC_DECLARE_ALLOCATOR(SyntheticPseudoElementTreeNode);
 
 public:
-    SyntheticPseudoElementTreeNode();
+    explicit SyntheticPseudoElementTreeNode(CSS::PseudoElement type);
+    SyntheticPseudoElementTreeNode(CSS::PseudoElement type, GC::Ref<Element> originating_element);
     virtual ~SyntheticPseudoElementTreeNode() override;
 
 protected:
@@ -108,11 +106,10 @@ class WEB_API ElementReferencePseudoElement : public PseudoElement {
     Layout::NodeWithStyle* layout_node() const override;
     Layout::NodeWithStyle* unsafe_layout_node() const override;
 
-    RefPtr<CSS::ComputedValues const> computed_values() const override;
-    void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) override;
+    virtual Node& root() const override;
 
-    RefPtr<CSS::CustomPropertyData const> custom_property_data() const override;
-    void set_custom_property_data(RefPtr<CSS::CustomPropertyData const> value) override;
+    virtual CSS::StyleRecordID style_record_identity() const override;
+    void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) override;
 
     GC::Ref<Element> const& referenced_element() const { return m_referenced_element; }
 

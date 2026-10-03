@@ -4,10 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGDescElement.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/SVG/SVGDescElement.h>
 
@@ -20,15 +18,9 @@ SVGDescElement::SVGDescElement(DOM::Document& document, DOM::QualifiedName quali
 {
 }
 
-void SVGDescElement::initialize(JS::Realm& realm)
+CSS::ElementBoxKind SVGDescElement::box_kind() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGDescElement);
-    Base::initialize(realm);
-}
-
-RefPtr<Layout::Node> SVGDescElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const>)
-{
-    return nullptr;
+    return CSS::ElementBoxKind::NoBox;
 }
 
 }

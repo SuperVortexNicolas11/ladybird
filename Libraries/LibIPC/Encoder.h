@@ -136,6 +136,9 @@ template<>
 ErrorOr<void> encode(Encoder&, URL::Host const&);
 
 template<>
+ErrorOr<void> encode(Encoder&, URL::OpaqueHost const&);
+
+template<>
 ErrorOr<void> encode(Encoder&, File const&);
 
 template<>
@@ -148,13 +151,7 @@ template<>
 ErrorOr<void> encode(Encoder&, Core::AnonymousBuffer const&);
 
 template<>
-ErrorOr<void> encode(Encoder&, Core::ProxyData const&);
-
-template<>
-ErrorOr<void> encode(Encoder&, URL::BlobURLEntry::Blob const&);
-
-template<>
-ErrorOr<void> encode(Encoder&, URL::BlobURLEntry::MediaSource const&);
+ErrorOr<void> encode(Encoder&, URL::BlobURLEntry const&);
 
 template<Concepts::Span T>
 requires(!IsArithmetic<typename T::ElementType>)

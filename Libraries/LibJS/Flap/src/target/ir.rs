@@ -101,18 +101,6 @@ impl MachineCondition {
             FloatComparison::GreaterOrEqual => Self::FloatGreaterOrEqual,
         }
     }
-
-    pub(crate) fn from_assertion(operation: crate::intrinsic::AssertionOperation) -> Self {
-        use crate::intrinsic::AssertionOperation;
-
-        match operation {
-            AssertionOperation::UnsignedLess => Self::UnsignedLess,
-            AssertionOperation::UnsignedGreaterOrEqual => Self::UnsignedGreaterOrEqual,
-            AssertionOperation::NonZero => Self::NonZero,
-            AssertionOperation::TagEqual => Self::Equal,
-            AssertionOperation::TagNotEqual => Self::NotEqual,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +309,7 @@ pub(crate) struct MachineFunction {
     pub(crate) is_cold: bool,
     pub(crate) hot_instructions: Vec<MachineInstruction>,
     pub(crate) cold_instructions: Vec<MachineInstruction>,
+    pub(crate) assertion_traps: Vec<MachineInstruction>,
 }
 
 /// A finalized physical machine program ready for textual printing.
@@ -336,14 +325,17 @@ impl MachineProgram {
         use KnownLayoutConstant::*;
 
         let architecture_constants: &[KnownLayoutConstant] = match self.target.architecture {
-            Architecture::X86_64 => &[Int32TagShifted],
-            Architecture::Aarch64 => &[Int32Tag, BooleanTag, NanBaseTag],
+            Architecture::X86_64 => &[],
+            Architecture::Aarch64 => &[Int32Tag, BooleanTag],
         };
         architecture_constants
             .iter()
             .chain(
                 [
+                    SlowPathContinuationBit,
                     VmRunningExecutionContext,
+                    VmBreakpointController,
+                    VmHeapRegionBase,
                     ExecutionContextExecutable,
                     ExecutionContextProgramCounter,
                     ExecutableBytecodeData,

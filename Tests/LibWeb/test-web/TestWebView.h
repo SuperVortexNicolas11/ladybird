@@ -13,7 +13,7 @@
 #include <LibCore/Forward.h>
 #include <LibCore/Promise.h>
 #include <LibGfx/Forward.h>
-#include <LibWeb/PixelUnits.h>
+#include <LibWebCommon/PixelUnits.h>
 #include <LibWebView/HeadlessWebView.h>
 
 namespace TestWeb {
@@ -23,6 +23,9 @@ public:
     static NonnullOwnPtr<TestWebView> create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size);
 
     void clear_content_blockers();
+    void reset_force_dark();
+    void reset_line_box_borders();
+    void reset_geolocation_emulated_position();
     NonnullRefPtr<Core::Promise<Empty>> reset_session_history();
     pid_t web_content_pid() const;
 
@@ -35,13 +38,14 @@ public:
 private:
     TestWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size);
 
-    virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem) override;
-    virtual Vector<Web::Clipboard::SystemClipboardRepresentation> clipboard_entries() const override;
+    virtual Web::Clipboard::SystemClipboardItem clipboard_item() const override { return m_clipboard_item; }
+    virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem item) override { m_clipboard_item = move(item); }
 
-    virtual void did_receive_screenshot(Badge<WebView::WebContentClient>, Gfx::ShareableBitmap const& screenshot) override;
+    virtual void did_receive_screenshot(Badge<WebView::WebContentPage>, Gfx::ShareableBitmap const& screenshot) override;
     RefPtr<Core::Promise<RefPtr<Gfx::Bitmap const>>> m_pending_screenshot;
 
-    Optional<Web::Clipboard::SystemClipboardItem> m_clipboard_item;
+    Web::Clipboard::SystemClipboardItem m_clipboard_item;
+
     NonnullRefPtr<TestPromise> m_test_promise;
 };
 

@@ -281,9 +281,10 @@ void WebGL2RenderingContextImpl::uniform1ui(GC::Ptr<WebGLUniformLocation> locati
 {
     m_context->make_current();
 
-    GLuint location_handle = 0;
-    if (location)
-        location_handle = SET_ERROR_VALUE_IF_ERROR(location->handle(m_current_program), GL_INVALID_OPERATION);
+    if (!location)
+        return;
+
+    GLuint location_handle = SET_ERROR_VALUE_IF_ERROR(location->handle(m_current_program), GL_INVALID_OPERATION);
 
     m_context->uniform1ui(location_handle, v0);
 }
@@ -292,9 +293,10 @@ void WebGL2RenderingContextImpl::uniform2ui(GC::Ptr<WebGLUniformLocation> locati
 {
     m_context->make_current();
 
-    GLuint location_handle = 0;
-    if (location)
-        location_handle = SET_ERROR_VALUE_IF_ERROR(location->handle(m_current_program), GL_INVALID_OPERATION);
+    if (!location)
+        return;
+
+    GLuint location_handle = SET_ERROR_VALUE_IF_ERROR(location->handle(m_current_program), GL_INVALID_OPERATION);
 
     m_context->uniform2ui(location_handle, v0, v1);
 }
@@ -303,9 +305,10 @@ void WebGL2RenderingContextImpl::uniform3ui(GC::Ptr<WebGLUniformLocation> locati
 {
     m_context->make_current();
 
-    GLuint location_handle = 0;
-    if (location)
-        location_handle = SET_ERROR_VALUE_IF_ERROR(location->handle(m_current_program), GL_INVALID_OPERATION);
+    if (!location)
+        return;
+
+    GLuint location_handle = SET_ERROR_VALUE_IF_ERROR(location->handle(m_current_program), GL_INVALID_OPERATION);
 
     m_context->uniform3ui(location_handle, v0, v1, v2);
 }
@@ -314,9 +317,10 @@ void WebGL2RenderingContextImpl::uniform4ui(GC::Ptr<WebGLUniformLocation> locati
 {
     m_context->make_current();
 
-    GLuint location_handle = 0;
-    if (location)
-        location_handle = SET_ERROR_VALUE_IF_ERROR(location->handle(m_current_program), GL_INVALID_OPERATION);
+    if (!location)
+        return;
+
+    GLuint location_handle = SET_ERROR_VALUE_IF_ERROR(location->handle(m_current_program), GL_INVALID_OPERATION);
 
     m_context->uniform4ui(location_handle, v0, v1, v2, v3);
 }
@@ -678,7 +682,7 @@ GC::Ref<WebGLQuery> WebGL2RenderingContextImpl::create_query()
 
     GLuint handle = 0;
     m_context->gen_queries(1, &handle);
-    return WebGLQuery::create(realm(), *this, handle);
+    return WebGLQuery::create(*this, handle);
 }
 
 void WebGL2RenderingContextImpl::delete_query(GC::Ptr<WebGLQuery> query)
@@ -796,7 +800,7 @@ GC::Ref<WebGLSampler> WebGL2RenderingContextImpl::create_sampler()
 
     GLuint handle = 0;
     m_context->gen_samplers(1, &handle);
-    return WebGLSampler::create(realm(), *this, handle);
+    return WebGLSampler::create(*this, handle);
 }
 
 void WebGL2RenderingContextImpl::delete_sampler(GC::Ptr<WebGLSampler> sampler)
@@ -914,7 +918,7 @@ GC::Ptr<WebGLSync> WebGL2RenderingContextImpl::fence_sync(WebIDL::UnsignedLong c
     m_context->make_current();
 
     GLsync handle = m_context->fence_sync(condition, flags);
-    return WebGLSync::create(realm(), *this, handle);
+    return WebGLSync::create(*this, handle);
 }
 
 void WebGL2RenderingContextImpl::delete_sync(GC::Ptr<WebGLSync> sync)
@@ -986,7 +990,7 @@ GC::Ref<WebGLTransformFeedback> WebGL2RenderingContextImpl::create_transform_fee
 
     GLuint handle = 0;
     m_context->gen_transform_feedbacks(1, &handle);
-    return WebGLTransformFeedback::create(realm(), *this, handle);
+    return WebGLTransformFeedback::create(*this, handle);
 }
 
 void WebGL2RenderingContextImpl::delete_transform_feedback(GC::Ptr<WebGLTransformFeedback> transform_feedback)
@@ -1288,7 +1292,7 @@ GC::Ref<WebGLVertexArrayObject> WebGL2RenderingContextImpl::create_vertex_array(
 
     GLuint handle = 0;
     m_context->gen_vertex_arrays(1, &handle);
-    return WebGLVertexArrayObject::create(realm(), *this, handle);
+    return WebGLVertexArrayObject::create(*this, handle);
 }
 
 void WebGL2RenderingContextImpl::delete_vertex_array(GC::Ptr<WebGLVertexArrayObject> vertex_array)

@@ -12,22 +12,24 @@
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/Vector.h>
+#include <AK/kmalloc.h>
 #include <LibGfx/Cursor.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
 #include <LibURL/URL.h>
-#include <LibWeb/Forward.h>
-#include <LibWebView/PrivateBrowsing.h>
+#include <LibWebCommon/Forward.h>
+#include <LibWebCommon/Page/PageId.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/ViewImplementation.h>
 
-#include <QMenu>
+#include <LibWebCommon/Page/QueuedInputEvent.h>
 #include <QPixmap>
 #include <QTimer>
 #include <QUrl>
+#include <QVariant>
 
 #ifdef AK_OS_MACOS
-#    define LADYBIRD_QT_USE_METAL_RHI_WIDGET 1
-#    define LADYBIRD_QT_USE_RHI_WIDGET 1
+#    define LADYBIRD_QT_USE_IOSURFACE_LAYER 1
 #elif defined(USE_DIRECTX)
 #    define LADYBIRD_QT_USE_D3D_RHI_WIDGET 1
 #    define LADYBIRD_QT_USE_RHI_WIDGET 1
@@ -42,6 +44,9 @@
 #endif
 
 class QKeyEvent;
+class QLabel;
+class QPushButton;
+class QShortcut;
 class QSinglePointEvent;
 class QCursor;
 
@@ -63,6 +68,10 @@ using WebContentViewBase = QRhiWidget;
 using WebContentViewBase = QWidget;
 #endif
 
+class CrashOverlayUrlLabel;
+class CrashReportReviewWidget;
+class SelectDropdown;
+
 struct WebContentViewInitialState {
     WebView::IsPrivate is_private { WebView::IsPrivate::No };
     double maximum_frames_per_second { 60.0 };
@@ -74,10 +83,12 @@ class WebContentView final
     , public WebView::ViewImplementation {
     Q_OBJECT
 public:
-    WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, size_t page_index = 0, WebContentViewInitialState initial_state = {});
+    AK_ALLOC_WITH_KMALLOC;
+
+    WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, Web::PageId page_index = 0, WebContentViewInitialState initial_state = {});
     virtual ~WebContentView() override;
 
-#ifndef LADYBIRD_QT_USE_RHI_WIDGET
+#if !defined(LADYBIRD_QT_USE_RHI_WIDGET) && !defined(LADYBIRD_QT_USE_IOSURFACE_LAYER)
     virtual void paintEvent(QPaintEvent*) override;
 #endif
     virtual void resizeEvent(QResizeEvent*) override;
@@ -103,6 +114,7 @@ public:
     virtual bool event(QEvent*) override;
 
     void set_viewport_rect(Gfx::IntRect);
+    void push_viewport_size();
     void set_device_pixel_ratio(double);
     void set_zoom_level(double);
     void set_maximum_frames_per_second(double);
@@ -110,27 +122,29 @@ public:
     void set_vertical_tab_overlay_insets(int left, int right);
     void prepare_for_window_move();
     void finish_window_move();
+    void close_select_dropdown_after_crash();
+    // Offers the reports of earlier crashes on the crash screen, once this view is shown.
+    void show_earlier_crash_reports();
 
     enum class PaletteMode {
         Default,
         Dark,
     };
     void update_palette(PaletteMode = PaletteMode::Default);
+    void update_palette(WebView::WebContentPage&, PaletteMode = PaletteMode::Default);
     Optional<QPixmap> tab_preview_pixmap(QSize const& maximum_size) const;
 
     using ViewImplementation::client;
 
     QPoint map_point_to_global_position(Gfx::IntPoint) const;
 
-public slots:
-    void select_dropdown_action();
-
 signals:
+    void ready_to_paint();
     void urls_dropped(QList<QUrl> const&);
 
 private:
     // ^WebView::ViewImplementation
-    virtual void initialize_client(CreateNewClient) override;
+    virtual void prepare_page_for_tab(WebView::WebContentPage&) override;
     virtual void update_zoom() override;
     virtual Web::DevicePixelSize viewport_size() const override;
     virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override;
@@ -159,10 +173,12 @@ private:
     void schedule_frame_damage_repaint();
 #endif
     void update_compositor_display_metadata();
+    void update_compositor_display_metadata(WebView::WebContentPage&);
 
     Web::DevicePixelPoint node_picker_position_for(QSinglePointEvent const&) const;
 
     void enqueue_native_event(Web::MouseEvent::Type, QSinglePointEvent const& event);
+    void handle_pointer_leave();
 
     void enqueue_native_event(Web::DragEvent::Type, QDropEvent const& event);
     void finish_handling_drag_event(Web::DragEvent const&);
@@ -171,34 +187,46 @@ private:
     void finish_handling_key_event(Web::KeyEvent const&);
 
     void update_screen_rects();
+    void update_screen_rects(WebView::WebContentPage&);
+
+    void set_crash_overlay_visible(bool);
+    enum class CrashScreen : u8 {
+        ThisPage,
+        Earlier,
+    };
+    void show_crash_report_review(CrashScreen = CrashScreen::ThisPage);
 
     bool m_tooltip_override { false };
     Optional<ByteString> m_tooltip_text;
     QTimer m_tooltip_hover_timer;
 
     Gfx::IntSize m_viewport_size;
+    bool m_viewport_push_pending { false };
 
     u64 m_last_click_timestamp { 0 };
     QPointF m_last_click_position;
     int m_click_count { 0 };
 
-    QMenu* m_select_dropdown { nullptr };
+    SelectDropdown* m_select_dropdown { nullptr };
 
-#ifdef AK_OS_MACOS
-    bool prepare_metal_renderer(unsigned long render_target_pixel_format);
-    bool update_imported_iosurface_texture(Gfx::SharedImageBuffer const&);
-    void release_metal_resources();
-    void release_imported_iosurface_texture();
+    QWidget* m_crash_overlay { nullptr };
+    CrashOverlayUrlLabel* m_crash_overlay_url { nullptr };
+    QLabel* m_crash_overlay_message { nullptr };
+    QPushButton* m_crash_overlay_reload_button { nullptr };
+    QShortcut* m_crash_overlay_reload_shortcut { nullptr };
+    QWidget* m_crash_report_container { nullptr };
+    CrashReportReviewWidget* m_crash_report_review { nullptr };
+    bool m_show_earlier_crash_reports_when_shown { false };
 
-    void* m_metal_device { nullptr };
-    void* m_metal_library { nullptr };
-    void* m_metal_pipeline_state { nullptr };
-    void* m_metal_sampler_state { nullptr };
-    void* m_imported_iosurface_texture { nullptr };
-    Gfx::SharedImageBuffer const* m_imported_shared_image_buffer { nullptr };
-    unsigned long m_render_target_pixel_format { 0 };
+#ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
+    bool ensure_iosurface_layer_attached_to_native_view();
+    void present_current_paintable_as_layer_contents();
+    void update_iosurface_layer_frame();
+    void update_iosurface_layer_background_color();
+    void detach_iosurface_layer_from_native_view();
+    void destroy_iosurface_layer();
 
-    bool m_repaint_retry_scheduled { false };
+    void* m_iosurface_layer { nullptr };
 #endif
 
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
@@ -233,7 +261,7 @@ private:
 
     void create_vulkan_window();
     void destroy_vulkan_window();
-    void update_vulkan_window_input_region();
+    void update_vulkan_window_mask();
     void update_vulkan_alpha_blending_support();
     bool current_paintable_can_use_vulkan_window() const;
     void schedule_vulkan_window_update();

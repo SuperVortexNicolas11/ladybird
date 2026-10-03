@@ -10,10 +10,12 @@
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <AK/Variant.h>
+#include <LibMedia/Audio/SpscAudioFrameRing.h>
 #include <LibWeb/Bindings/BiquadFilterNode.h>
 #include <LibWeb/Bindings/OscillatorNode.h>
 #include <LibWeb/Bindings/PannerNode.h>
 #include <LibWeb/WebAudio/Rendering/AudioData.h>
+#include <LibWeb/WebAudio/Rendering/ConvolverKernel.h>
 #include <LibWeb/WebAudio/Types.h>
 
 namespace Web::WebAudio {
@@ -58,6 +60,12 @@ struct SetBiquadFilterType {
     Bindings::BiquadFilterType type { Bindings::BiquadFilterType::Lowpass };
 };
 
+struct SetConvolverKernel {
+    NodeID node_id { 0 };
+    RefPtr<Rendering::ConvolverKernel> kernel;
+    RefPtr<Rendering::ConvolverDelayLine> delay_line;
+};
+
 struct SetPannerParameters {
     NodeID node_id { 0 };
     Bindings::PanningModelType panning_model { Bindings::PanningModelType::Equalpower };
@@ -70,8 +78,26 @@ struct SetPannerParameters {
     double cone_outer_gain { 0 };
 };
 
+// Attaches the ring buffer that carries a MediaStreamTrack's audio into a
+// MediaStreamAudioSourceNode's render node. Shipped as a message rather than a constructor
+// argument so the ring can be replaced without rebuilding the render node.
+struct SetMediaStreamSourceRing {
+    NodeID node_id { 0 };
+    RefPtr<Media::SpscAudioFrameRing> ring;
+    u32 channel_count { 0 };
+};
+
 // A control message that updates the state of a single render node.
-using NodeMessage = Variant<StartSource, StopSource, StartBufferSource, SetBufferSourceParameters, SetOscillatorWaveform, SetBiquadFilterType, SetPannerParameters>;
+using NodeMessage = Variant<
+    SetBiquadFilterType,
+    SetBufferSourceParameters,
+    SetConvolverKernel,
+    SetMediaStreamSourceRing,
+    SetOscillatorWaveform,
+    SetPannerParameters,
+    StartBufferSource,
+    StartSource,
+    StopSource>;
 
 inline NodeID node_message_target(NodeMessage const& message)
 {

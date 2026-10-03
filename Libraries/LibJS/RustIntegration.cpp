@@ -8,6 +8,7 @@
 
 #include <AK/BitCast.h>
 #include <AK/NumericLimits.h>
+#include <AK/QuickSort.h>
 #include <AK/TemporaryChange.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
@@ -22,6 +23,7 @@
 #include <LibJS/Bytecode/RegexTable.h>
 #include <LibJS/Bytecode/StringTable.h>
 #include <LibJS/Bytecode/Validator.h>
+#include <LibJS/Debugger.h>
 #include <LibJS/Runtime/BigInt.h>
 #include <LibJS/Runtime/Intrinsics.h>
 #include <LibJS/Runtime/NativeJavaScriptBackedFunction.h>
@@ -534,6 +536,11 @@ ParsedProgram* parse_program(u16 const* utf16_data, size_t length_in_code_units,
     return rust_parse_program(utf16_data, length_in_code_units, static_cast<u8>(type), line_number_offset, g_dump_ast, g_dump_ast_use_color);
 }
 
+ParsedProgram* clone_parsed_program(ParsedProgram const* parsed)
+{
+    return rust_clone_parsed_program(parsed);
+}
+
 CompiledProgram* compile_parsed_program_off_thread(ParsedProgram* parsed, size_t length_in_code_units)
 {
     return rust_compile_parsed_program_off_thread(parsed, length_in_code_units);
@@ -559,6 +566,42 @@ void free_compiled_program(CompiledProgram* compiled)
     rust_free_compiled_program(compiled);
 }
 
+static void collect_breakpoint_position(void* context, u32 line, u32 column)
+{
+    static_cast<Vector<Position>*>(context)->append({ line, column });
+}
+
+Vector<Position> breakpoint_positions_for_source(SourceCode const& source_code, ProgramType type, size_t line_number_offset)
+{
+    auto* parsed = parse_program(source_code.utf16_data(), source_code.length_in_code_units(), type, line_number_offset);
+    if (!parsed)
+        return {};
+    if (parsed_program_has_errors(parsed)) {
+        free_parsed_program(parsed);
+        return {};
+    }
+
+    auto* compiled = compile_parsed_program_fully_off_thread(parsed, source_code.length_in_code_units());
+    if (!compiled)
+        return {};
+
+    Vector<Position> positions;
+    rust_collect_compiled_program_breakpoint_positions(compiled, &positions, collect_breakpoint_position);
+    free_compiled_program(compiled);
+
+    quick_sort(positions, [](auto const& left, auto const& right) {
+        return left.line < right.line || (left.line == right.line && left.column < right.column);
+    });
+    Vector<Position> unique_positions;
+    unique_positions.ensure_capacity(positions.size());
+    for (auto const& position : positions) {
+        if (!unique_positions.is_empty() && unique_positions.last().line == position.line && unique_positions.last().column == position.column)
+            continue;
+        unique_positions.append(position);
+    }
+    return unique_positions;
+}
+
 ByteBuffer serialize_compiled_program_for_bytecode_cache(CompiledProgram const& compiled, ProgramType type, ReadonlyBytes source_hash)
 {
     auto blob = rust_serialize_compiled_program_for_bytecode_cache(&compiled, static_cast<u8>(type), source_hash.data(), source_hash.size());
@@ -571,6 +614,8 @@ ByteBuffer serialize_compiled_program_for_bytecode_cache(CompiledProgram const& 
 }
 
 struct BytecodeCacheBlobOwner {
+    AK_ALLOC_WITH_KMALLOC;
+
     Core::ImmutableBytes bytes;
     Core::EventLoop* event_loop { nullptr };
 };
@@ -993,20 +1038,20 @@ ModuleBytecodeCacheInstallResult install_generated_bytecode_cache_module(Decoded
     return result.release_value();
 }
 
-Optional<Result<ModuleResult, Vector<ParserError>>> compile_module(Utf16View source_text, Realm& realm, Utf16View display_filename)
+Optional<Result<ModuleResult, Vector<ParserError>>> compile_module(Utf16View source_text, Realm& realm, Utf16View display_filename, size_t line_number_offset)
 {
     auto source_code = SourceCode::create(
         Utf16String::from_utf16(display_filename),
         Utf16String::from_utf16(source_text));
 
-    return compile_module(move(source_code), realm);
+    return compile_module(move(source_code), realm, line_number_offset);
 }
 
-Optional<Result<ModuleResult, Vector<ParserError>>> compile_module(NonnullRefPtr<SourceCode const> source_code, Realm& realm)
+Optional<Result<ModuleResult, Vector<ParserError>>> compile_module(NonnullRefPtr<SourceCode const> source_code, Realm& realm, size_t line_number_offset)
 {
     auto const* source_ptr = source_code->utf16_data();
     auto length = source_code->length_in_code_units();
-    auto* parsed = rust_parse_program(source_ptr, length, static_cast<u8>(ProgramType::Module), 0, g_dump_ast, g_dump_ast_use_color);
+    auto* parsed = rust_parse_program(source_ptr, length, static_cast<u8>(ProgramType::Module), line_number_offset, g_dump_ast, g_dump_ast_use_color);
 
     return compile_parsed_module(parsed, source_code, realm);
 }
@@ -1167,23 +1212,10 @@ void free_function_ast(void* ast)
 namespace JS::FFI {
 
 struct RustCompiledRegex {
+    AK_ALLOC_WITH_KMALLOC;
+
     Utf16String parsed_pattern;
 };
-
-static Utf16View view_from_ffi(FFIUtf16Slice slice)
-{
-    return JS::RustIntegration::utf16_view_from_bytes(slice.data, slice.length);
-}
-
-static Utf16String utf16_from_ffi(FFIUtf16Slice slice)
-{
-    return Utf16String::from_utf16(view_from_ffi(slice));
-}
-
-static Utf16FlyString utf16_fly_from_ffi(FFIUtf16Slice slice)
-{
-    return Utf16FlyString::from_utf16(view_from_ffi(slice));
-}
 
 static void align_constant_cursor(uint8_t const* begin, uint8_t const*& cursor, uint8_t const* end, size_t alignment)
 {
@@ -1331,21 +1363,21 @@ extern "C" void* rust_create_executable(
     auto ident_table = make<JS::Bytecode::IdentifierTable>();
     ident_table->ensure_capacity(data->identifier_count);
     for (size_t i = 0; i < data->identifier_count; ++i) {
-        ident_table->insert(utf16_fly_from_ffi(data->identifier_table[i]));
+        ident_table->insert(Utf16FlyString::from_raw(data->identifier_table[i]));
     }
 
     // Build property key table
     auto prop_key_table = make<JS::Bytecode::PropertyKeyTable>();
     prop_key_table->ensure_capacity(data->property_key_count);
     for (size_t i = 0; i < data->property_key_count; ++i) {
-        prop_key_table->insert(utf16_fly_from_ffi(data->property_key_table[i]));
+        prop_key_table->insert(Utf16FlyString::from_raw(data->property_key_table[i]));
     }
 
     // Build string table
     auto str_table = make<JS::Bytecode::StringTable>();
     str_table->ensure_capacity(data->string_count);
     for (size_t i = 0; i < data->string_count; ++i) {
-        str_table->insert(utf16_from_ffi(data->string_table[i]));
+        str_table->insert(Utf16String::from_raw(data->string_table[i]));
     }
 
     // Build regex table from pre-compiled regex objects.
@@ -1382,6 +1414,7 @@ extern "C" void* rust_create_executable(
         data->template_object_cache_count,
         data->object_shape_cache_count,
         data->object_property_iterator_cache_count,
+        data->environment_shape_cache_count,
         data->number_of_registers,
         data->is_strict ? JS::Strict::Yes : JS::Strict::No);
 
@@ -1392,6 +1425,7 @@ extern "C" void* rust_create_executable(
             data->exception_handlers[i].start_offset,
             data->exception_handlers[i].end_offset,
             data->exception_handlers[i].handler_offset,
+            data->exception_handlers[i].catches_exception,
         });
     }
 
@@ -1416,9 +1450,23 @@ extern "C" void* rust_create_executable(
 
     // Set local variable names
     executable->local_variable_names.ensure_capacity(data->local_variable_count);
+    executable->local_variable_metadata.ensure_capacity(data->local_variable_count);
     for (size_t i = 0; i < data->local_variable_count; ++i) {
-        executable->local_variable_names.append(utf16_fly_from_ffi(data->local_variable_names[i]));
+        auto const& metadata = data->local_variable_metadata[i];
+        executable->local_variable_names.append(Utf16FlyString::from_raw(metadata.name));
+        Optional<Bytecode::Executable::LocalVariableScopeRange> scope_range;
+        if (metadata.has_scope_range) {
+            scope_range = Bytecode::Executable::LocalVariableScopeRange {
+                .start = { metadata.scope_start_line, metadata.scope_start_column },
+                .end = { metadata.scope_end_line, metadata.scope_end_column },
+            };
+        }
+        executable->local_variable_metadata.append({ metadata.is_mutable, move(scope_range) });
     }
+
+    executable->argument_variable_names.ensure_capacity(data->argument_variable_count);
+    for (size_t i = 0; i < data->argument_variable_count; ++i)
+        executable->argument_variable_names.append(Utf16FlyString::from_raw(data->argument_variable_names[i]));
 
     // Set layout indices
     executable->local_index_base = data->number_of_registers;
@@ -1462,6 +1510,9 @@ extern "C" void* rust_create_executable(
         }
     }
 
+    if (auto* debugger = vm.debugger())
+        debugger->register_executable(*executable);
+
     return executable.ptr();
 }
 
@@ -1483,7 +1534,7 @@ static GC::Ref<JS::SharedFunctionInstanceData> create_shared_function_instance_d
     if (data->has_simple_parameter_list) {
         mapped_param_names.ensure_capacity(data->parameter_name_count);
         for (size_t i = 0; i < data->parameter_name_count; ++i)
-            mapped_param_names.append(utf16_fly_from_ffi(data->parameter_names[i]));
+            mapped_param_names.append(Utf16FlyString::from_raw(data->parameter_names[i]));
     }
 
     auto shared = vm.heap().allocate<JS::SharedFunctionInstanceData>(

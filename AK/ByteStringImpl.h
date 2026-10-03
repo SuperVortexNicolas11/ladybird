@@ -28,11 +28,6 @@ public:
     static NonnullRefPtr<ByteStringImpl const> create(char const* cstring, size_t length, ShouldChomp = NoChomp);
     static NonnullRefPtr<ByteStringImpl const> create(ReadonlyBytes, ShouldChomp = NoChomp);
 
-    void operator delete(void* ptr)
-    {
-        kfree(ptr);
-    }
-
     static ByteStringImpl& the_empty_stringimpl();
 
     ~ByteStringImpl();
@@ -59,14 +54,14 @@ public:
 
     unsigned hash() const
     {
-        if (!m_has_hash)
+        if (!atomic_load(&m_has_hash, memory_order_acquire))
             compute_hash();
-        return m_hash;
+        return atomic_load(&m_hash, memory_order_relaxed);
     }
 
     unsigned existing_hash() const
     {
-        return m_hash;
+        return atomic_load(&m_hash, memory_order_relaxed);
     }
 
     unsigned case_insensitive_hash() const;

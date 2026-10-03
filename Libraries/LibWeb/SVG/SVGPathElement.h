@@ -12,18 +12,16 @@
 namespace Web::SVG {
 
 class SVGPathElement final : public SVGGeometryElement {
-    WEB_PLATFORM_OBJECT(SVGPathElement, SVGGeometryElement);
+    WEB_WRAPPABLE(SVGPathElement, SVGGeometryElement);
     GC_DECLARE_ALLOCATOR(SVGPathElement);
 
 public:
     virtual ~SVGPathElement() override = default;
 
-    virtual Gfx::Path get_path(CSSPixelSize viewport_size) override;
+    virtual Gfx::Path get_path(CSSPixelSize viewport_size, CSS::ComputedValues const&) override;
 
 private:
     SVGPathElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
 };
 
 }

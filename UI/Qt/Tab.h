@@ -8,9 +8,11 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <AK/kmalloc.h>
 #include <LibWakeLock/DisplaySleepInhibitor.h>
-#include <LibWeb/HTML/AudioPlayState.h>
-#include <LibWeb/Page/ScreenWakeLockHandle.h>
+#include <LibWebCommon/HTML/AudioPlayState.h>
+#include <LibWebCommon/Page/PageId.h>
+#include <LibWebCommon/Page/ScreenWakeLockState.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Settings.h>
 #include <UI/Qt/BookmarksBar.h>
@@ -27,11 +29,15 @@
 #include <QWidget>
 
 class QTimer;
+class QColorDialog;
+class QFileDialog;
+class QMessageBox;
 namespace Ladybird {
 
 class BrowserWindow;
 enum class ChromeIcon;
 class DownloadsPopover;
+class JavaScriptDialog;
 class PrivateSessionPopover;
 class WindowControlButton;
 
@@ -39,6 +45,8 @@ class HyperlinkLabel final : public QLabel {
     Q_OBJECT
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit HyperlinkLabel(QWidget* parent = nullptr)
         : QLabel(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
     {
@@ -62,7 +70,9 @@ class Tab final
     Q_OBJECT
 
 public:
-    Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, size_t page_index = 0);
+    AK_ALLOC_WITH_KMALLOC;
+
+    Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, Web::PageId page_index = 0);
     virtual ~Tab() override;
 
     WebContentView& view() { return *m_view; }
@@ -103,7 +113,6 @@ public:
 
 public slots:
     void focus_location_editor();
-    void location_edit_return_pressed();
 
 signals:
     void title_changed(int id, QString const&);
@@ -111,17 +120,17 @@ signals:
     void audio_play_state_changed(int id, Web::HTML::AudioPlayState);
 
 private:
+    void location_edit_return_pressed(String, Optional<URL::URL>, WebView::OmniboxDestinationKind);
     virtual void resizeEvent(QResizeEvent*) override;
+    virtual void hideEvent(QHideEvent*) override;
     virtual bool event(QEvent*) override;
 
     virtual void tab_settings_changed() override;
-    virtual void show_menu_bar_changed() override;
     virtual void config_variable_changed(WebView::ConfigVariableID) override;
 
     void recreate_toolbar_icons();
     void update_vertical_tabs_toolbar_button_placement();
     void connect_hamburger_menu();
-    void update_hamburger_menu();
     void update_chrome_style();
     void update_tab_title();
     void update_downloads_button();
@@ -141,6 +150,7 @@ private:
 
     QWidget* m_toolbar_container { nullptr };
     QWidget* m_toolbar { nullptr };
+    QWidget* m_performance_monitor { nullptr };
     QWidget* m_toolbar_window_controls_separator { nullptr };
     QWidget* m_toolbar_window_controls { nullptr };
     QSpacerItem* m_sidebar_toggle_navigation_spacer { nullptr };
@@ -186,8 +196,12 @@ private:
     Optional<ChromeIcon> m_downloads_button_icon;
     QString m_downloads_button_tooltip;
 
-    QPointer<QDialog> m_dialog;
+    JavaScriptDialog* m_javascript_dialog { nullptr };
+    QPointer<QColorDialog> m_color_picker_dialog;
+    QPointer<QFileDialog> m_file_picker_dialog;
+    QPointer<QMessageBox> m_external_url_confirmation_dialog;
 
+    bool m_suppress_javascript_dialogs_until_navigation { false };
     bool m_already_requested_close { false };
 };
 

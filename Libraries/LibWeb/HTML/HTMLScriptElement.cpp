@@ -8,8 +8,6 @@
 #include <AK/Debug.h>
 #include <AK/Utf16StringBuilder.h>
 #include <LibTextCodec/Decoder.h>
-#include <LibWeb/Bindings/HTMLScriptElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
@@ -18,19 +16,26 @@
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/Fetching.h>
 #include <LibWeb/HTML/Scripting/ImportMapParseResult.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/Infra/CharacterTypes.h>
-#include <LibWeb/Infra/Strings.h>
-#include <LibWeb/MimeSniff/MimeType.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
+#include <LibWebCommon/Infra/Strings.h>
+#include <LibWebCommon/MimeSniff/MimeType.h>
 
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLScriptElement);
+
+static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name)
+{
+    return DOM::Event::create(event_name, HighResolutionTime::current_high_resolution_time(relevant_global_object(element)));
+}
 
 HTMLScriptElement::HTMLScriptElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))
@@ -38,12 +43,6 @@ HTMLScriptElement::HTMLScriptElement(DOM::Document& document, DOM::QualifiedName
 }
 
 HTMLScriptElement::~HTMLScriptElement() = default;
-
-void HTMLScriptElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLScriptElement);
-    Base::initialize(realm);
-}
 
 void HTMLScriptElement::visit_edges(Cell::Visitor& visitor)
 {
@@ -68,9 +67,9 @@ void HTMLScriptElement::attribute_changed(Utf16FlyString const& name, Optional<U
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
-    if (name == HTML::AttributeNames::crossorigin) {
+    if (!namespace_.has_value() && name == HTML::AttributeNames::crossorigin) {
         m_crossorigin = cors_setting_attribute_from_keyword(value.map([](auto const& value) { return value.utf16_view(); }));
-    } else if (name == HTML::AttributeNames::referrerpolicy) {
+    } else if (!namespace_.has_value() && name == HTML::AttributeNames::referrerpolicy) {
         m_referrer_policy = ReferrerPolicy::from_string(value.has_value() ? value->utf16_view() : u""sv).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
     } else if (name == HTML::AttributeNames::src) {
         // https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:concept-element-attributes-change-ext
@@ -143,7 +142,7 @@ void HTMLScriptElement::execute_script()
     // 3. If el's result is null, then fire an event named error at el, and return.
     if (m_result.has<ResultState::Null>()) {
         dbgln("HTMLScriptElement: Refusing to run script because the element's result is null.");
-        dispatch_event(DOM::Event::create(realm(), HTML::EventNames::error));
+        dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
         return;
     }
 
@@ -186,10 +185,10 @@ void HTMLScriptElement::execute_script()
     }
     // -> "importmap"
     else if (m_script_type == ScriptType::ImportMap) {
-        HTML::TemporaryExecutionContext execution_context { realm() };
+        HTML::TemporaryExecutionContext execution_context { document->relevant_settings_object() };
 
         // 1. Register an import map given el's relevant global object and el's result.
-        m_result.get<GC::Ref<ImportMapParseResult>>()->register_import_map(as<Window>(relevant_global_object(*this)));
+        m_result.get<GC::Ref<ImportMapParseResult>>()->register_import_map(relevant_window(*this));
     }
 
     // 7. Decrement the ignore-destructive-writes counter of document, if it was incremented in the earlier step.
@@ -198,7 +197,7 @@ void HTMLScriptElement::execute_script()
 
     // 8. If el's from an external file is true, then fire an event named load at el.
     if (m_from_an_external_file)
-        dispatch_event(DOM::Event::create(realm(), HTML::EventNames::load));
+        dispatch_event(create_event_for_element(*this, HTML::EventNames::load));
 }
 
 // https://w3c.github.io/trusted-types/dist/spec/#slot-value-verification
@@ -228,7 +227,7 @@ void HTMLScriptElement::prepare_script()
     auto source_text = m_script_text;
 
     // 7. If el has no src attribute, and source text is the empty string, then return.
-    if (!has_attribute(HTML::AttributeNames::src) && source_text.is_empty()) {
+    if (!has_attribute_ns({}, HTML::AttributeNames::src) && source_text.is_empty()) {
         return;
     }
 
@@ -241,7 +240,7 @@ void HTMLScriptElement::prepare_script()
     //    - el has no type attribute but it has a language attribute and that attribute's value is the empty string; or
     //    - el has neither a type attribute nor a language attribute
     Utf16String script_block_type;
-    auto maybe_type_attribute = attribute(HTML::AttributeNames::type);
+    auto maybe_type_attribute = get_attribute_ns({}, HTML::AttributeNames::type);
     auto maybe_language_attribute = attribute(HTML::AttributeNames::language);
     if ((maybe_type_attribute.has_value() && maybe_type_attribute->is_empty())
         || (!maybe_type_attribute.has_value() && maybe_language_attribute.has_value() && maybe_language_attribute->is_empty())
@@ -320,8 +319,8 @@ void HTMLScriptElement::prepare_script()
 
     // 22. If el does not have a src content attribute, and the Should element's inline behavior be blocked by Content
     //     Security Policy? algorithm returns "Blocked" when given el, cspType, and source text, then return [CSP]
-    if (!has_attribute(AttributeNames::src)
-        && ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(realm(), *this, ContentSecurityPolicy::Directives::Directive::InlineType::Script, source_text) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
+    if (!has_attribute_ns({}, AttributeNames::src)
+        && ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(*this, ContentSecurityPolicy::Directives::Directive::InlineType::Script, source_text.utf16_view()) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
         dbgln("HTMLScriptElement: Refusing to run inline script because it violates the Content Security Policy.");
         return;
     }
@@ -329,10 +328,10 @@ void HTMLScriptElement::prepare_script()
     // 23. If el has an event attribute and a for attribute, and el's type is "classic", then:
     if (m_script_type == ScriptType::Classic && has_attribute(HTML::AttributeNames::event) && has_attribute(HTML::AttributeNames::for_)) {
         // 1. Let for be the value of el's' for attribute.
-        auto for_ = get_attribute_value_view(HTML::AttributeNames::for_).value_or({});
+        auto for_ = attribute(HTML::AttributeNames::for_).value_or({});
 
         // 2. Let event be the value of el's event attribute.
-        auto event = get_attribute_value_view(HTML::AttributeNames::event).value_or({});
+        auto event = attribute(HTML::AttributeNames::event).value_or({});
 
         // 3. Strip leading and trailing ASCII whitespace from event and for.
         for_ = for_.trim_ascii_whitespace();
@@ -357,7 +356,7 @@ void HTMLScriptElement::prepare_script()
     Optional<Utf16String> encoding;
 
     if (has_attribute(HTML::AttributeNames::charset)) {
-        auto charset = TextCodec::get_standardized_encoding(get_attribute_value_view(HTML::AttributeNames::charset).value_or({}));
+        auto charset = TextCodec::get_standardized_encoding(attribute(HTML::AttributeNames::charset).value_or({}));
         if (charset.has_value())
             encoding = Utf16String::from_ascii_without_validation(charset->bytes());
     }
@@ -375,12 +374,12 @@ void HTMLScriptElement::prepare_script()
     auto module_script_credential_mode = cors_settings_attribute_credentials_mode(m_crossorigin);
 
     // 27. Let cryptographic nonce be el's [[CryptographicNonce]] internal slot's value.
-    auto cryptographic_nonce = m_cryptographic_nonce;
+    auto cryptographic_nonce = nonce();
 
     // 28. If el has an integrity attribute, then let integrity metadata be that attribute's value.
     //     Otherwise, let integrity metadata be the empty string.
     Utf16String integrity_metadata;
-    if (auto maybe_integrity = attribute(HTML::AttributeNames::integrity); maybe_integrity.has_value()) {
+    if (auto maybe_integrity = get_attribute_ns({}, HTML::AttributeNames::integrity); maybe_integrity.has_value()) {
         integrity_metadata = *maybe_integrity;
     }
 
@@ -388,7 +387,7 @@ void HTMLScriptElement::prepare_script()
     auto referrer_policy = m_referrer_policy;
 
     // 30. Let fetch priority be the current state of el's fetchpriority content attribute.
-    auto fetch_priority = Fetch::Infrastructure::request_priority_from_string(get_attribute_value_view(HTML::AttributeNames::fetchpriority).value_or({})).value_or(Fetch::Infrastructure::Request::Priority::Auto);
+    auto fetch_priority = Fetch::Infrastructure::request_priority_from_string(attribute(HTML::AttributeNames::fetchpriority).value_or({})).value_or(Fetch::Infrastructure::Request::Priority::Auto);
 
     // 31. Let parser metadata be "parser-inserted" if el is parser-inserted, and "not-parser-inserted" otherwise.
     auto parser_metadata = is_parser_inserted()
@@ -412,25 +411,25 @@ void HTMLScriptElement::prepare_script()
     auto& settings_object = document().relevant_settings_object();
 
     // 34. If el has a src content attribute, then:
-    if (has_attribute(HTML::AttributeNames::src)) {
+    if (has_attribute_ns({}, HTML::AttributeNames::src)) {
         // 1. If el's type is "importmap" or "speculationrules", then:
         // FIXME: Add "speculationrules" support.
         if (m_script_type == ScriptType::ImportMap) {
             // then queue an element task on the DOM manipulation task source given el to fire an event named error at el, and return.
             queue_an_element_task(HTML::Task::Source::DOMManipulation, [this] {
-                dispatch_event(DOM::Event::create(realm(), HTML::EventNames::error));
+                dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
             });
             return;
         }
 
         // 2. Let src be the value of el's src attribute.
-        auto src = get_attribute_value_view(HTML::AttributeNames::src).value_or({});
+        auto src = get_attribute_ns({}, HTML::AttributeNames::src).value_or({});
 
         // 3. If src is the empty string, then queue an element task on the DOM manipulation task source given el to fire an event named error at el, and return.
         if (src.is_empty()) {
             dbgln("HTMLScriptElement: Refusing to run script because the src attribute is empty.");
             queue_an_element_task(HTML::Task::Source::DOMManipulation, [this] {
-                dispatch_event(DOM::Event::create(realm(), HTML::EventNames::error));
+                dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
             });
             return;
         }
@@ -445,7 +444,7 @@ void HTMLScriptElement::prepare_script()
         if (!url.has_value()) {
             dbgln("HTMLScriptElement: Refusing to run script because the src URL '{}' is invalid.", url);
             queue_an_element_task(HTML::Task::Source::DOMManipulation, [this] {
-                dispatch_event(DOM::Event::create(realm(), HTML::EventNames::error));
+                dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
             });
             return;
         }
@@ -478,7 +477,7 @@ void HTMLScriptElement::prepare_script()
         // -> "module"
         else if (m_script_type == ScriptType::Module) {
             // If el does not have an integrity attribute, then set options's integrity metadata to the result of resolving a module integrity metadata with url and settings object.
-            if (!has_attribute(HTML::AttributeNames::integrity))
+            if (!has_attribute_ns({}, HTML::AttributeNames::integrity))
                 options.integrity_metadata = resolve_a_module_integrity_metadata(*url, settings_object);
 
             // AD-HOC: Queue an element task on the networking task source to run the onComplete steps
@@ -495,12 +494,12 @@ void HTMLScriptElement::prepare_script()
             });
 
             // Fetch an external module script graph given url, settings object, options, and onComplete.
-            fetch_external_module_script_graph(realm(), *url, settings_object, options, on_complete);
+            fetch_external_module_script_graph(HTML::relevant_realm(*this), *url, settings_object, options, on_complete);
         }
     }
 
     // 35. If el does not have a src content attribute:
-    if (!has_attribute(HTML::AttributeNames::src)) {
+    if (!has_attribute_ns({}, HTML::AttributeNames::src)) {
         // 1. Let base URL be el's node document's document base URL.
         auto base_url = document().base_url();
 
@@ -532,12 +531,12 @@ void HTMLScriptElement::prepare_script()
 
             // 2. Fetch an inline module script graph, given source text, base URL, settings object, options, and with the following steps given result:
             // FIXME: Pass options
-            fetch_inline_module_script_graph(realm(), m_document->url().to_byte_string(), source_text.utf16_view(), base_url, document().relevant_settings_object(), m_source_line_number, steps);
+            fetch_inline_module_script_graph(HTML::relevant_realm(*this), m_document->url().to_byte_string(), source_text.utf16_view(), base_url, document().relevant_settings_object(), m_source_line_number, steps);
         }
         // -> "importmap"
         else if (m_script_type == ScriptType::ImportMap) {
             // 1. Let result be the result of creating an import map parse result given source text and base URL.
-            auto result = ImportMapParseResult::create(realm(), source_text.utf16_view(), base_url);
+            auto result = ImportMapParseResult::parse(HTML::relevant_realm(*this), source_text.utf16_view(), base_url);
 
             // 2. Mark as ready el given result.
             mark_as_ready(Result(move(result)));
@@ -546,7 +545,7 @@ void HTMLScriptElement::prepare_script()
     }
 
     // 36. If el's type is "classic" and el has a src attribute, or el's type is "module":
-    if ((m_script_type == ScriptType::Classic && has_attribute(HTML::AttributeNames::src)) || m_script_type == ScriptType::Module) {
+    if ((m_script_type == ScriptType::Classic && has_attribute_ns({}, HTML::AttributeNames::src)) || m_script_type == ScriptType::Module) {
         // 1. Assert: el's result is "uninitialized".
         // FIXME: I believe this step to be a spec bug, and it should be removed: https://github.com/whatwg/html/issues/8534
 
@@ -578,7 +577,7 @@ void HTMLScriptElement::prepare_script()
             m_steps_to_run_when_the_result_is_ready = [this] {
                 auto& scripts = m_preparation_time_document->scripts_to_execute_in_order_as_soon_as_possible();
                 // 1. If scripts[0] is not el, then abort these steps.
-                if (scripts[0] != this)
+                if (scripts[0].ptr() != this)
                     return;
 
                 // 2. While scripts is not empty, and scripts[0]'s result is not "uninitialized":

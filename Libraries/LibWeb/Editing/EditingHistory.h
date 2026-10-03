@@ -11,8 +11,8 @@
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
-#include <LibWeb/Page/EventResult.h>
 #include <LibWeb/TextAffinity.h>
+#include <LibWebCommon/Page/EventResult.h>
 
 namespace Web::Editing {
 
@@ -139,7 +139,7 @@ class EditingHistory final : public JS::Cell {
     GC_DECLARE_ALLOCATOR(EditingHistory);
 
 public:
-    [[nodiscard]] static GC::Ref<EditingHistory> create(JS::Realm&);
+    [[nodiscard]] static GC::Ref<EditingHistory> create();
 
     // The undo step for the editing command currently executing, if any. DOM mutations made
     // through the Editing proxy functions are recorded onto this step.

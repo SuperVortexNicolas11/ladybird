@@ -21,6 +21,7 @@
 #include <LibJS/RustIntegration.h>
 #include <LibJS/Script.h>
 #include <LibJS/SourceTextModule.h>
+#include <LibMain/Main.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
@@ -221,10 +222,10 @@ static ErrorOr<void, TestError> run_test(StringView source, StringView filepath,
 
     auto root_execution_context = MUST(JS::Realm::initialize_host_defined_realm(
         *vm,
-        [&](JS::Realm& realm_) -> JS::GlobalObject* {
+        [&](JS::Realm& realm_) -> GC::Ref<JS::Object> {
             realm = &realm_;
             global_object = vm->heap().allocate<JS::Test262::GlobalObject>(realm_);
-            return global_object;
+            return global_object.as_nonnull();
         },
         nullptr));
 
@@ -590,13 +591,8 @@ constexpr int exit_stdout_setup_failed = 1;
 constexpr int exit_setup_input_failure = 7;
 constexpr int exit_read_file_failure = 3;
 
-int main(int argc, char** argv)
+ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
-    Vector<StringView> arguments;
-    arguments.ensure_capacity(argc);
-    for (auto i = 0; i < argc; ++i)
-        arguments.append({ argv[i], strlen(argv[i]) });
-
     int timeout = 10;
     bool enable_debug_printing = false;
     bool disable_core_dumping = false;

@@ -6,40 +6,48 @@
 
 #include <AK/LexicalPath.h>
 #include <LibCore/ArgsParser.h>
+#include <LibCore/CrashHandler.h>
+#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/LocalServer.h>
+#include <LibCore/Platform/TaskRole.h>
+#include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
 #include <LibCore/Resource.h>
 #include <LibCore/System.h>
 #include <LibCore/TimeZone.h>
+#include <LibCrypto/OpenSSL.h>
 #include <LibCrypto/OpenSSLForward.h>
 #include <LibGfx/Font/FontDatabase.h>
-#include <LibGfx/Font/PathFontProvider.h>
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibMain/Main.h>
+#include <LibMediaClient/Client.h>
 #include <LibRequests/RequestClient.h>
+#include <LibSandbox/ConnectBroker.h>
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
-#include <LibWeb/HTML/UniversalGlobalScope.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/Internals/Internals.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
-#include <LibWeb/Platform/FontPlugin.h>
-#include <LibWeb/WebIDL/Tracing.h>
-#include <LibWebView/Plugins/ImageCodecPlugin.h>
-#include <LibWebView/SiteIsolation.h>
-#include <LibWebView/Utilities.h>
+#include <LibWeb/Platform/RemoteImageCodecPlugin.h>
+#include <LibWebCommon/WebView/Utilities.h>
 #include <Services/RendererSandbox.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/WebContentCompositorHost.h>
 #include <WebContent/WebDriverConnection.h>
+
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+#    include <LibWasm/Types.h>
+#    include <LibWasmCompilerClient/State.h>
+#endif
 
 #include <openssl/thread.h>
 
@@ -130,32 +138,28 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
 
-    auto config_path = WebView::s_ladybird_resource_root;
-    StringView cache_path;
     StringView mach_server_name {};
     Vector<ByteString> certificates;
+    int crash_report_fd = -1;
+    int connect_broker_fd = -1;
     bool enable_test_mode = false;
     bool expose_experimental_interfaces = false;
     bool expose_internals_object = false;
     bool wait_for_debugger = false;
     bool log_all_js_exceptions = false;
-    auto site_isolation_mode = WebView::SiteIsolationMode::TopLevel;
-    bool enable_idl_tracing = false;
     bool enable_http_memory_cache = false;
     bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
     bool is_headless = false;
     bool disable_scrollbar_painting = false;
-    bool disable_async_scrolling = false;
     bool disable_sandbox = false;
     StringView echo_server_port_string_view {};
     StringView default_time_zone {};
-    StringView style_invalidation_counter_dump_interval {};
     bool file_origins_are_tuple_origins = false;
 
     Core::ArgsParser args_parser;
-    args_parser.add_option(config_path, "Ladybird configuration path", "config-path", 0, "config_path");
-    args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
+    args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
+    args_parser.add_option(connect_broker_fd, "Descriptor for the sandbox connection broker", "connect-broker-fd", 0, "fd");
     args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
     args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
     args_parser.add_option(expose_internals_object, "Expose internals object", "expose-internals-object");
@@ -163,70 +167,50 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
     args_parser.add_option(log_all_js_exceptions, "Log all JavaScript exceptions", "log-all-js-exceptions");
-    args_parser.add_option(Core::ArgsParser::Option {
-        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
-        .help_string = "Set site isolation mode. Mode may be 'disable', 'top-level' (default), or 'iframe'.",
-        .long_name = "site-isolation",
-        .value_name = "mode",
-        .accept_value = [&](StringView value) {
-            auto parsed_mode = WebView::site_isolation_mode_from_string(value);
-            if (!parsed_mode.has_value())
-                return false;
-
-            site_isolation_mode = *parsed_mode;
-            return true;
-        },
-    });
-    args_parser.add_option(enable_idl_tracing, "Enable IDL tracing", "enable-idl-tracing");
     args_parser.add_option(enable_http_memory_cache, "Enable HTTP cache", "enable-http-memory-cache");
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation");
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical viewport scrollbars", "disable-scrollbar-painting");
-    args_parser.add_option(disable_async_scrolling, "Disable async scrolling", "disable-async-scrolling");
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
     args_parser.add_option(echo_server_port_string_view, "Echo server port used in test internals", "echo-server-port", 0, "echo_server_port");
     args_parser.add_option(is_headless, "Report that the browser is running in headless mode", "headless");
     args_parser.add_option(default_time_zone, "Default time zone", "default-time-zone", 0, "time-zone-id");
-    args_parser.add_option(style_invalidation_counter_dump_interval, "Dump style invalidation counters after every N style invalidations", "dump-style-invalidation-counters", 0, "N");
     args_parser.add_option(file_origins_are_tuple_origins, "Treat file:// URLs as having tuple origins", "tuple-file-origins");
 
     args_parser.parse(arguments);
 
+    if (crash_report_fd >= 0) {
+        if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
+            warnln("Could not install crash report handler: {}", result.error());
+    }
+
     if (wait_for_debugger) {
         Core::Process::wait_for_debugger_and_break();
     }
+
+    if (auto result = Core::Platform::adopt_foreground_application_task_role(); result.is_error())
+        warnln("Could not adopt the foreground application task role: {}", result.error());
+    // Match the UI process, but let its main thread win a tie, as WebKit does for its WebContent process.
+    if (auto result = Core::Platform::set_current_thread_qos(Core::Platform::ThreadQoS::UserInteractive, -1); result.is_error())
+        warnln("Could not set main thread QoS: {}", result.error());
 
     if (!default_time_zone.is_empty()) {
         if (auto result = Core::TimeZone::set_current_time_zone(default_time_zone); result.is_error())
             dbgln("Failed to set default time zone: {}", result.error());
     }
 
-    if (!style_invalidation_counter_dump_interval.is_empty()) {
-        auto interval = style_invalidation_counter_dump_interval.to_number<u64>();
-        if (!interval.has_value() || *interval == 0)
-            VERIFY_NOT_REACHED();
-        Web::DOM::Document::set_style_invalidation_counter_dump_interval(*interval);
-    }
-
     if (file_origins_are_tuple_origins)
         URL::set_file_scheme_urls_have_tuple_origins();
 
-    auto& font_provider = static_cast<Gfx::PathFontProvider&>(Gfx::FontDatabase::the().install_system_font_provider(make<Gfx::PathFontProvider>()));
-    if (force_fontconfig) {
-        font_provider.set_name_but_fixme_should_create_custom_system_font_provider("FontConfig"_string);
+    if (force_fontconfig)
         Gfx::FontDatabase::the().set_force_freetype_rasterization(true);
-    }
-    font_provider.load_all_fonts_from_uri("resource://fonts"sv);
 
     WebContent::PageClient::set_is_headless(is_headless);
-
-    WebView::set_site_isolation_mode(site_isolation_mode);
 
     if (enable_http_memory_cache)
         Web::Fetch::Fetching::set_http_memory_cache_enabled(true);
 
     Web::Painting::set_paint_viewport_scrollbars(!disable_scrollbar_painting);
-    WebContent::PageClient::set_async_scrolling_enabled(!disable_async_scrolling);
 
     if (!echo_server_port_string_view.is_empty()) {
         if (auto maybe_echo_server_port = echo_server_port_string_view.to_number<u16>(); maybe_echo_server_port.has_value())
@@ -239,11 +223,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Web::HTML::Window::set_enable_test_mode(enable_test_mode);
     Web::HTML::Window::set_internals_object_exposed(expose_internals_object);
-    Web::HTML::UniversalGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
+    Web::HTML::WindowOrWorkerGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
 
-    Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(enable_test_mode, &font_provider));
-
-    Web::Bindings::initialize_main_thread_vm(Web::Bindings::AgentType::SimilarOriginWindow);
+    Web::Bindings::initialize_main_thread_vm(Web::HTML::AgentType::SimilarOriginWindow);
 
     if (collect_garbage_on_every_allocation)
         Web::Bindings::main_thread_vm().heap().set_should_collect_on_every_allocation(true);
@@ -252,20 +234,21 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         JS::set_log_all_js_exceptions(true);
     }
 
-    if (enable_idl_tracing) {
-        Web::WebIDL::set_enable_idl_tracing(true);
-    }
+#if defined(AK_OS_LINUX)
+    if (connect_broker_fd != -1)
+        Sandbox::set_connect_broker_fd(connect_broker_fd);
+#endif
 
     if (!disable_sandbox)
-        TRY(RendererSandbox::apply_sandbox(config_path, cache_path));
+        TRY(RendererSandbox::apply_sandbox(mach_server_name, RendererSandbox::AudioAccess::Yes));
 
 #if defined(AK_OS_MACOS)
     auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));
     auto transport_ports = TRY(IPC::bootstrap_transport_from_server_port(browser_port));
     auto webcontent_client = WebContent::ConnectionFromClient::construct(
-        make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)));
+        make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)), enable_test_mode);
 #else
-    auto webcontent_client = TRY(IPC::take_over_accepted_client_from_system_server<WebContent::ConnectionFromClient>(mach_server_name));
+    auto webcontent_client = TRY(IPC::take_over_accepted_client_from_system_server<WebContent::ConnectionFromClient>(mach_server_name, enable_test_mode));
 #endif
 
     auto& heap = Web::Bindings::main_thread_vm().heap();
@@ -277,6 +260,20 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         if (auto result = connect_to_image_decoder(handle); result.is_error())
             dbgln("Failed to connect to image decoder: {}", result.error());
     };
+
+    MediaClient::Client::set_transport_factory([webcontent_client] {
+        return webcontent_client->request_media_server_transport();
+    });
+
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    Wasm::set_cranelift_compile_callback([](Core::AnonymousBuffer const& buffer) {
+        return WasmCompilerClient::compiler_state().compile(buffer);
+    });
+
+    webcontent_client->on_wasm_compiler_connection = [](auto handle) {
+        WasmCompilerClient::compiler_state().replace_connection(move(handle));
+    };
+#endif
 
     return event_loop.exec();
 }
@@ -305,8 +302,8 @@ ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle)
     new_client->transport().set_peer_pid(response->peer_pid());
 #endif
     if (Web::Platform::ImageCodecPlugin::is_initialized())
-        static_cast<WebView::ImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
+        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
     else
-        Web::Platform::ImageCodecPlugin::install(*new WebView::ImageCodecPlugin(move(new_client)));
+        Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(move(new_client)));
     return {};
 }

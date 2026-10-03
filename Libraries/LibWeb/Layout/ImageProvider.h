@@ -11,7 +11,7 @@
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Size.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/PixelUnits.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::Layout {
 
@@ -44,8 +44,8 @@ public:
 
     virtual void layout_node_was_detached() const { }
 
-protected:
-    static void did_update_alt_text(ImageBox&);
+    virtual Layout::Node const* image_provider_layout_node() const = 0;
+    void image_provider_contents_changed() const;
 };
 
 }

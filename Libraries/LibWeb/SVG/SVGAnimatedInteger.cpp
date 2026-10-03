@@ -6,9 +6,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGAnimatedInteger.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGAnimatedInteger.h>
 
 namespace Web::SVG {
@@ -16,26 +15,23 @@ namespace Web::SVG {
 GC_DEFINE_ALLOCATOR(SVGAnimatedInteger);
 
 GC::Ref<SVGAnimatedInteger> SVGAnimatedInteger::create(
-    JS::Realm& realm,
     GC::Ref<SVGElement> element,
     DOM::QualifiedName reflected_attribute,
     WebIDL::Long initial_value,
     SupportsSecondValue supports_second_value,
     ValueRepresented value_represented)
 {
-    return realm.create<SVGAnimatedInteger>(realm, element, move(reflected_attribute), initial_value,
+    return GC::Heap::the().allocate<SVGAnimatedInteger>(element, move(reflected_attribute), initial_value,
         supports_second_value, value_represented);
 }
 
 SVGAnimatedInteger::SVGAnimatedInteger(
-    JS::Realm& realm,
     GC::Ref<SVGElement> element,
     DOM::QualifiedName reflected_attribute,
     WebIDL::Long initial_value,
     SupportsSecondValue supports_second_value,
     ValueRepresented value_represented)
-    : PlatformObject(realm)
-    , m_element(element)
+    : m_element(element)
     , m_reflected_attribute(move(reflected_attribute))
     , m_initial_value(initial_value)
     , m_supports_second_value(supports_second_value)
@@ -114,7 +110,7 @@ WebIDL::Long SVGAnimatedInteger::anim_val() const
 
 WebIDL::Long SVGAnimatedInteger::parse_value_or_initial(Utf16View number_value) const
 {
-    auto value = AttributeParser::parse_integer(number_value);
+    auto value = parse_integer(number_value);
     if (!value.has_value())
         return m_initial_value;
     return value.release_value();
@@ -151,13 +147,7 @@ WebIDL::Long SVGAnimatedInteger::get_base_or_anim_value() const
     return parse_value_or_initial(value);
 }
 
-void SVGAnimatedInteger::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGAnimatedInteger);
-    Base::initialize(realm);
-}
-
-void SVGAnimatedInteger::visit_edges(Visitor& visitor)
+void SVGAnimatedInteger::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_element);

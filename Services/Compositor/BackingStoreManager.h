@@ -8,13 +8,15 @@
 
 #include <AK/Noncopyable.h>
 #include <AK/Optional.h>
+#include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Types.h>
 #include <AK/Vector.h>
+#include <LibCompositing/Types.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/SharedImage.h>
+#include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/Size.h>
-#include <LibWeb/Compositor/Types.h>
 
 namespace Compositor {
 
@@ -45,17 +47,22 @@ public:
     BackingStoreManager() = default;
 
     Optional<Allocation> resize_backing_stores_if_needed(
-        Gfx::IntSize viewport_size, Web::Compositor::WindowResizingInProgress);
+        Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress, bool should_publish);
     Optional<Publication> allocate_backing_stores(Allocation const&, RefPtr<Gfx::SkiaBackendContext> const&, bool should_publish, GpuSharing);
 
     void invalidate() { m_allocated_size = {}; }
 
     bool is_valid() const;
+    bool is_rendering() const { return m_rendering_store_index.has_value(); }
     bool has_available_buffer() const;
     Optional<RenderTarget> acquire_render_target(Gfx::IntRect frame_damage);
     void complete_rendering(i32 bitmap_id, bool release_to_external);
     bool release_buffer(i32 bitmap_id);
     RefPtr<Gfx::PaintingSurface> latest_rendered_surface() const;
+
+    Optional<Publication> add_backing_store_if_window_server_still_reads_every_released_store(RefPtr<Gfx::SkiaBackendContext> const&);
+    bool has_surplus_backing_stores() const { return m_backing_stores.size() > m_initial_backing_store_count; }
+    Vector<i32> retire_idle_surplus_backing_stores();
 
 private:
     enum class BufferState : u8 {
@@ -66,15 +73,27 @@ private:
 
     struct BackingStore {
         RefPtr<Gfx::PaintingSurface> surface;
+        OwnPtr<Gfx::SharedImageBuffer> published_shared_image_buffer;
         i32 bitmap_id { -1 };
         BufferState state { BufferState::Available };
         Gfx::IntRect accumulated_damage;
+        bool was_presented_to_client { false };
+        bool was_rendered_into_since_last_retirement_check { false };
     };
+
+    static constexpr size_t maximum_backing_store_count = 8;
+
+    static BackingStore create_published_shareable_backing_store(Gfx::IntSize, i32 bitmap_id, BufferState, RefPtr<Gfx::SkiaBackendContext> const&);
+    static bool published_surface_is_in_use(BackingStore const&);
+    static bool store_can_be_rendered_into(BackingStore const&);
 
     int m_next_bitmap_id { 0 };
 
     // Used to track if backing stores need reallocation
     Gfx::IntSize m_allocated_size;
+
+    Gfx::IntSize m_backing_store_size;
+    size_t m_initial_backing_store_count { 0 };
     Vector<BackingStore> m_backing_stores;
     Optional<size_t> m_rendering_store_index;
     Optional<size_t> m_latest_rendered_store_index;

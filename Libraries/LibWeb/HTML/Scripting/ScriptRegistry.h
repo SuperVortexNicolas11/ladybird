@@ -10,46 +10,39 @@
 #include <AK/HashFunctions.h>
 #include <AK/HashMap.h>
 #include <AK/Optional.h>
+#include <AK/Span.h>
 #include <AK/Types.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <AK/Variant.h>
 #include <LibIPC/Forward.h>
 #include <LibJS/Forward.h>
+#include <LibJS/Position.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibWebCommon/HTML/Scripting/ScriptRegistryTypes.h>
 
 namespace Web::HTML {
 
 class WEB_API ScriptRegistry {
 public:
-    struct Content {
-        Utf16String content_type;
-        Utf16String text;
-    };
+    using Content = ScriptRegistryContent;
 
-    struct Identifier {
-        UniqueNodeID document_id;
-        u64 script_id { 0 };
+    using Identifier = ScriptRegistryIdentifier;
 
-        bool operator==(Identifier const&) const = default;
-    };
-
-    struct Description {
-        Identifier id;
-        Optional<URL::URL> url;
-        Utf16String display_url;
-        Utf16String introduction_type;
-        Utf16String content_type;
-        bool is_inline_source { false };
-        u32 source_start_line { 1 };
-        u32 source_start_column { 0 };
-        size_t source_length { 0 };
-    };
+    using Description = ScriptRegistryDescription;
 
     struct JavaScriptSource {
+        enum class Type : u8 {
+            Script,
+            Module,
+        };
+
         NonnullRefPtr<JS::SourceCode const> source_code;
+        Type type { Type::Script };
+        size_t line_number_offset { 1 };
+        mutable Optional<Vector<JS::Position>> breakpoint_positions;
     };
 
     using ContentHandle = Variant<JavaScriptSource>;
@@ -64,49 +57,17 @@ public:
         ContentHandle content;
     };
 
-    Script const& register_javascript_source(NonnullRefPtr<JS::SourceCode const>, ByteString const& filename, Utf16String display_url, Utf16String introduction_type, IsInlineSource, size_t source_line_number, size_t source_length);
+    Script const& register_javascript_source(NonnullRefPtr<JS::SourceCode const>, JavaScriptSource::Type, ByteString const& filename, Utf16String display_url, Utf16String introduction_type, IsInlineSource, size_t source_line_number, size_t source_length);
 
     OrderedHashMap<u64, Script> const& scripts() const { return m_scripts; }
+    Optional<Script const&> script_for_source_code(JS::SourceCode const&) const;
+    Optional<NonnullRefPtr<JS::SourceCode const>> source_code(u64 script_id) const;
     Optional<Content> script_content(u64 script_id, Utf16View document_source) const;
+    ReadonlySpan<JS::Position> breakpoint_positions(u64 script_id) const;
 
 private:
     OrderedHashMap<u64, Script> m_scripts;
     u64 m_next_script_id { 1 };
 };
-
-}
-
-template<>
-struct AK::Traits<Web::HTML::ScriptRegistry::Identifier> : public AK::DefaultTraits<Web::HTML::ScriptRegistry::Identifier> {
-    static bool equals(Web::HTML::ScriptRegistry::Identifier const& lhs, Web::HTML::ScriptRegistry::Identifier const& rhs)
-    {
-        return lhs == rhs;
-    }
-
-    static unsigned hash(Web::HTML::ScriptRegistry::Identifier const& identifier)
-    {
-        return pair_int_hash(identifier.document_id.value(), identifier.script_id);
-    }
-};
-
-namespace IPC {
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::ScriptRegistry::Identifier const&);
-
-template<>
-WEB_API ErrorOr<Web::HTML::ScriptRegistry::Identifier> decode(Decoder&);
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::ScriptRegistry::Description const&);
-
-template<>
-WEB_API ErrorOr<Web::HTML::ScriptRegistry::Description> decode(Decoder&);
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::ScriptRegistry::Content const&);
-
-template<>
-WEB_API ErrorOr<Web::HTML::ScriptRegistry::Content> decode(Decoder&);
 
 }

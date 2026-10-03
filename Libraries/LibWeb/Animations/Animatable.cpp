@@ -10,27 +10,56 @@
 #include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/Animations/PseudoElementParsing.h>
 #include <LibWeb/CSS/CSSAnimation.h>
+#include <LibWeb/CSS/CSSAnimationProperties.h>
 #include <LibWeb/CSS/CSSTransition.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
+#include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/StyleValueRustFFI.h>
 
 namespace Web::Animations {
 
 struct Animatable::Transition {
-    HashMap<CSS::PropertyID, size_t> transition_attribute_indices;
-    Vector<TransitionAttributes> transition_attributes;
+    AK_ALLOC_WITH_KMALLOC;
+
     HashMap<CSS::PropertyID, GC::Ref<CSS::CSSTransition>> associated_transitions;
 };
 
 Animatable::Impl::~Impl() = default;
 
+static WebIDL::ExceptionOr<Animatable::GetAnimationsOptions> get_animations_options_from_bindings(Bindings::GetAnimationsOptions const& options)
+{
+    Animatable::GetAnimationsOptions converted_options;
+    converted_options.subtree = options.subtree;
+    if (options.pseudo_element.has_value())
+        converted_options.pseudo_element = TRY(pseudo_element_parsing(options.pseudo_element));
+    return converted_options;
+}
+
+static WebIDL::ExceptionOr<Animatable::KeyframeAnimationOptions> keyframe_animation_options_from_bindings(Bindings::KeyframeAnimationOptions const& options)
+{
+    auto effect_options = TRY(keyframe_effect_options_from_bindings(options));
+    Animatable::KeyframeAnimationOptions converted_options;
+    static_cast<KeyframeEffect::Options&>(converted_options) = move(effect_options);
+    converted_options.id = options.id;
+    converted_options.timeline = options.timeline;
+    return converted_options;
+}
+
+static WebIDL::ExceptionOr<Variant<double, Animatable::KeyframeAnimationOptions>> keyframe_animation_options_from_bindings(Variant<double, Bindings::KeyframeAnimationOptions> const& options)
+{
+    if (options.has<double>())
+        return options.get<double>();
+    return TRY(keyframe_animation_options_from_bindings(options.get<Bindings::KeyframeAnimationOptions>()));
+}
+
 // https://www.w3.org/TR/web-animations-1/#dom-animatable-animate
-WebIDL::ExceptionOr<GC::Ref<Animation>> Animatable::animate(GC::Ptr<JS::Object> keyframes, Variant<Empty, double, Bindings::KeyframeAnimationOptions> const& options)
+WebIDL::ExceptionOr<GC::Ref<Animation>> Animatable::animate(Vector<BaseKeyframe> keyframes, Variant<double, KeyframeAnimationOptions> const& options)
 {
     // 1. Let target be the object on which this method was called.
     GC::Ref target { *static_cast<DOM::Element*>(this) };
-    auto& realm = target->realm();
 
     // 2. Construct a new KeyframeEffect object, effect, in the relevant Realm of target by using the same procedure as
     //    the KeyframeEffect(target, keyframes, options) constructor, passing target as the target argument, and the
@@ -38,26 +67,25 @@ WebIDL::ExceptionOr<GC::Ref<Animation>> Animatable::animate(GC::Ptr<JS::Object> 
     //
     //    If the above procedure causes an exception to be thrown, propagate the exception and abort this procedure.
     auto effect = TRY(options.visit(
-        [&](Empty) { return KeyframeEffect::construct_impl(realm, target, keyframes); },
-        [&](auto const& value) { return KeyframeEffect::construct_impl(realm, target, keyframes, value); }));
+        [&](auto const& value) { return KeyframeEffect::create_from_processed_keyframes(target, move(keyframes), value); }));
 
     // 3. If options is a KeyframeAnimationOptions object, let timeline be the timeline member of options or, if
     //    timeline member of options is missing, be the default document timeline of the node document of the element
     //    on which this method was called.
     Optional<GC::Ptr<AnimationTimeline>> timeline;
-    if (options.has<Bindings::KeyframeAnimationOptions>() && options.get<Bindings::KeyframeAnimationOptions>().timeline.has_value())
-        timeline = options.get<Bindings::KeyframeAnimationOptions>().timeline.value();
+    if (options.has<KeyframeAnimationOptions>() && options.get<KeyframeAnimationOptions>().timeline.has_value())
+        timeline = options.get<KeyframeAnimationOptions>().timeline.value();
     if (!timeline.has_value())
         timeline = target->document().timeline();
 
     // 4. Construct a new Animation object, animation, in the relevant Realm of target by using the same procedure as
     //    the Animation() constructor, passing effect and timeline as arguments of the same name.
-    auto animation = Animation::create(realm, effect, move(timeline));
+    auto animation = Animation::create(target->document().relevant_settings_object(), effect, timeline.release_value());
 
     // 5. If options is a KeyframeAnimationOptions object, assign the value of the id member of options to animation’s
     //    id attribute.
-    if (options.has<Bindings::KeyframeAnimationOptions>())
-        animation->set_id(options.get<Bindings::KeyframeAnimationOptions>().id);
+    if (options.has<KeyframeAnimationOptions>())
+        animation->set_id(options.get<KeyframeAnimationOptions>().id);
 
     //  6. Run the procedure to play an animation for animation with the auto-rewind flag set to true.
     TRY(animation->play_an_animation(Animation::AutoRewind::Yes));
@@ -66,29 +94,34 @@ WebIDL::ExceptionOr<GC::Ref<Animation>> Animatable::animate(GC::Ptr<JS::Object> 
     return animation;
 }
 
+WebIDL::ExceptionOr<GC::Ref<Animation>> Animatable::animate(JS::Realm& realm, GC::Ptr<JS::Object> keyframes, Variant<double, Bindings::KeyframeAnimationOptions> const& options)
+{
+    auto animation = TRY(animate(TRY(process_keyframes(realm, keyframes)), TRY(keyframe_animation_options_from_bindings(options))));
+
+    return animation;
+}
+
 // https://drafts.csswg.org/web-animations-1/#dom-animatable-getanimations
-WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations(Optional<Bindings::GetAnimationsOptions> const& options)
+WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations(GetAnimationsOptions const& options)
 {
     as<DOM::Element>(*this).document().update_style();
+
     return get_animations_internal(GetAnimationsSorted::Yes, options);
 }
 
-WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations_internal(GetAnimationsSorted sorted, Optional<Bindings::GetAnimationsOptions> const& options)
+WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations(Bindings::GetAnimationsOptions const& options)
+{
+    return get_animations(TRY(get_animations_options_from_bindings(options)));
+}
+
+WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations_internal(GetAnimationsSorted sorted, GetAnimationsOptions const& options)
 {
     // 1. Let object be the object on which this method was called.
-
-    // 2. Let pseudoElement be the result of pseudo-element parsing applied to pseudoElement of options, or null if options is not passed.
-    // FIXME: Currently only DOM::Element includes Animatable, but that might not always be true.
-    Optional<CSS::Selector::PseudoElementSelector> pseudo_element;
-    if (options.has_value() && options->pseudo_element.has_value()) {
-        auto& realm = static_cast<DOM::Element&>(*this).realm();
-        pseudo_element = TRY(pseudo_element_parsing(realm, options->pseudo_element));
-    }
 
     // 3. If pseudoElement is not null, then let target be the pseudo-element identified by pseudoElement with object as the originating element.
     //    Otherwise, let target be object.
     // FIXME: We can't refer to pseudo-elements directly, and they also can't be animated yet.
-    (void)pseudo_element;
+    (void)options.pseudo_element;
     GC::Ref target { *static_cast<DOM::Element*>(this) };
 
     // 4. If options is passed with subtree set to true, then return the set of relevant animations for a subtree of target.
@@ -102,8 +135,7 @@ WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations_inter
         }
     }
 
-    if (options.has_value() && options->subtree) {
-        Optional<WebIDL::Exception> exception;
+    if (options.subtree) {
         TRY(target->for_each_child_of_type_fallible<DOM::Element>([&](auto& child) -> WebIDL::ExceptionOr<IterationDecision> {
             relevant_animations.extend(TRY(child.get_animations_internal(GetAnimationsSorted::No, options)));
             return IterationDecision::Continue;
@@ -123,6 +155,40 @@ WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations_inter
     return relevant_animations;
 }
 
+ReadonlySpan<GC::Ref<Animation>> Animatable::associated_animations_in_composite_order()
+{
+    if (!m_impl)
+        return {};
+
+    if (!m_impl->is_sorted_by_composite_order) {
+        quick_sort(m_impl->associated_animations, [](auto const& a, auto const& b) {
+            auto a_effect = a->effect();
+            auto b_effect = b->effect();
+            bool a_is_keyframe_effect = a_effect && is<KeyframeEffect>(*a_effect);
+            bool b_is_keyframe_effect = b_effect && is<KeyframeEffect>(*b_effect);
+            if (a_is_keyframe_effect && b_is_keyframe_effect)
+                return KeyframeEffect::composite_order(static_cast<KeyframeEffect&>(*a_effect), static_cast<KeyframeEffect&>(*b_effect)) < 0;
+            if (a_is_keyframe_effect != b_is_keyframe_effect)
+                return !a_is_keyframe_effect;
+            return a->global_animation_list_order() < b->global_animation_list_order();
+        });
+        m_impl->is_sorted_by_composite_order = true;
+    }
+
+    return m_impl->associated_animations.span();
+}
+
+void Animatable::invalidate_associated_animation_composite_order()
+{
+    if (m_impl)
+        m_impl->is_sorted_by_composite_order = false;
+}
+
+bool Animatable::has_associated_animations() const
+{
+    return m_impl && !m_impl->associated_animations.is_empty();
+}
+
 bool Animatable::has_relevant_animations() const
 {
     if (!m_impl)
@@ -136,19 +202,44 @@ bool Animatable::has_relevant_animations() const
     return false;
 }
 
+bool Animatable::has_relevant_animations_other_than_transitions() const
+{
+    if (!m_impl)
+        return false;
+
+    for (auto const& animation : m_impl->associated_animations) {
+        if (!animation->is_css_transition() && animation->is_relevant())
+            return true;
+    }
+
+    return false;
+}
+
 void Animatable::associate_with_animation(GC::Ref<Animation> animation)
 {
     auto& impl = ensure_impl();
+    if (impl.associated_animations.contains_slow(animation))
+        return;
     impl.associated_animations.append(animation);
     impl.is_sorted_by_composite_order = false;
+    // The style engine computes no record for an element whose animations compose its style.
+    CSS::record_element_adjustment_facts(as<DOM::Element>(*this));
+
+    as<DOM::Element>(*this).change_associated_animation_count_in_subtree(1);
 
     as<DOM::Element>(*this).document().associate_with_animation(animation);
+    animation->did_associate_with_target();
 }
 
 void Animatable::disassociate_with_animation(GC::Ref<Animation> animation)
 {
     auto& impl = *m_impl;
-    impl.associated_animations.remove_first_matching([&](auto element) { return animation == element; });
+    auto was_associated = impl.associated_animations.remove_first_matching([&](auto element) { return animation == element; });
+    impl.is_sorted_by_composite_order = false;
+    CSS::record_element_adjustment_facts(as<DOM::Element>(*this));
+
+    if (was_associated)
+        as<DOM::Element>(*this).change_associated_animation_count_in_subtree(-1);
 
     as<DOM::Element>(*this).document().disassociate_with_animation(animation);
 }
@@ -164,46 +255,99 @@ void Animatable::on_document_changed(DOM::Document& old_document, DOM::Document&
     }
 }
 
-void Animatable::add_transitioned_properties(Optional<CSS::PseudoElement> pseudo_element, Vector<CSS::TransitionProperties> const& transitions)
+// The computation of an element's animation definitions matches them against the animations the
+// element already has, so the names of those animations are an input to it, and so is the definition
+// each one last had applied: a plan that would apply the same again changes nothing.
+static void publish_css_defined_animations(Animatable& animatable, size_t index, Vector<GC::Ref<CSS::CSSAnimation>> const& animations)
 {
-    auto* maybe_transition = ensure_transition(pseudo_element);
-    if (!maybe_transition)
+    auto* element = as_if<DOM::Element>(animatable);
+    if (!element)
         return;
 
-    auto& transition = *maybe_transition;
-    for (size_t i = 0; i < transitions.size(); i++) {
-        size_t index_of_this_transition = transition.transition_attributes.size();
-        transition.transition_attributes.empend(transitions[i].delay, transitions[i].duration, transitions[i].timing_function, transitions[i].transition_behavior);
-
-        for (auto const& property : transitions[i].properties)
-            transition.transition_attribute_indices.set(property, index_of_this_transition);
+    Vector<Utf16FlyString> names;
+    Vector<CSS::StyleEngineFFI::FfiAppliedAnimationDefinition> definitions;
+    names.ensure_capacity(animations.size());
+    definitions.ensure_capacity(animations.size());
+    for (auto const& animation : animations) {
+        names.unchecked_append(animation->animation_name());
+        definitions.unchecked_append(animation->applied_definition());
     }
+    CSS::record_element_css_defined_animations(*element, static_cast<u8>(index), names, definitions);
 }
 
+void Animatable::cancel_css_animations_and_transitions()
+{
+    if (!m_impl)
+        return;
+
+    GC::RootVector<GC::Ref<Animation>> animations_to_cancel;
+    for (size_t index = 0; index < m_impl->css_defined_animations.size(); ++index) {
+        auto& animations = m_impl->css_defined_animations[index];
+        if (!animations || animations->is_empty())
+            continue;
+        for (auto& animation : *animations)
+            animations_to_cancel.append(animation);
+        animations->clear();
+        publish_css_defined_animations(*this, index, *animations);
+    }
+    for (auto& transition : m_impl->transitions) {
+        if (!transition)
+            continue;
+        for (auto& animation : transition->associated_transitions)
+            animations_to_cancel.append(animation.value);
+        transition->associated_transitions.clear();
+    }
+    m_impl->has_css_defined_animations = false;
+
+    for (auto& animation : animations_to_cancel)
+        animation->cancel(Animation::ShouldInvalidate::No);
+}
+
+static void const* installed_longhand_table(DOM::Element const& element, Optional<CSS::PseudoElement> pseudo_element)
+{
+    auto style_record = element.style_record_identity(pseudo_element);
+    if (!style_record)
+        return nullptr;
+    auto style = element.document().style_computer().style_engine().style_record_view(style_record);
+    return style.present ? style.longhand_table : nullptr;
+}
+
+// A declaration whose delay and duration are each the single value 0s starts nothing, so it gives no longhand a
+// matching entry unless the element already holds a transition, which such an entry could still cancel.
+bool Animatable::has_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element, void const* longhand_table) const
+{
+    if (!longhand_table)
+        return false;
+    if (CSS::StyleValueFFI::rust_transition_delay_and_duration_are_single_zero(longhand_table)
+        && property_ids_with_existing_transitions(pseudo_element).is_empty())
+        return false;
+    return CSS::StyleValueFFI::rust_transition_has_entries(longhand_table);
+}
+
+bool Animatable::has_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element) const
+{
+    return has_matching_transition_property_entry(pseudo_element, installed_longhand_table(static_cast<DOM::Element const&>(*this), pseudo_element));
+}
+
+// The longhands the element's installed style gives a matching transition-property entry, read from
+// the style's transition longhands.
 Vector<CSS::PropertyID> Animatable::property_ids_with_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element) const
 {
-    auto const* maybe_transition = ensure_transition(pseudo_element);
-
-    if (!maybe_transition)
+    auto const* longhand_table = installed_longhand_table(static_cast<DOM::Element const&>(*this), pseudo_element);
+    if (!has_matching_transition_property_entry(pseudo_element, longhand_table))
         return {};
-
-    return maybe_transition->transition_attribute_indices.keys();
-}
-
-Optional<Animatable::TransitionAttributes const&> Animatable::property_transition_attributes(Optional<CSS::PseudoElement> pseudo_element, CSS::PropertyID property) const
-{
-    auto* maybe_transition = ensure_transition(pseudo_element);
-    if (!maybe_transition)
-        return {};
-    auto& transition = *maybe_transition;
-    if (auto maybe_attr_index = transition.transition_attribute_indices.get(property); maybe_attr_index.has_value())
-        return transition.transition_attributes[maybe_attr_index.value()];
-    return {};
+    auto entries = CSS::StyleValueFFI::rust_transition_entries(longhand_table);
+    Vector<CSS::PropertyID> property_ids;
+    property_ids.ensure_capacity(entries.count);
+    for (auto const& entry : ReadonlySpan<CSS::StyleValueFFI::FfiTransitionEntry> { entries.entries, entries.count })
+        property_ids.unchecked_append(static_cast<CSS::PropertyID>(entry.property_id));
+    CSS::StyleValueFFI::rust_transition_entries_release(entries);
+    return property_ids;
 }
 
 Vector<CSS::PropertyID> Animatable::property_ids_with_existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const
 {
-    auto const* maybe_transition = ensure_transition(pseudo_element);
+    auto const* maybe_transition = transition_if_exists(pseudo_element);
 
     if (!maybe_transition)
         return {};
@@ -213,7 +357,7 @@ Vector<CSS::PropertyID> Animatable::property_ids_with_existing_transitions(Optio
 
 GC::Ptr<CSS::CSSTransition> Animatable::property_transition(Optional<CSS::PseudoElement> pseudo_element, CSS::PropertyID property) const
 {
-    auto* maybe_transition = ensure_transition(pseudo_element);
+    auto const* maybe_transition = transition_if_exists(pseudo_element);
     if (!maybe_transition)
         return {};
     auto& transition = *maybe_transition;
@@ -238,19 +382,10 @@ void Animatable::remove_transition(Optional<CSS::PseudoElement> pseudo_element, 
     if (!maybe_transition)
         return;
     auto& transition = *maybe_transition;
-    VERIFY(transition.associated_transitions.contains(property_id));
+    auto removed_transition = transition.associated_transitions.get(property_id);
+    VERIFY(removed_transition.has_value());
     transition.associated_transitions.remove(property_id);
-}
-
-void Animatable::clear_registered_transitions(Optional<CSS::PseudoElement> pseudo_element)
-{
-    auto maybe_transition = ensure_transition(pseudo_element);
-    if (!maybe_transition)
-        return;
-
-    auto& transition = *maybe_transition;
-    transition.transition_attribute_indices.clear();
-    transition.transition_attributes.clear();
+    removed_transition.value()->schedule_disassociation_from_target();
 }
 
 void Animatable::visit_edges(JS::Cell::Visitor& visitor)
@@ -281,6 +416,19 @@ bool Animatable::has_css_defined_animations() const
     return m_impl->has_css_defined_animations;
 }
 
+bool Animatable::has_css_animations_or_transitions() const
+{
+    if (!m_impl)
+        return false;
+    if (m_impl->has_css_defined_animations)
+        return true;
+    for (auto const& transition : m_impl->transitions) {
+        if (transition && !transition->associated_transitions.is_empty())
+            return true;
+    }
+    return false;
+}
+
 Vector<GC::Ref<CSS::CSSAnimation>> const* Animatable::css_defined_animations(Optional<CSS::PseudoElement> pseudo_element)
 {
     auto& impl = ensure_impl();
@@ -309,8 +457,18 @@ void Animatable::set_css_defined_animations(Optional<CSS::PseudoElement> pseudo_
                      .map([](CSS::PseudoElement pseudo_element_value) { return to_underlying(pseudo_element_value) + 1; })
                      .value_or(0);
 
+    // NB: The flag says the element has animations to play or cancel, not that it has been through
+    //     the step that would have registered some. Every element goes through that step, so setting
+    //     it here unconditionally made it true of every element that had computed a style once.
+    //     It stays set once any list is non-empty, since the lists are per pseudo-element and this
+    //     is one flag for all of them.
+    if (!animations.is_empty())
+        impl.has_css_defined_animations = true;
+    // NB: Every element goes through this step; one that had no animations and still has none has nothing to publish.
+    bool had_animations = impl.css_defined_animations[index] && !impl.css_defined_animations[index]->is_empty();
     impl.css_defined_animations[index] = make<Vector<GC::Ref<CSS::CSSAnimation>>>(move(animations));
-    impl.has_css_defined_animations = true;
+    if (had_animations || !impl.css_defined_animations[index]->is_empty())
+        publish_css_defined_animations(*this, index, *impl.css_defined_animations[index]);
 }
 
 Animatable::Impl& Animatable::ensure_impl() const
@@ -320,20 +478,35 @@ Animatable::Impl& Animatable::ensure_impl() const
     return *m_impl;
 }
 
+static Optional<size_t> transition_index_for_pseudo_element(Optional<CSS::PseudoElement> pseudo_element)
+{
+    if (!pseudo_element.has_value())
+        return 0;
+    if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value()))
+        return {};
+    return to_underlying(pseudo_element.value()) + 1;
+}
+
 Animatable::Transition* Animatable::ensure_transition(Optional<CSS::PseudoElement> pseudo_element) const
 {
+    auto pseudo_element_index = transition_index_for_pseudo_element(pseudo_element);
+    if (!pseudo_element_index.has_value())
+        return nullptr;
+
     auto& impl = ensure_impl();
+    if (!impl.transitions[*pseudo_element_index])
+        impl.transitions[*pseudo_element_index] = make<Transition>();
+    return impl.transitions[*pseudo_element_index];
+}
 
-    size_t pseudo_element_index = 0;
-    if (pseudo_element.has_value()) {
-        if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value()))
-            return nullptr;
-        pseudo_element_index = to_underlying(pseudo_element.value()) + 1;
-    }
-
-    if (!impl.transitions[pseudo_element_index])
-        impl.transitions[pseudo_element_index] = make<Transition>();
-    return impl.transitions[pseudo_element_index];
+Animatable::Transition const* Animatable::transition_if_exists(Optional<CSS::PseudoElement> pseudo_element) const
+{
+    if (!m_impl)
+        return nullptr;
+    auto pseudo_element_index = transition_index_for_pseudo_element(pseudo_element);
+    if (!pseudo_element_index.has_value())
+        return nullptr;
+    return m_impl->transitions[*pseudo_element_index];
 }
 
 }

@@ -18,8 +18,10 @@
 
 namespace URL::RustIntegration {
 
-Optional<URL> parse_basic_url(StringView input, Optional<URL const&> base_url = {}, URL* url = nullptr, Optional<Parser::State> state_override = {}, Optional<StringView> encoding = {});
 Optional<Host> parse_host(StringView input, bool is_opaque = false);
+Optional<Host> parse_host(Utf16View input, bool is_opaque = false);
+Optional<Host> host_from_ffi(FFI::FfiUrlHost const&);
+FFI::RustUrlInput rust_url_input(Utf16View);
 
 class URLPattern {
 public:
@@ -84,6 +86,8 @@ public:
 
 private:
     struct Impl {
+        AK_ALLOC_WITH_KMALLOC;
+
         FFI::RustUrlPattern* rust_url_pattern { nullptr };
         ~Impl();
     };

@@ -43,8 +43,9 @@
 //! These are the registers an `is_call=true` instruction kills (in addition
 //! to any explicitly listed clobbers). Pinned registers survive calls
 //! because they live in callee-saved slots. AArch64 pins its values base,
-//! x21 (ip cache), and x22-x24 (tag constants); x86-64 pins values and the
-//! shifted Int32 tag, and derives exec_ctx from values.
+//! x21 (ip cache), and x22-x23 (tag constants), plus x24 for the heap region
+//! base; x86-64 pins values and the heap region base, and derives exec_ctx
+//! from values.
 //!
 //! - x86_64: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11, xmm0-xmm5
 //! - aarch64: x0-x17, d0-d7
@@ -56,10 +57,9 @@
 
 use crate::Architecture;
 pub(crate) use crate::intrinsic::{
-    AssertionOperation, BranchOperation, CallOperation as CallKind, ControlOperation, EqualityCondition,
-    FloatBinaryOperation, FloatConversion, FloatUnaryOperation, FloatingPointOperation, IntegerBinaryOperation,
-    IntegerSignedness, IntegerWidth, MemoryOperation, MemoryWidth, PairWidth, SignCondition, TestCondition,
-    ZeroCondition,
+    BranchOperation, CallOperation as CallKind, ControlOperation, EqualityCondition, FloatBinaryOperation,
+    FloatConversion, FloatUnaryOperation, FloatingPointOperation, IntegerBinaryOperation, IntegerSignedness,
+    IntegerWidth, MemoryOperation, MemoryWidth, PairWidth, SignCondition, TestCondition, ZeroCondition,
 };
 use crate::target::ir::Operand;
 use crate::target::registers::{PhysicalRegister, RegisterClass, aarch64, x86_64};
@@ -162,7 +162,7 @@ pub(crate) enum Operation {
     Or32Branch(SignCondition),
     Negate,
     Not(IntegerWidth),
-    Modulo,
+    Modulo(IntegerWidth),
     Overflow(OverflowOperation),
     ExtractTag,
     UnboxInt32,
@@ -175,7 +175,9 @@ pub(crate) enum Operation {
     Float(FloatingPointOperation),
     FloatMove,
     Branch(BranchOperation),
-    Assertion(AssertionOperation),
+    AssertNonzero,
+    AssertBranch(BranchOperation),
+    AssertFailure,
 }
 
 impl Operation {
@@ -757,6 +759,8 @@ fn lookup_operation(operation: Operation) -> &'static InstructionDescription {
     use OverflowOperation::*;
 
     match operation {
+        Operation::AssertBranch(branch) => lookup_operation(Operation::Branch(branch)),
+        Operation::AssertFailure => &const { plain(&[Label]) },
         Operation::Cold => &const { plain(&[Label]) },
         Operation::Label => &const { plain(&[Label]) },
         Operation::Control(ControlOperation::JumpLabel) => &const { plain(&[Label]).terminal() },
@@ -811,6 +815,24 @@ fn lookup_operation(operation: Operation) -> &'static InstructionDescription {
                     .call()
                     .x86_64(spec().outputs(&[RAX]).fixed(&[(1, RAX)]))
                     .aarch64(spec().outputs(&[X0]).fixed(&[(1, X0)]))
+            }
+        }
+        Operation::Call(CallKind::HelperWithTwoArguments) => {
+            &const {
+                plain(&[FuncSymbol, GprIn, GprIn, GprOut])
+                    .call()
+                    .x86_64(
+                        spec()
+                            .inputs(&[RCX, RDX])
+                            .outputs(&[RAX])
+                            .fixed(&[(1, RCX), (2, RDX), (3, RAX)]),
+                    )
+                    .aarch64(
+                        spec()
+                            .inputs(&[X0, X1])
+                            .outputs(&[X0])
+                            .fixed(&[(1, X0), (2, X1), (3, X0)]),
+                    )
             }
         }
         Operation::Call(CallKind::RawNative) => {
@@ -875,10 +897,13 @@ fn lookup_operation(operation: Operation) -> &'static InstructionDescription {
             }
         }
         Operation::Move(U32) => &const { plain(&[GprOut, GprInOrImm]) },
-        Operation::ExtractTag | Operation::UnboxObject | Operation::BoxInt32 { clean: true } => {
-            &const { plain(&[GprOut, GprIn]).coalesces(&[(0, 1)]) }
+        Operation::ExtractTag => &const { plain(&[GprOut, GprIn]).coalesces(&[(0, 1)]) },
+        Operation::BoxInt32 { clean: true } => {
+            &const { plain(&[GprOut, GprIn]).coalesces(&[(0, 1)]).scratches(&[R11], &[]) }
         }
-        Operation::UnboxInt32 | Operation::BoxInt32 { clean: false } => &const { plain(&[GprOut, GprIn]) },
+        Operation::UnboxObject => &const { plain(&[GprOut, GprIn]).coalesces(&[(0, 1)]).scratches(&[R11], &[]) },
+        Operation::UnboxInt32 => &const { plain(&[GprOut, GprIn]) },
+        Operation::BoxInt32 { clean: false } => &const { plain(&[GprOut, GprIn]).scratches(&[R11], &[]) },
         Operation::IntegerBinary {
             operation: IntegerBinaryOperation::Binary(Add | Subtract | Or),
             width: U64,
@@ -944,7 +969,7 @@ fn lookup_operation(operation: Operation) -> &'static InstructionDescription {
                     .coalesces(&[(0, 1)])
             }
         }
-        Operation::Modulo => {
+        Operation::Modulo(_) => {
             &const {
                 plain(&[GprOut, GprIn, GprIn])
                     .x86_64(spec().outputs(&[RDX]).fixed(&[(0, RDX)]).scratches(&[RAX]))
@@ -988,8 +1013,11 @@ fn lookup_operation(operation: Operation) -> &'static InstructionDescription {
             }
         }
         Operation::Float(FloatingPointOperation::Convert(
-            FloatConversion::Int32ToFloat64 | FloatConversion::Uint32ToFloat64,
+            FloatConversion::Int32ToFloat64 | FloatConversion::Int64ToFloat64 | FloatConversion::Uint32ToFloat64,
         )) => &const { plain(&[FprOut, GprIn]) },
+        Operation::Float(FloatingPointOperation::Convert(FloatConversion::Float64ToInt64)) => {
+            &const { plain(&[GprOut, FprIn, Label]).scratches(&[XMM3], &[D16]) }
+        }
         Operation::Float(FloatingPointOperation::Convert(FloatConversion::Float64ToInt32)) => {
             &const { plain(&[GprOut, FprIn, Label]).scratches(&[RCX, XMM3], &[D16]) }
         }
@@ -1037,16 +1065,12 @@ fn lookup_operation(operation: Operation) -> &'static InstructionDescription {
             }
         }
         Operation::Branch(BranchOperation::Float(_)) => &const { plain(&[FprIn, FprIn, Label]) },
-        Operation::Assertion(AssertionOperation::UnsignedLess | AssertionOperation::UnsignedGreaterOrEqual) => {
-            &const { plain(&[GprIn, GprInOrImm]).scratches(&[], &[X9]) }
-        }
-        Operation::Assertion(AssertionOperation::NonZero) => &const { plain(&[GprIn]) },
-        Operation::Assertion(AssertionOperation::TagEqual | AssertionOperation::TagNotEqual) => {
-            &const { plain(&[GprIn, GprInOrImm]).scratches(&[R11], &[X9, X10]) }
-        }
+        Operation::AssertNonzero => &const { plain(&[GprIn]) },
         Operation::StorePairIndexed(PairWidth::Word) => unreachable!("indexed 32-bit pair stores are unsupported"),
-        Operation::Memory(MemoryOperation::Load64NonZero) => {
-            unreachable!("checked loads must be lowered before target selection")
+        Operation::Memory(
+            MemoryOperation::Load64NonZero | MemoryOperation::LoadCellPointer | MemoryOperation::LoadNonnullCellPointer,
+        ) => {
+            unreachable!("specialized loads must be lowered before target selection")
         }
         Operation::Move(U8 | U16) => unreachable!("narrow moves are unsupported"),
         Operation::IntegerBinary { .. } => unreachable!("unsupported integer operation width"),
@@ -1078,13 +1102,17 @@ mod tests {
     }
 
     #[test]
-    fn direct_value_operations_have_no_scratch_registers() {
+    fn direct_value_operations_declare_their_scratch_registers() {
         for operation in [
             Operation::BoxInt32 { clean: false },
             Operation::BoxInt32 { clean: true },
-            Operation::ToggleBit,
-            Operation::ClearBit,
         ] {
+            let info = lookup_operation(operation);
+            assert_eq!(info.x86_64.trailing_scratch_registers, &[R11]);
+            assert!(info.aarch64.trailing_scratch_registers.is_empty());
+        }
+
+        for operation in [Operation::ToggleBit, Operation::ClearBit] {
             let info = lookup_operation(operation);
             assert!(info.x86_64.trailing_scratch_registers.is_empty());
             assert!(info.aarch64.trailing_scratch_registers.is_empty());

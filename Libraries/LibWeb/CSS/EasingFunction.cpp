@@ -7,26 +7,20 @@
 #include "EasingFunction.h"
 #include <AK/Math.h>
 #include <LibWeb/CSS/Enums.h>
+#include <LibWeb/CSS/Number.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
-#include <LibWeb/CSS/StyleValues/EasingStyleValue.h>
-#include <LibWeb/CSS/StyleValues/IntegerStyleValue.h>
-#include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
-#include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
-#include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 
 namespace Web::CSS {
 
 // https://drafts.csswg.org/css-easing/#linear-easing-function-output
 double LinearEasingFunction::evaluate_at(double input_progress, bool before_flag) const
 {
-    Vector<StyleValueFFI::FfiLinearEasingPoint> points;
+    Vector<Compositing::RustFFI::FfiLinearEasingPoint> points;
     points.ensure_capacity(control_points.size());
-    for (auto const& point : control_points) {
-        VERIFY(point.input.has_value());
-        points.unchecked_append({ .input = *point.input, .output = point.output });
-    }
-    StyleValueFFI::FfiEasingDescriptor descriptor {
-        .kind = StyleValueFFI::FfiEasingKind::Linear,
+    for (auto const& point : control_points)
+        points.unchecked_append({ .input = point.input, .output = point.output });
+    Compositing::RustFFI::FfiEasingDescriptor descriptor {
+        .kind = Compositing::RustFFI::FfiEasingKind::Linear,
         .linear_points = points.data(),
         .linear_point_count = points.size(),
         .x1 = 0,
@@ -42,8 +36,8 @@ double LinearEasingFunction::evaluate_at(double input_progress, bool before_flag
 // https://www.w3.org/TR/css-easing-1/#cubic-bezier-algo
 double CubicBezierEasingFunction::evaluate_at(double input_progress, bool before_flag) const
 {
-    StyleValueFFI::FfiEasingDescriptor descriptor {
-        .kind = StyleValueFFI::FfiEasingKind::CubicBezier,
+    Compositing::RustFFI::FfiEasingDescriptor descriptor {
+        .kind = Compositing::RustFFI::FfiEasingKind::CubicBezier,
         .linear_points = nullptr,
         .linear_point_count = 0,
         .x1 = x1,
@@ -59,8 +53,8 @@ double CubicBezierEasingFunction::evaluate_at(double input_progress, bool before
 // https://www.w3.org/TR/css-easing-1/#step-easing-algo
 double StepsEasingFunction::evaluate_at(double input_progress, bool before_flag) const
 {
-    StyleValueFFI::FfiEasingDescriptor descriptor {
-        .kind = StyleValueFFI::FfiEasingKind::Steps,
+    Compositing::RustFFI::FfiEasingDescriptor descriptor {
+        .kind = Compositing::RustFFI::FfiEasingKind::Steps,
         .linear_points = nullptr,
         .linear_point_count = 0,
         .x1 = 0,
@@ -71,61 +65,6 @@ double StepsEasingFunction::evaluate_at(double input_progress, bool before_flag)
         .step_position = to_underlying(position),
     };
     return StyleValueFFI::rust_evaluate_easing(&descriptor, input_progress, before_flag);
-}
-
-// https://drafts.csswg.org/css-easing/#linear-canonicalization
-static Vector<LinearEasingFunction::ControlPoint> canonicalize_linear_easing_function_control_points(Vector<LinearEasingFunction::ControlPoint> control_points)
-{
-    // To canonicalize a linear() function’s control points, perform the following:
-    Vector<LinearEasingFunction::ControlPoint> canonicalized_control_points = control_points;
-
-    // 1. If the first control point lacks an input progress value, set its input progress value to 0.
-    if (!canonicalized_control_points.first().input.has_value())
-        canonicalized_control_points.first().input = 0;
-
-    // 2. If the last control point lacks an input progress value, set its input progress value to 1.
-    if (!canonicalized_control_points.last().input.has_value())
-        canonicalized_control_points.last().input = 1;
-
-    // 3. If any control point has an input progress value that is less than
-    // the input progress value of any preceding control point,
-    // set its input progress value to the largest input progress value of any preceding control point.
-    double largest_input = 0;
-    for (auto& control_point : canonicalized_control_points) {
-        if (control_point.input.has_value()) {
-            if (control_point.input.value() < largest_input) {
-                control_point.input = largest_input;
-            } else {
-                largest_input = control_point.input.value();
-            }
-        }
-    }
-
-    // 4. If any control point still lacks an input progress value,
-    // then for each contiguous run of such control points,
-    // set their input progress values so that they are evenly spaced
-    // between the preceding and following control points with input progress values.
-    Optional<size_t> run_start_idx;
-    for (size_t idx = 0; idx < canonicalized_control_points.size(); idx++) {
-        auto& control_point = canonicalized_control_points[idx];
-        if (control_point.input.has_value() && run_start_idx.has_value()) {
-            // Note: this stop is immediately after a run
-            //       set inputs of [start, idx-1] stops to be evenly spaced between start-1 and idx
-            auto start_input = canonicalized_control_points[run_start_idx.value() - 1].input.value();
-            auto end_input = canonicalized_control_points[idx].input.value();
-            auto run_stop_count = idx - run_start_idx.value() + 1;
-            auto delta = (end_input - start_input) / run_stop_count;
-            for (size_t run_idx = 0; run_idx < run_stop_count; run_idx++) {
-                canonicalized_control_points[run_idx + run_start_idx.value() - 1].input = start_input + delta * run_idx;
-            }
-            run_start_idx = {};
-        } else if (!control_point.input.has_value() && !run_start_idx.has_value()) {
-            // Note: this stop is the start of a run
-            run_start_idx = idx;
-        }
-    }
-
-    return canonicalized_control_points;
 }
 
 // https://drafts.csswg.org/css-easing-2/#linear-easing-function
@@ -166,38 +105,53 @@ EasingFunction EasingFunction::ease()
 EasingFunction EasingFunction::from_style_value(StyleValue const& style_value)
 {
     if (style_value.is_easing()) {
-        return style_value.as_easing().function().visit(
-            [&](EasingStyleValue::Linear const& linear) -> EasingFunction {
-                Vector<LinearEasingFunction::ControlPoint> resolved_control_points;
-
-                for (auto const& control_point : linear.stops) {
-                    double output = number_from_style_value(control_point.output, {});
-
-                    Optional<double> input;
-                    if (control_point.input)
-                        input = Percentage::from_style_value(*control_point.input).as_fraction();
-
-                    resolved_control_points.append({ input, output });
-                }
-
-                // https://drafts.csswg.org/css-easing-2/#funcdef-linear
-                // If an argument lacks a <percentage>, its input progress value is initially empty. This is corrected
-                // at used value time by linear() canonicalization.
-                resolved_control_points = canonicalize_linear_easing_function_control_points(resolved_control_points);
-
-                return LinearEasingFunction { resolved_control_points, linear.to_utf16_string(SerializationMode::ResolvedValue) };
-            },
-            [&](EasingStyleValue::CubicBezier const& cubic_bezier) -> EasingFunction {
-                auto resolved_x1 = number_from_style_value(cubic_bezier.x1, {});
-                auto resolved_y1 = number_from_style_value(cubic_bezier.y1, {});
-                auto resolved_x2 = number_from_style_value(cubic_bezier.x2, {});
-                auto resolved_y2 = number_from_style_value(cubic_bezier.y2, {});
-
-                return CubicBezierEasingFunction { resolved_x1, resolved_y1, resolved_x2, resolved_y2, cubic_bezier.to_utf16_string(SerializationMode::Normal) };
-            },
-            [&](EasingStyleValue::Steps const& steps) -> EasingFunction {
-                return StepsEasingFunction { int_from_style_value(steps.number_of_intervals), steps.position, steps.to_utf16_string(SerializationMode::ResolvedValue) };
-            });
+        auto const& easing = style_value.rust_style_value_data()->easing;
+        auto numeric = [](auto const& retained) -> double {
+            auto const* data = static_cast<StyleValueFFI::StyleValueData const*>(retained.pointer);
+            switch (data->tag) {
+            case StyleValueFFI::StyleValueData::Tag::Number:
+                return data->number.value;
+            case StyleValueFFI::StyleValueData::Tag::Integer:
+                return data->integer.value;
+            case StyleValueFFI::StyleValueData::Tag::Percentage:
+                return data->percentage.value;
+            case StyleValueFFI::StyleValueData::Tag::Calculated: {
+                auto calculated = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(data));
+                auto const& value = calculated->as_calculated();
+                if (value.resolves_to_percentage())
+                    return value.resolve_percentage({}).value().value();
+                return value.resolve_number({}).value();
+            }
+            default:
+                VERIFY_NOT_REACHED();
+            }
+        };
+        switch (easing.kind) {
+        case 0: {
+            auto canonicalized = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_composite_style_value_absolutize(
+                style_value.rust_style_value_data(), nullptr, [](void const*, StyleValueFFI::StyleValueData const* child) {
+                    return StyleValueFFI::rust_style_value_retain(child);
+                }));
+            auto const& canonical_easing = canonicalized->rust_style_value_data()->easing;
+            Vector<LinearEasingFunction::ControlPoint> points;
+            points.ensure_capacity(canonical_easing.linear_stops.length);
+            for (auto const& stop : ReadonlySpan<StyleValueFFI::RetainedLinearEasingStop> { canonical_easing.linear_stops.pointer, canonical_easing.linear_stops.length })
+                points.unchecked_append({ numeric(stop.input) / 100, numeric(stop.output) });
+            return LinearEasingFunction { move(points), style_value.to_utf16_string(SerializationMode::ResolvedValue) };
+        }
+        case 1:
+            return CubicBezierEasingFunction {
+                numeric(easing.x1),
+                numeric(easing.y1),
+                numeric(easing.x2),
+                numeric(easing.y2),
+                style_value.to_utf16_string(SerializationMode::Normal),
+            };
+        case 2:
+            return StepsEasingFunction { round_to_nearest_integer(numeric(easing.number_of_intervals)), static_cast<StepPosition>(easing.step_position), style_value.to_utf16_string(SerializationMode::ResolvedValue) };
+        default:
+            VERIFY_NOT_REACHED();
+        }
     }
 
     switch (style_value.to_keyword()) {
@@ -217,47 +171,6 @@ EasingFunction EasingFunction::from_style_value(StyleValue const& style_value)
     }
 
     VERIFY_NOT_REACHED();
-}
-
-NonnullRefPtr<StyleValue const> EasingFunction::to_style_value() const
-{
-    auto const& serialized = to_utf16_string();
-    if (serialized == "linear"_utf16)
-        return KeywordStyleValue::create(Keyword::Linear);
-    if (serialized == "ease"_utf16)
-        return KeywordStyleValue::create(Keyword::Ease);
-    if (serialized == "ease-in"_utf16)
-        return KeywordStyleValue::create(Keyword::EaseIn);
-    if (serialized == "ease-out"_utf16)
-        return KeywordStyleValue::create(Keyword::EaseOut);
-    if (serialized == "ease-in-out"_utf16)
-        return KeywordStyleValue::create(Keyword::EaseInOut);
-
-    return visit(
-        [](LinearEasingFunction const& linear) -> NonnullRefPtr<StyleValue const> {
-            Vector<EasingStyleValue::Linear::Stop> stops;
-            for (auto const& point : linear.control_points) {
-                ValueComparingRefPtr<StyleValue const> input;
-                if (point.input.has_value())
-                    input = PercentageStyleValue::create(Percentage { *point.input * 100 });
-                stops.append({ NumberStyleValue::create(point.output), move(input) });
-            }
-            return EasingStyleValue::create(EasingStyleValue::Linear { move(stops) });
-        },
-        [](CubicBezierEasingFunction const& cubic_bezier) -> NonnullRefPtr<StyleValue const> {
-            return EasingStyleValue::create(EasingStyleValue::CubicBezier {
-                NumberStyleValue::create(cubic_bezier.x1),
-                NumberStyleValue::create(cubic_bezier.y1),
-                NumberStyleValue::create(cubic_bezier.x2),
-                NumberStyleValue::create(cubic_bezier.y2),
-            });
-        },
-        [](StepsEasingFunction const& steps) -> NonnullRefPtr<StyleValue const> {
-            return EasingStyleValue::create(EasingStyleValue::Steps {
-                IntegerStyleValue::create(steps.interval_count),
-                steps.position,
-            });
-        });
 }
 
 double EasingFunction::evaluate_at(double input_progress, bool before_flag) const

@@ -5,14 +5,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/VisualViewport.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/EventDispatcher.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/LocalNavigable.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
 
 namespace Web::CSS {
 
@@ -20,19 +23,18 @@ GC_DEFINE_ALLOCATOR(VisualViewport);
 
 GC::Ref<VisualViewport> VisualViewport::create(DOM::Document& document)
 {
-    return document.realm().create<VisualViewport>(document);
+    return GC::Heap::the().allocate<VisualViewport>(document);
 }
 
 VisualViewport::VisualViewport(DOM::Document& document)
-    : DOM::EventTarget(document.realm())
+    : DOM::EventTarget()
     , m_document(document)
 {
 }
 
-void VisualViewport::initialize(JS::Realm& realm)
+GC::Ptr<Bindings::Wrappable> VisualViewport::relevant_global_impl() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(VisualViewport);
-    Base::initialize(realm);
+    return m_document->window();
 }
 
 void VisualViewport::visit_edges(Cell::Visitor& visitor)
@@ -227,12 +229,12 @@ void VisualViewport::reset()
 
 void VisualViewport::update_accumulated_visual_context()
 {
-    if (auto paintable = m_document->unsafe_paintable(); paintable && paintable->has_visual_context_tree()) {
-        paintable->update_visual_viewport_accumulated_visual_context();
+    if (m_document->has_committed_viewport_box() && m_document->paint_state().has_visual_context_tree()) {
+        m_document->paint_state().update_visual_viewport_accumulated_visual_context(*m_document);
         return;
     }
 
-    m_document->set_needs_accumulated_visual_contexts_update(true);
+    m_document->schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason::FirstBuild);
 }
 
 }

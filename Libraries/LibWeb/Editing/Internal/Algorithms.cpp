@@ -4,11 +4,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
 #include <AK/Utf16StringBuilder.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Color.h>
 #include <LibWeb/Bindings/Document.h>
-#include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -42,10 +42,10 @@
 #include <LibWeb/HTML/HTMLTableRowElement.h>
 #include <LibWeb/HTML/HTMLTableSectionElement.h>
 #include <LibWeb/HTML/HTMLUListElement.h>
-#include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Selection/CaretNavigation.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
 
 namespace Web::Editing {
 
@@ -402,17 +402,25 @@ enum class PreserveLeadingSpaceAcrossNodeBoundary {
     Yes,
 };
 
-enum class AtomicContentTraversal {
-    Cross,
-    Stop,
-};
-
 // https://w3c.github.io/editing/docs/execCommand/#canonicalize-whitespace
 static void canonicalize_whitespace_impl(DOM::BoundaryPoint boundary, bool fix_collapsed_space,
-    PreserveLeadingSpaceAcrossNodeBoundary preserve_leading_space, AtomicContentTraversal atomic_content_traversal)
+    PreserveLeadingSpaceAcrossNodeBoundary preserve_leading_space)
 {
     auto node = boundary.node;
     auto offset = boundary.offset;
+
+    // INTEROP: Removing whitespace must not leave an invisible text node that can trap subsequent caret navigation.
+    //          Defer removing exhausted nodes until the boundary walkers have finished using them.
+    GC::RootVector<GC::Ref<DOM::Text>> emptied_text_nodes;
+    ScopeGuard remove_emptied_text_nodes = [&] {
+        for (auto text : emptied_text_nodes) {
+            if (text->parent() && text->length() == 0)
+                remove_node(*text);
+        }
+    };
+
+    // INTEROP: Images separate whitespace runs, and links keep their own boundary whitespace. Editing on one side
+    //          must not strip a space on the other side, or rewrite an untouched separator outside a link.
 
     // 1. If node is neither editable nor an editing host, abort these steps.
     if (!node->is_editable_or_editing_host())
@@ -428,7 +436,7 @@ static void canonicalize_whitespace_impl(DOM::BoundaryPoint boundary, bool fix_c
         //    set start node to that child, then set start offset to start node's length.
         auto* offset_minus_one_child = start_node->child_at_index(start_offset - 1);
         if (offset_minus_one_child && is_in_same_editing_host(*start_node, *offset_minus_one_child)) {
-            if (atomic_content_traversal == AtomicContentTraversal::Stop && editing_ignores_content(*offset_minus_one_child))
+            if (editing_ignores_content(*offset_minus_one_child) || is<HTML::HTMLAnchorElement>(*offset_minus_one_child))
                 break;
             start_node = *offset_minus_one_child;
             start_offset = start_node->length();
@@ -438,6 +446,8 @@ static void canonicalize_whitespace_impl(DOM::BoundaryPoint boundary, bool fix_c
         // 2. Otherwise, if start offset is zero and start node does not follow a line break and
         //    start node's parent is in the same editing host, set start offset to start node's
         //    index, then set start node to its parent.
+        if (is<HTML::HTMLAnchorElement>(*start_node) && start_offset == 0)
+            break;
         if (start_offset == 0 && !follows_a_line_break(start_node) && is_in_same_editing_host(*start_node, *start_node->parent())) {
             start_offset = start_node->index();
             start_node = *start_node->parent();
@@ -482,7 +492,7 @@ static void canonicalize_whitespace_impl(DOM::BoundaryPoint boundary, bool fix_c
         //    to that child, then set end offset to zero.
         auto* offset_child = end_node->child_at_index(end_offset);
         if (offset_child && is_in_same_editing_host(*end_node, *offset_child)) {
-            if (atomic_content_traversal == AtomicContentTraversal::Stop && editing_ignores_content(*offset_child))
+            if (editing_ignores_content(*offset_child) || is<HTML::HTMLAnchorElement>(*offset_child))
                 break;
             end_node = *offset_child;
             end_offset = 0;
@@ -492,6 +502,8 @@ static void canonicalize_whitespace_impl(DOM::BoundaryPoint boundary, bool fix_c
         // 2. Otherwise, if end offset is end node's length and end node does not precede a line
         //    break and end node's parent is in the same editing host, set end offset to one plus
         //    end node's index, then set end node to its parent.
+        if (is<HTML::HTMLAnchorElement>(*end_node) && end_offset == end_node->length())
+            break;
         if (end_offset == end_node->length() && !precedes_a_line_break(end_node) && is_in_same_editing_host(*end_node, *end_node->parent())) {
             end_offset = end_node->index() + 1;
             end_node = *end_node->parent();
@@ -515,6 +527,8 @@ static void canonicalize_whitespace_impl(DOM::BoundaryPoint boundary, bool fix_c
                 //    on end node, then continue this loop from the beginning.
                 if (fix_collapsed_space && collapse_spaces && offset_code_unit == 0x20) {
                     MUST(delete_data(static_cast<DOM::CharacterData&>(*end_node), end_offset, 1));
+                    if (end_node->length() == 0)
+                        emptied_text_nodes.append(as<DOM::Text>(*end_node));
                     continue;
                 }
 
@@ -578,6 +592,8 @@ static void canonicalize_whitespace_impl(DOM::BoundaryPoint boundary, bool fix_c
 
                     // 3. Call deleteData(end offset, 1) on end node.
                     MUST(delete_data(static_cast<DOM::CharacterData&>(*end_node), end_offset, 1));
+                    if (end_node->length() == 0)
+                        emptied_text_nodes.append(as<DOM::Text>(*end_node));
 
                     // NOTE: We continue the loop here since we matched every condition from step 8.3
                     continue;
@@ -598,7 +614,13 @@ static void canonicalize_whitespace_impl(DOM::BoundaryPoint boundary, bool fix_c
     // INTEROP: After deleting a selection, Chromium preserves a whitespace run that crosses an inline node boundary.
     // This matters when replacing content across wrappers or atomic inline content, where an ordinary leading space
     // would otherwise collapse against the preceding run. Ordinary insertion across the same boundary keeps the space.
-    auto non_breaking_start = (start_offset == 0 && follows_a_line_break(start_node))
+    // INTEROP: A non-breaking space already separating a link from following text remains non-breaking when typing.
+    auto* preceding_child = start_offset > 0 ? start_node->child_at_index(start_offset - 1) : nullptr;
+    auto* following_text = as_if<DOM::Text>(start_node->child_at_index(start_offset));
+    auto preserves_link_separator = is<HTML::HTMLAnchorElement>(preceding_child)
+        && following_text && following_text->data().starts_with(u'\u00a0');
+    auto follows_atomic_content = !fix_collapsed_space && preceding_child && editing_ignores_content(*preceding_child);
+    auto non_breaking_start = (start_offset == 0 && follows_a_line_break(start_node)) || preserves_link_separator || follows_atomic_content
         || (preserve_leading_space == PreserveLeadingSpaceAcrossNodeBoundary::Yes && start_node != end_node);
     auto replacement_whitespace = canonical_space_sequence(
         length,
@@ -654,14 +676,14 @@ static void canonicalize_whitespace_impl(DOM::BoundaryPoint boundary, bool fix_c
 
 void canonicalize_whitespace(DOM::BoundaryPoint boundary, bool fix_collapsed_space)
 {
-    canonicalize_whitespace_impl(boundary, fix_collapsed_space, PreserveLeadingSpaceAcrossNodeBoundary::No, AtomicContentTraversal::Cross);
+    canonicalize_whitespace_impl(boundary, fix_collapsed_space, PreserveLeadingSpaceAcrossNodeBoundary::No);
 }
 
 void canonicalize_whitespace_after_selection_replacement(DOM::BoundaryPoint boundary)
 {
     // INTEROP: Chromium preserves a leading collapsible space when replacing a selection exposes it across an
     //          inline node boundary. The execCommand draft does not distinguish this case from ordinary insertion.
-    canonicalize_whitespace_impl(boundary, false, PreserveLeadingSpaceAcrossNodeBoundary::Yes, AtomicContentTraversal::Cross);
+    canonicalize_whitespace_impl(boundary, false, PreserveLeadingSpaceAcrossNodeBoundary::Yes);
 }
 
 void canonicalize_whitespace_after_node_insertion(DOM::BoundaryPoint boundary)
@@ -670,7 +692,7 @@ void canonicalize_whitespace_after_node_insertion(DOM::BoundaryPoint boundary)
     //          that space with the same non-breaking-space canonicalization used after replacing a selection.
     // Clipboard serialization has already protected whitespace adjacent to atomic content. Normalize the insertion
     // seam up to that content, but do not rewrite a separate whitespace seam on its other side.
-    canonicalize_whitespace_impl(boundary, false, PreserveLeadingSpaceAcrossNodeBoundary::Yes, AtomicContentTraversal::Stop);
+    canonicalize_whitespace_impl(boundary, false, PreserveLeadingSpaceAcrossNodeBoundary::Yes);
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#clear-the-value
@@ -710,17 +732,21 @@ Vector<GC::Ref<DOM::Node>> clear_the_value(Utf16FlyString const& command, GC::Re
 
     // 5. If command is "strikethrough", and element has a style attribute that sets "text-decoration" to some value
     //    containing "line-through", delete "line-through" from the value.
+    // AD-HOC: The style attribute stores expanded longhands, so the line keywords live in the
+    //         `text-decoration-line` longhand rather than in a shorthand value list.
     auto remove_text_decoration_value = [&element](CSS::Keyword keyword_to_delete) {
         auto inline_style = element->inline_style();
         if (!inline_style)
             return;
 
-        auto style_value = inline_style->get_property_style_value(CSS::PropertyID::TextDecoration);
+        auto style_value = inline_style->get_property_style_value(CSS::PropertyID::TextDecorationLine);
         if (!style_value)
             return;
-        VERIFY(style_value->is_value_list());
-        auto const& value_list = style_value->as_value_list();
-        CSS::StyleValueVector new_values { value_list.values() };
+        CSS::StyleValueVector new_values;
+        if (style_value->is_value_list())
+            new_values = style_value->as_value_list().values();
+        else
+            new_values.append(*style_value);
         auto was_removed = new_values.remove_all_matching([&](ValueComparingNonnullRefPtr<CSS::StyleValue const> const& value) {
             return value->is_keyword() && value->as_keyword().keyword() == keyword_to_delete;
         });
@@ -732,9 +758,9 @@ Vector<GC::Ref<DOM::Node>> clear_the_value(Utf16FlyString const& command, GC::Re
             return;
         }
 
-        auto new_style_value = CSS::StyleValueList::create(move(new_values), value_list.separator());
+        auto new_style_value = CSS::StyleValueList::create(move(new_values), CSS::StyleValueList::Separator::Space);
         MUST(inline_style->set_property(
-            CSS::PropertyID::TextDecoration,
+            CSS::PropertyID::TextDecorationLine,
             new_style_value->to_utf16_string(CSS::SerializationMode::Normal),
             {}));
     };
@@ -792,6 +818,46 @@ void delete_the_selection(Selection& selection, bool block_merging, bool strip_w
     // NOTE: The selection is collapsed often in this algorithm, so we shouldn't store the active range in a variable.
     if (!active_range(document))
         return;
+
+    // INTEROP: A collapsed selection has no content to delete. In particular, insertion must not first strip
+    //          collapsed whitespace from adjacent content that is outside the insertion point.
+    if (selection.is_collapsed())
+        return;
+
+    // INTEROP: Selecting all of an editor's content retains its first paragraph as the insertion container.
+    auto initial_range = active_range(document);
+    if (initial_range->start_container()->is_editing_host() && initial_range->start_offset() == 0) {
+        auto* first = initial_range->start_container()->first_child();
+        if (first && is_non_list_single_line_container(*first))
+            MUST(initial_range->set_start(*first, 0));
+    }
+
+    GC::RootVector<GC::Ref<HTML::HTMLAnchorElement>> links;
+    for (auto endpoint : { initial_range->start_container(), initial_range->end_container() }) {
+        for (auto* ancestor = endpoint.ptr(); ancestor && ancestor->is_editable(); ancestor = ancestor->parent()) {
+            if (auto* anchor = as_if<HTML::HTMLAnchorElement>(*ancestor); anchor && !links.contains_slow(GC::Ref { *anchor }))
+                links.append(*anchor);
+        }
+    }
+    initial_range->for_each_contained([&](GC::Ref<DOM::Node> node) {
+        if (auto* anchor = as_if<HTML::HTMLAnchorElement>(*node); anchor && anchor->is_editable() && !links.contains_slow(GC::Ref { *anchor }))
+            links.append(*anchor);
+        return IterationDecision::Continue;
+    });
+    // INTEROP: Deleting the last linked content removes the empty anchor and its inherited link style. Keep
+    //          detached subtrees intact so undo can restore the original nodes.
+    ScopeGuard prune_empty_links = [&] {
+        for (auto link : links) {
+            if (link->is_connected()) {
+                if (has_visible_children(*link))
+                    continue;
+                remove_node(*link);
+            }
+            document.clear_command_value_override(CommandNames::createLink);
+            document.clear_command_state_override(CommandNames::underline);
+            document.clear_command_value_override(CommandNames::foreColor);
+        }
+    };
 
     // 2. Canonicalize whitespace at the active range's start.
     canonicalize_whitespace(active_range(document)->start());
@@ -1060,7 +1126,7 @@ void delete_the_selection(Selection& selection, bool block_merging, bool strip_w
         values = record_the_values_of_nodes(children);
 
         // 10. While children's first member's parent is not start block, split the parent of children.
-        while (children.first()->parent() != start_block)
+        while (children.first()->parent() != start_block.ptr())
             split_the_parent_of_nodes(children);
 
         // 11. If children's first member's previousSibling is an editable br, remove that br from its parent.
@@ -1078,7 +1144,7 @@ void delete_the_selection(Selection& selection, bool block_merging, bool strip_w
         auto reference_node = start_block;
 
         // 3. While reference node is not a child of end block, set reference node to its parent.
-        while (reference_node->parent() && reference_node->parent() != end_block)
+        while (reference_node->parent() && reference_node->parent() != end_block.ptr())
             reference_node = reference_node->parent();
 
         // 4. If reference node's nextSibling is an inline node and start block's lastChild is a br, remove start
@@ -1292,9 +1358,9 @@ Optional<Utf16String> effective_command_value(GC::Ptr<DOM::Node> node, Utf16FlyS
     // 6. If command is "strikethrough", and the "text-decoration" property of node or any of its ancestors has resolved
     //    value containing "line-through", return "line-through". Otherwise, return null.
     if (command == CommandNames::strikethrough) {
-        auto inclusive_ancestor = node;
+        GC::Ptr<DOM::Node> inclusive_ancestor = node;
         do {
-            auto text_decoration_line = resolved_value(*node, CSS::PropertyID::TextDecorationLine);
+            auto text_decoration_line = resolved_value(*inclusive_ancestor, CSS::PropertyID::TextDecorationLine);
             if (text_decoration_line && value_contains_keyword(*text_decoration_line, CSS::Keyword::LineThrough))
                 return "line-through"_utf16;
             inclusive_ancestor = inclusive_ancestor->parent();
@@ -1306,9 +1372,9 @@ Optional<Utf16String> effective_command_value(GC::Ptr<DOM::Node> node, Utf16FlyS
     // 7. If command is "underline", and the "text-decoration" property of node or any of its ancestors has resolved
     //    value containing "underline", return "underline". Otherwise, return null.
     if (command == CommandNames::underline) {
-        auto inclusive_ancestor = node;
+        GC::Ptr<DOM::Node> inclusive_ancestor = node;
         do {
-            auto text_decoration_line = resolved_value(*node, CSS::PropertyID::TextDecorationLine);
+            auto text_decoration_line = resolved_value(*inclusive_ancestor, CSS::PropertyID::TextDecorationLine);
             if (text_decoration_line && value_contains_keyword(*text_decoration_line, CSS::Keyword::Underline))
                 return "underline"_utf16;
             inclusive_ancestor = inclusive_ancestor->parent();
@@ -1642,7 +1708,7 @@ void force_the_value(GC::Ref<DOM::Node> node, Utf16FlyString const& command, Opt
     if (!values_are_loosely_equivalent(command, optional_utf16_view(effective_command_value(new_parent, command)), new_value)) {
         auto const& command_definition = find_command_definition(command);
         if (command_definition->relevant_css_property.has_value()) {
-            auto inline_style = new_parent->style_for_bindings();
+            auto inline_style = new_parent->style();
             MUST(inline_style->set_property(command_definition->relevant_css_property.value(), new_value.value()));
         }
     }
@@ -1652,16 +1718,16 @@ void force_the_value(GC::Ref<DOM::Node> node, Utf16FlyString const& command, Opt
     //     "line-through".
     if (command == CommandNames::strikethrough && new_value == "line-through"sv
         && effective_command_value(new_parent, command) != "line-through"sv) {
-        auto inline_style = new_parent->style_for_bindings();
-        MUST(inline_style->set_property(CSS::PropertyID::TextDecoration, u"line-through"sv));
+        auto inline_style = new_parent->style();
+        MUST(inline_style->set_property(CSS::PropertyID::TextDecoration, "line-through"sv));
     }
 
     // 19. If command is "underline", and new value is "underline", and the effective command value of "underline" for
     //     new parent is not "underline", set the "text-decoration" property of new parent to "underline".
     if (command == CommandNames::underline && new_value == "underline"sv
         && effective_command_value(new_parent, command) != "underline"sv) {
-        auto inline_style = new_parent->style_for_bindings();
-        MUST(inline_style->set_property(CSS::PropertyID::TextDecoration, u"underline"sv));
+        auto inline_style = new_parent->style();
+        MUST(inline_style->set_property(CSS::PropertyID::TextDecoration, "underline"sv));
     }
 
     // 20. Append node to new parent as its last child, preserving ranges.
@@ -1965,8 +2031,19 @@ bool is_block_end_point(DOM::BoundaryPoint boundary_point)
         return true;
 
     // or node has a child with index offset, and that child is a visible block node.
+    // AD-HOC: Test block-ness first. Both conditions are side-effect free, and is_visible_node() resolves style for
+    //         every inclusive ancestor, while is_block_node() rejects a non-Element outright.
     auto offset_child = boundary_point.node->child_at_index(boundary_point.offset);
-    return offset_child && is_visible_node(*offset_child) && is_block_node(*offset_child);
+    return offset_child && is_block_node(*offset_child) && is_visible_node(*offset_child);
+}
+
+// Whether a resolved display qualifies an Element as a block node; see is_block_node() below.
+static bool is_block_display(Optional<CSS::Display> const& display)
+{
+    if (!display.has_value())
+        return true;
+    return !(display->is_inline_outside() && (display->is_flow_inside() || display->is_flow_root_inside() || display->is_table_inside()))
+        && !display->is_none();
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#block-node
@@ -1980,11 +2057,7 @@ bool is_block_node(GC::Ref<DOM::Node> node)
     if (!is<DOM::Element>(*node))
         return false;
 
-    auto display = resolved_display(node);
-    if (!display.has_value())
-        return true;
-    return !(display->is_inline_outside() && (display->is_flow_inside() || display->is_flow_root_inside() || display->is_table_inside()))
-        && !display->is_none();
+    return is_block_display(resolved_display(node));
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#block-start-point
@@ -1995,9 +2068,11 @@ bool is_block_start_point(DOM::BoundaryPoint boundary_point)
         return true;
 
     // or node has a child with index offset − 1, and that child is either a visible block node or a visible br.
+    // AD-HOC: Test block-ness first, as in is_block_end_point().
     auto offset_minus_one_child = boundary_point.node->child_at_index(boundary_point.offset - 1);
-    return offset_minus_one_child && is_visible_node(*offset_minus_one_child)
-        && (is_block_node(*offset_minus_one_child) || is<HTML::HTMLBRElement>(*offset_minus_one_child));
+    return offset_minus_one_child
+        && (is_block_node(*offset_minus_one_child) || is<HTML::HTMLBRElement>(*offset_minus_one_child))
+        && is_visible_node(*offset_minus_one_child);
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#collapsed-block-prop
@@ -2646,9 +2721,18 @@ bool is_visible_node(GC::Ref<DOM::Node> node)
 {
     // excluding any node with an inclusive ancestor Element whose "display" property has resolved
     // value "none".
+    // NB: Only Elements have a display of their own; on any other node, resolved_display() answers
+    //     with the nearest inclusive ancestor Element's display. So, walking the ancestor Elements
+    //     covers every node in between. The display of node itself also feeds the block-node check
+    //     below. So, it's resolved once here — rather than a second time there.
+    Optional<CSS::Display> node_display;
     bool has_display_none = false;
-    node->for_each_inclusive_ancestor([&has_display_none](GC::Ref<DOM::Node> ancestor) {
+    node->for_each_inclusive_ancestor([&](GC::Ref<DOM::Node> ancestor) {
+        if (!is<DOM::Element>(*ancestor))
+            return IterationDecision::Continue;
         auto display = resolved_display(ancestor);
+        if (ancestor.ptr() == node.ptr())
+            node_display = display;
         if (display.has_value() && display->is_none()) {
             has_display_none = true;
             return IterationDecision::Break;
@@ -2659,7 +2743,7 @@ bool is_visible_node(GC::Ref<DOM::Node> node)
         return false;
 
     // Something is visible if it is a node that either is a block node,
-    if (is_block_node(node))
+    if (is<DOM::Element>(*node) ? is_block_display(node_display) : is_block_node(node))
         return true;
 
     // or a Text node that is not a collapsed whitespace node,
@@ -2760,7 +2844,7 @@ void justify_the_selection(DOM::Document& document, JustifyAlignment alignment)
             remove_attribute_ns(*element, Namespace::HTML, HTML::AttributeNames::align);
 
         // 2. Unset the CSS property "text-align" on element, if it's set by a style attribute.
-        auto inline_style = element->style_for_bindings();
+        auto inline_style = element->style();
         auto removed_text_align = MUST(inline_style->remove_property(CSS::PropertyID::TextAlign));
         (void)removed_text_align;
 
@@ -2849,8 +2933,8 @@ void justify_the_selection(DOM::Document& document, JustifyAlignment alignment)
             },
             [&] {
                 auto div = MUST(DOM::create_element(document, HTML::TagNames::div, Namespace::HTML));
-                auto inline_style = div->style_for_bindings();
-                MUST(inline_style->set_property(CSS::PropertyID::TextAlign, alignment_keyword_string));
+                auto inline_style = div->style();
+                MUST(inline_style->set_property(CSS::PropertyID::TextAlign, alignment_keyword));
                 return div;
             });
     }
@@ -2966,14 +3050,14 @@ void move_node_preserving_ranges(GC::Ref<DOM::Node> node, GC::Ref<DOM::Node> new
 
             // 4. If a boundary point's node is old parent and its offset is old index or old index + 1, set its node
             //    to new parent and preserve its position relative to the moved node.
-            if (boundary.node == old_parent && (boundary.offset == old_index || boundary.offset == old_index + 1)) {
+            if (boundary.node.ptr() == old_parent && (boundary.offset == old_index || boundary.offset == old_index + 1)) {
                 boundary.node = new_parent;
                 boundary.offset = new_index + (boundary.offset - old_index);
             }
 
             // 5. If a boundary point's node is old parent and its offset is greater than old index + 1, subtract one
             //    from its offset.
-            if (boundary.node == old_parent && boundary.offset > old_index + 1)
+            if (boundary.node.ptr() == old_parent && boundary.offset > old_index + 1)
                 --boundary.offset;
         };
         adjust_boundary(start);
@@ -3044,7 +3128,7 @@ void normalize_sublists_in_node(GC::Ref<DOM::Node> item)
 
             // 2. Insert child into the parent of item immediately following item, preserving
             //    ranges.
-            move_node_preserving_ranges(child, *item->parent(), item->index());
+            move_node_preserving_ranges(child, *item->parent(), item->index() + 1);
         }
 
         // 3. Otherwise:
@@ -3462,20 +3546,20 @@ GC::ConservativeVector<RecordedNodeValue> record_the_values_of_nodes(Vector<GC::
     for (auto node : node_list) {
         for (auto command : commands) {
             // 1. Let ancestor equal node.
-            auto ancestor = node;
+            GC::Ptr<DOM::Node> ancestor = node;
 
             // 2. If ancestor is not an Element, set it to its parent.
             if (!is<DOM::Element>(*ancestor))
-                ancestor = *ancestor->parent();
+                ancestor = ancestor->parent();
 
             // 3. While ancestor is an Element and its specified command value for command is null, set
             //    it to its parent.
-            while (is<DOM::Element>(*ancestor) && !specified_command_value(static_cast<DOM::Element&>(*ancestor), command).has_value())
-                ancestor = *ancestor->parent();
+            while (is<DOM::Element>(ancestor.ptr()) && !specified_command_value(static_cast<DOM::Element&>(*ancestor), command).has_value())
+                ancestor = ancestor->parent();
 
             // 4. If ancestor is an Element, add (node, command, ancestor's specified command value for
             //    command) to values. Otherwise add (node, command, null) to values.
-            if (is<DOM::Element>(*ancestor))
+            if (is<DOM::Element>(ancestor.ptr()))
                 values.empend(*node, command, specified_command_value(static_cast<DOM::Element&>(*ancestor), command));
             else
                 values.empend(*node, command, OptionalNone {});
@@ -3533,7 +3617,7 @@ void remove_extraneous_line_breaks_before_node(GC::Ref<DOM::Node> node)
     //    parent, set ref to the node before it in tree order.
     while (is_invisible_node(*ref)
         && !is_extraneous_line_break(*ref)
-        && ref != node->parent()) {
+        && ref.ptr() != node->parent()) {
         ref = ref->previous_in_pre_order();
     }
 
@@ -3940,7 +4024,7 @@ GC::Ref<DOM::Element> set_the_tag_name(GC::Ref<DOM::Element> element, Utf16FlySt
         return element;
 
     // 3. Let replacement element be the result of calling createElement(new name) on the ownerDocument of element.
-    auto replacement_element = MUST(element->owner_document()->create_element(new_name, Bindings::ElementCreationOptions {}));
+    auto replacement_element = MUST(element->owner_document()->create_element(new_name, DOM::Document::ElementCreationOptions {}));
 
     // 4. Insert replacement element into element's parent immediately before element.
     insert_node_before(replacement_element, *element->parent(), element);
@@ -3999,8 +4083,10 @@ Optional<Utf16String> specified_command_value(GC::Ref<DOM::Element> element, Utf
 
     // 4. If command is "strikethrough", and element has a style attribute set, and that attribute sets
     //    "text-decoration":
+    // AD-HOC: The style attribute stores expanded longhands, and a reconstructed `text-decoration` shorthand is not
+    //         a value list, so read the `text-decoration-line` longhand the attribute sets.
     if (command == CommandNames::strikethrough) {
-        auto text_decoration_style = property_in_style_attribute(element, CSS::PropertyID::TextDecoration);
+        auto text_decoration_style = property_in_style_attribute(element, CSS::PropertyID::TextDecorationLine);
         if (text_decoration_style) {
             // 1. If element's style attribute sets "text-decoration" to a value containing "line-through", return
             //    "line-through".
@@ -4017,8 +4103,9 @@ Optional<Utf16String> specified_command_value(GC::Ref<DOM::Element> element, Utf
         return "line-through"_utf16;
 
     // 6. If command is "underline", and element has a style attribute set, and that attribute sets "text-decoration":
+    // AD-HOC: Read the `text-decoration-line` longhand, as above.
     if (command == CommandNames::underline) {
-        auto text_decoration_style = property_in_style_attribute(element, CSS::PropertyID::TextDecoration);
+        auto text_decoration_style = property_in_style_attribute(element, CSS::PropertyID::TextDecorationLine);
         if (text_decoration_style) {
             // 1. If element's style attribute sets "text-decoration" to a value containing "underline", return "underline".
             if (value_contains_keyword(*text_decoration_style, CSS::Keyword::Underline))
@@ -4930,9 +5017,15 @@ RefPtr<CSS::StyleValue const> resolved_value(GC::Ref<DOM::Node> node, CSS::Prope
         element = element->parent();
     if (!element)
         return {};
+    DOM::AbstractElement abstract_element { static_cast<DOM::Element&>(*element) };
+
+    // OPTIMIZATION: For properties whose resolved value is the plain computed value, read it straight off the element's
+    // computed style — instead of materializing a whole resolved-style declaration just to extract a single property.
+    if (auto fast_value = CSS::CSSStyleProperties::resolved_value_read_from_computed_style(abstract_element, property_id); fast_value.has_value())
+        return fast_value.release_value();
 
     // Retrieve resolved style value
-    auto resolved_css_style_declaration = CSS::CSSStyleProperties::create_resolved_style(element->realm(), DOM::AbstractElement { static_cast<DOM::Element&>(*element) });
+    auto resolved_css_style_declaration = CSS::CSSStyleProperties::create_resolved_style(abstract_element);
     auto optional_style_property = resolved_css_style_declaration->get_property(property_id);
     if (!optional_style_property.has_value())
         return {};

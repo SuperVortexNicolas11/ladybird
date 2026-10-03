@@ -80,6 +80,47 @@ test("uses ArraySpeciesCreate", () => {
     expect(array).toEqual([1, 9, 3]);
 });
 
+describe("species result that already has elements", () => {
+    test("longer removed array is truncated", () => {
+        var array = [1, 2, 3, 4, 5];
+        array.constructor = {
+            [Symbol.species]: function () {
+                return [9, 9, 9, 9, 9, 9];
+            },
+        };
+        var removed = array.splice(1, 2);
+        expect(removed).toEqual([2, 3]);
+        expect(array).toEqual([1, 4, 5]);
+    });
+
+    test("nothing removed truncates the result to zero", () => {
+        var array = [1, 2];
+        array.constructor = {
+            [Symbol.species]: function () {
+                return [9, 9];
+            },
+        };
+        var removed = array.splice(1, 0, "x");
+        expect(removed).toHaveLength(0);
+        expect(array).toEqual([1, "x", 2]);
+    });
+
+    test("removed array that is this", () => {
+        var array = [1, 2, 3, 4, 5];
+        array.constructor = {
+            [Symbol.species]: function () {
+                return array;
+            },
+        };
+        var removed = array.splice(1, 2);
+        expect(removed).toBe(array);
+        expect(array).toHaveLength(3);
+        expect(array[0]).toBe(2);
+        expect(1 in array).toBeFalse();
+        expect(2 in array).toBeFalse();
+    });
+});
+
 test("throws if the array length is not writable", () => {
     var array = [1, 2, 3];
     Object.defineProperty(array, "length", { writable: false });
@@ -92,4 +133,35 @@ test("throws if the array length is not writable", () => {
     expect(array[2]).toBeUndefined();
     expect(2 in array).toBeFalse();
     expect(array.length).toBe(3);
+});
+
+describe("array resized before elements are moved", () => {
+    test("shrunk while converting arguments", () => {
+        var array = [1, 2, 3];
+        var deleteCount = {
+            valueOf() {
+                array.length = 1;
+                return 3;
+            },
+        };
+        var removed = array.splice(0, deleteCount);
+        expect(removed).toHaveLength(3);
+        expect(removed[0]).toBe(1);
+        expect(1 in removed).toBeFalse();
+        expect(2 in removed).toBeFalse();
+        expect(array).toHaveLength(0);
+    });
+
+    test("grown while converting arguments", () => {
+        var array = [1, 2, 3];
+        var deleteCount = {
+            valueOf() {
+                array.push(4);
+                return 1;
+            },
+        };
+        var removed = array.splice(0, deleteCount);
+        expect(removed).toEqual([1]);
+        expect(array).toEqual([2, 3]);
+    });
 });

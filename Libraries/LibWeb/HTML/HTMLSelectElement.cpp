@@ -7,12 +7,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLSelectElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
@@ -29,12 +27,13 @@
 #include <LibWeb/HTML/HTMLSelectedContentElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Numbers.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/Infra/Strings.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::HTML {
 
@@ -43,19 +42,19 @@ GC_DEFINE_ALLOCATOR(HTMLSelectElement);
 HTMLSelectElement::HTMLSelectElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))
 {
-    m_legacy_platform_object_flags = LegacyPlatformObjectFlags {
-        .supports_indexed_properties = true,
-        .has_indexed_property_setter = true,
-        .indexed_property_setter_has_identifier = true,
-    };
 }
 
 HTMLSelectElement::~HTMLSelectElement() = default;
 
-void HTMLSelectElement::initialize(JS::Realm& realm)
+// `:user-valid` and `:user-invalid` turn on the first time the user has interacted with the
+// control, which no attribute and no value says. The style engine is told what the element now
+// holds rather than asking.
+void HTMLSelectElement::set_user_validity(bool flag)
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLSelectElement);
-    Base::initialize(realm);
+    if (m_user_validity == flag)
+        return;
+    m_user_validity = flag;
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
 }
 
 void HTMLSelectElement::visit_edges(Cell::Visitor& visitor)
@@ -66,32 +65,7 @@ void HTMLSelectElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_inner_text_element);
     visitor.visit(m_chevron_icon_element);
     visitor.visit(m_cached_list_of_options);
-
-    for (auto const& item : m_select_items) {
-        if (item.has<SelectItemOption>())
-            visitor.visit(item.get<SelectItemOption>().option_element);
-
-        if (item.has<SelectItemOptionGroup>()) {
-            auto item_option_group = item.get<SelectItemOptionGroup>();
-            for (auto const& item : item_option_group.items)
-                visitor.visit(item.option_element);
-        }
-    }
-}
-
-void HTMLSelectElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
-{
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
-
-    // AD-HOC: We rewrite `display: inline` to `display: inline-block`.
-    //         This is required for the internal shadow tree to work correctly in layout.
-    if (style.display().is_inline_outside() && style.display().is_flow_inside())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::InlineBlock)));
-
-    // AD-HOC: Enforce normal line-height for select elements. This matches the behavior of other engines.
-    style.set_property(CSS::PropertyID::LineHeight, CSS::KeywordStyleValue::create(CSS::Keyword::Normal));
+    visitor.visit(m_select_item_option_elements);
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-size
@@ -139,7 +113,7 @@ GC::Ptr<HTMLOptionsCollection> const& HTMLSelectElement::options() const
     if (!m_options) {
         m_options = HTMLOptionsCollection::create(const_cast<HTMLSelectElement&>(*this), [this](DOM::Element const& element) {
             auto const* maybe_option = as_if<HTML::HTMLOptionElement>(element);
-            return maybe_option && maybe_option->nearest_select_element() == this;
+            return maybe_option && maybe_option->nearest_select_element().ptr() == this;
         });
     }
     return m_options;
@@ -165,19 +139,11 @@ HTMLOptionElement* HTMLSelectElement::item(WebIDL::UnsignedLong index)
     return as<HTMLOptionElement>(const_cast<HTMLOptionsCollection&>(*options()).item(index));
 }
 
-// https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:htmlselectelement
-Optional<JS::Value> HTMLSelectElement::item_value(size_t index) const
-{
-    // The options collection is also mirrored on the HTMLSelectElement object. The supported property indices at any
-    // instant are the indices supported by the object returned by the options attribute at that instant.
-    return (const_cast<HTMLOptionsCollection&>(*options()).item_value(index));
-}
-
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-nameditem
-HTMLOptionElement* HTMLSelectElement::named_item(Utf16View name)
+HTMLOptionElement* HTMLSelectElement::named_item(Utf16String const& name)
 {
     // The namedItem(name) method must return the value returned by the method of the same name on the options collection, when invoked with the same argument.
-    return as<HTMLOptionElement>(const_cast<HTMLOptionsCollection&>(*options()).named_item(name));
+    return as<HTMLOptionElement>(const_cast<HTMLOptionsCollection&>(*options()).named_item(name.utf16_view()));
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-add
@@ -192,11 +158,11 @@ WebIDL::ExceptionOr<void> HTMLSelectElement::add(HTMLOptionOrOptGroupElement ele
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:set-the-value-of-a-new-indexed-property
-WebIDL::ExceptionOr<void> HTMLSelectElement::set_value_of_indexed_property(u32 n, JS::Value new_value)
+WebIDL::ExceptionOr<void> HTMLSelectElement::set_value_of_indexed_property(u32 n, Optional<GC::Ref<DOM::Element>> new_value)
 {
     // When the user agent is to set the value of a new indexed property or set the value of an existing indexed property
     // for a select element, it must instead run the corresponding algorithm on the select element's options collection.
-    TRY(const_cast<HTMLOptionsCollection&>(*options()).set_value_of_indexed_property(n, new_value));
+    TRY(const_cast<HTMLOptionsCollection&>(*options()).set_value_of_indexed_property(n, move(new_value)));
 
     return {};
 }
@@ -206,7 +172,7 @@ void HTMLSelectElement::remove()
 {
     // The remove() method must act like its namesake method on that same options collection when it has arguments,
     // and like its namesake method on the ChildNode interface implemented by the HTMLSelectElement ancestor interface Element when it has no arguments.
-    ChildNode::remove_binding();
+    ChildNode::remove_from_parent();
 }
 
 void HTMLSelectElement::remove(WebIDL::Long index)
@@ -220,13 +186,14 @@ GC::Ref<DOM::HTMLCollection> HTMLSelectElement::selected_options()
     // The selectedOptions IDL attribute must return an HTMLCollection rooted at the select node,
     // whose filter matches the elements in the list of options that have their selectedness set to true.
     if (!m_selected_options) {
-        m_selected_options = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, [this](Element const& element) {
+        auto filter = [this](Element const& element) {
             auto const* maybe_option = as_if<HTML::HTMLOptionElement>(element);
-            if (maybe_option && maybe_option->nearest_select_element() == this) {
+            if (maybe_option && maybe_option->nearest_select_element().ptr() == this) {
                 return maybe_option->selected();
             }
             return false;
-        });
+        };
+        m_selected_options = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, move(filter), DOM::HTMLCollection::AttributeInvalidationType::None, nullptr, DOM::HTMLCollection::Kind::SelectedOptions);
     }
     return *m_selected_options;
 }
@@ -511,17 +478,14 @@ void HTMLSelectElement::send_select_update_notifications()
     // 2. Run update a select's selectedcontent given element.
     MUST(update_selectedcontent());
 
-    // 3. Run clone selected option into select button given element.
-    clone_selected_option_into_select_button();
-
     // 4. Fire an event named input at element, with the bubbles and composed attributes initialized to true.
-    auto input_event = DOM::Event::create(realm(), HTML::EventNames::input);
+    auto input_event = DOM::Event::create(HTML::relevant_global_object(*this), HTML::EventNames::input);
     input_event->set_bubbles(true);
     input_event->set_composed(true);
     dispatch_event(input_event);
 
     // 5. Fire an event named change at element, with the bubbles attribute initialized to true.
-    auto change_event = DOM::Event::create(realm(), HTML::EventNames::change);
+    auto change_event = DOM::Event::create(HTML::relevant_global_object(*this), HTML::EventNames::change);
     change_event->set_bubbles(true);
     dispatch_event(*change_event);
 }
@@ -532,7 +496,7 @@ void HTMLSelectElement::set_is_open(bool open)
         return;
 
     m_is_open = open;
-    CSS::Invalidation::invalidate_style_after_select_open_state_change(*this);
+    CSS::Invalidation::invalidate_style_after_select_open_state_change(*this, open);
 }
 
 bool HTMLSelectElement::has_activation_behavior() const
@@ -547,7 +511,7 @@ void HTMLSelectElement::show_the_picker_if_applicable()
     // To show the picker, if applicable for a select element element:
 
     // 1. If element's relevant global object does not have transient activation, then return.
-    auto& relevant_global = as<HTML::Window>(relevant_global_object(*this));
+    auto& relevant_global = relevant_window(*this);
     if (!relevant_global.has_transient_activation())
         return;
 
@@ -575,8 +539,13 @@ void HTMLSelectElement::show_the_picker_if_applicable()
     //    events, or a cancel event.)
 
     // Populate select items
-    m_select_items.clear();
-    u32 id_counter = 1;
+    // NB: Each option item's ID is one past its index in m_select_item_option_elements.
+    Vector<SelectItem> select_items;
+    m_select_item_option_elements.clear();
+    auto create_select_item_option = [&](HTMLOptionElement& option_element) {
+        m_select_item_option_elements.append(option_element);
+        return SelectItemOption { static_cast<u32>(m_select_item_option_elements.size()), option_element.selected(), option_element.disabled(), Infra::strip_and_collapse_whitespace(option_element.label()), option_element.value() };
+    };
     for (auto const& child : children_as_vector()) {
         if (auto const* opt_group_element = as_if<HTMLOptGroupElement>(*child)) {
             if (!opt_group_element->has_attribute(Web::HTML::AttributeNames::hidden)) {
@@ -584,11 +553,11 @@ void HTMLSelectElement::show_the_picker_if_applicable()
                 for (auto const& child : opt_group_element->children_as_vector()) {
                     if (auto const& option_element = as_if<HTMLOptionElement>(*child)) {
                         if (!option_element->has_attribute(Web::HTML::AttributeNames::hidden))
-                            option_group_items.append(SelectItemOption { id_counter++, option_element->selected(), option_element->disabled(), option_element, Infra::strip_and_collapse_whitespace(option_element->label()), option_element->value() });
+                            option_group_items.append(create_select_item_option(*option_element));
                     }
                 }
                 auto label = opt_group_element->get_attribute(AttributeNames::label);
-                m_select_items.append(SelectItemOptionGroup {
+                select_items.append(SelectItemOptionGroup {
                     label.has_value() ? label.release_value() : Utf16String {},
                     move(option_group_items) });
             }
@@ -596,20 +565,21 @@ void HTMLSelectElement::show_the_picker_if_applicable()
 
         if (auto const& option_element = as_if<HTMLOptionElement>(*child)) {
             if (!option_element->has_attribute(Web::HTML::AttributeNames::hidden))
-                m_select_items.append(SelectItemOption { id_counter++, option_element->selected(), option_element->disabled(), option_element, Infra::strip_and_collapse_whitespace(option_element->label()), option_element->value() });
+                select_items.append(create_select_item_option(*option_element));
         }
 
         if (auto const* hr_element = as_if<HTMLHRElement>(*child)) {
             if (!hr_element->has_attribute(Web::HTML::AttributeNames::hidden))
-                m_select_items.append(SelectItemSeparator {});
+                select_items.append(SelectItemSeparator {});
         }
     }
 
     // Request select dropdown
     auto weak_element = GC::Weak<HTMLSelectElement> { *this };
     auto rect = get_bounding_client_rect();
-    auto position = document().navigable()->to_top_level_position(Web::CSSPixelPoint { rect.x(), rect.bottom() });
-    document().page().did_request_select_dropdown(weak_element, position, rect.width(), m_select_items);
+    auto navigable = document().navigable();
+    auto position = navigable->to_page_position(Web::CSSPixelPoint { rect.x(), rect.bottom() });
+    document().page().did_request_select_dropdown(weak_element, navigable->local_root()->id(), position, rect.width(), move(select_items));
     set_is_open(true);
 }
 
@@ -621,18 +591,18 @@ WebIDL::ExceptionOr<void> HTMLSelectElement::show_picker()
 
     // 1. If this is not mutable, then throw an "InvalidStateError" DOMException.
     if (!is_mutable())
-        return WebIDL::InvalidStateError::create(realm(), "Element is not mutable"_utf16);
+        return WebIDL::InvalidStateError::create("Element is not mutable"_utf16);
 
     // 2. If this's relevant settings object's origin is not same origin with this's relevant settings object's top-level origin,
     //    and this is a select element, then throw a "SecurityError" DOMException.
     if (!relevant_settings_object(*this).origin().is_same_origin(relevant_settings_object(*this).top_level_origin.value())) {
-        return WebIDL::SecurityError::create(realm(), "Cross origin pickers are not allowed"_utf16);
+        return WebIDL::SecurityError::create("Cross origin pickers are not allowed"_utf16);
     }
 
     // 3. If this's relevant global object does not have transient activation, then throw a "NotAllowedError" DOMException.
-    auto& global_object = relevant_global_object(*this);
-    if (!as<HTML::Window>(global_object).has_transient_activation()) {
-        return WebIDL::NotAllowedError::create(realm(), "Too long since user activation to show picker"_utf16);
+    auto* relevant_window = window_from_global_object(relevant_global_object(*this));
+    if (!relevant_window || !relevant_window->has_transient_activation()) {
+        return WebIDL::NotAllowedError::create("Too long since user activation to show picker"_utf16);
     }
 
     // FIXME: 4. If this is a select element, and this is not being rendered, then throw a "NotSupportedError" DOMException.
@@ -659,20 +629,8 @@ void HTMLSelectElement::did_select_item(Optional<u32> const& id)
     for (auto const& option_element : m_cached_list_of_options)
         option_element->set_selected(false);
 
-    for (auto const& item : m_select_items) {
-        if (item.has<SelectItemOption>()) {
-            auto const& item_option = item.get<SelectItemOption>();
-            if (item_option.id == *id)
-                item_option.option_element->set_selected(true);
-        }
-        if (item.has<SelectItemOptionGroup>()) {
-            auto item_option_group = item.get<SelectItemOptionGroup>();
-            for (auto const& item_option : item_option_group.items) {
-                if (item_option.id == *id)
-                    item_option.option_element->set_selected(true);
-            }
-        }
-    }
+    if (*id >= 1 && *id <= m_select_item_option_elements.size())
+        m_select_item_option_elements[*id - 1]->set_selected(true);
 
     clone_selected_option_into_select_button();
     send_select_update_notifications();
@@ -699,16 +657,24 @@ void HTMLSelectElement::form_associated_element_attribute_changed(Utf16FlyString
 
 void HTMLSelectElement::computed_properties_changed()
 {
+    if (!m_chevron_icon_element)
+        return;
+
     // Hide chevron icon when appearance is none
-    if (m_chevron_icon_element) {
-        auto appearance = computed_values()->appearance();
-        if (appearance == CSS::Appearance::None) {
-            MUST(m_chevron_icon_element->style_for_bindings()->set_property(CSS::PropertyID::Display, u"none"sv));
-            MUST(m_inner_text_element->style_for_bindings()->set_property(CSS::PropertyID::MarginInlineEnd, u"0"sv));
-        } else {
-            MUST(m_chevron_icon_element->style_for_bindings()->set_property(CSS::PropertyID::Display, u"block"sv));
-            MUST(m_inner_text_element->style_for_bindings()->set_property(CSS::PropertyID::MarginInlineEnd, u"20px"sv));
-        }
+    auto style = computed_style();
+    VERIFY(style);
+    // NB: This runs while the style engine's records are applied, and rewriting the shadow tree's declarations then
+    //     makes the records of its elements stale. So they are only written when appearance flips.
+    bool hide_chevron_icon = style->appearance() == CSS::Appearance::None;
+    if (hide_chevron_icon == m_chevron_icon_hidden)
+        return;
+    m_chevron_icon_hidden = hide_chevron_icon;
+    if (hide_chevron_icon) {
+        MUST(m_chevron_icon_element->style()->set_property(CSS::PropertyID::Display, "none"_utf16));
+        MUST(m_inner_text_element->style()->set_property(CSS::PropertyID::MarginInlineEnd, "0"_utf16));
+    } else {
+        MUST(m_chevron_icon_element->style()->set_property(CSS::PropertyID::Display, "block"_utf16));
+        MUST(m_inner_text_element->style()->set_property(CSS::PropertyID::MarginInlineEnd, "20px"_utf16));
     }
 }
 
@@ -717,7 +683,7 @@ void HTMLSelectElement::create_shadow_tree_if_needed()
     if (shadow_root())
         return;
 
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
     shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
 
@@ -733,6 +699,9 @@ void HTMLSelectElement::create_shadow_tree_if_needed()
     m_inner_text_element = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
     m_inner_text_element->set_attribute_value(HTML::AttributeNames::style, R"~~~(
         flex: 1;
+        min-width: 0;
+        overflow: clip;
+        text-overflow: inherit;
         margin-inline-end: 20px;
     )~~~"_utf16);
     MUST(border->append_child(*m_inner_text_element));
@@ -741,6 +710,7 @@ void HTMLSelectElement::create_shadow_tree_if_needed()
     //     baseline of the select derived from the label text. The label's margin-inline-end reserves its space.
     m_chevron_icon_element = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
     m_chevron_icon_element->set_attribute_value(HTML::AttributeNames::style, R"~~~(
+        display: block;
         position: absolute;
         inset-inline-end: 0;
         top: calc(50% - 8px);
@@ -866,9 +836,12 @@ HTMLOptionElement* HTMLSelectElement::placeholder_label_option() const
         // and if the value of the first option element in the select element's list of options (if any) is the empty
         // string, and that option element's parent node is the select element (and not an optgroup element), then that
         // option is the select element's placeholder label option.
-        auto first_option_element = list_of_options()[0];
-        if (first_option_element->value().is_empty() && first_option_element->parent() == this)
-            return first_option_element;
+        auto options = list_of_options();
+        if (!options.is_empty()) {
+            auto first_option_element = options[0];
+            if (first_option_element->value().is_empty() && first_option_element->parent() == this)
+                return first_option_element;
+        }
     }
     return {};
 }

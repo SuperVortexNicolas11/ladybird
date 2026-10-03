@@ -9,17 +9,18 @@
 #include <AK/JsonObject.h>
 #include <LibDevTools/Actors/NetworkEventActor.h>
 #include <LibDevTools/DevToolsServer.h>
+#include <LibTextCodec/Decoder.h>
 
 namespace DevTools {
 
-static i32 to_firefox_request_priority(Web::Fetch::Infrastructure::Request::Priority priority)
+static i32 to_firefox_request_priority(Web::Fetch::Infrastructure::RequestPriority priority)
 {
     switch (priority) {
-    case Web::Fetch::Infrastructure::Request::Priority::High:
+    case Web::Fetch::Infrastructure::RequestPriority::High:
         return -10;
-    case Web::Fetch::Infrastructure::Request::Priority::Low:
+    case Web::Fetch::Infrastructure::RequestPriority::Low:
         return 10;
-    case Web::Fetch::Infrastructure::Request::Priority::Auto:
+    case Web::Fetch::Infrastructure::RequestPriority::Auto:
         return 0;
     }
     VERIFY_NOT_REACHED();
@@ -80,7 +81,7 @@ void NetworkEventActor::set_is_navigation_request(bool is_navigation_request)
     m_is_navigation_request = is_navigation_request;
 }
 
-void NetworkEventActor::set_priority(Web::Fetch::Infrastructure::Request::Priority priority)
+void NetworkEventActor::set_priority(Web::Fetch::Infrastructure::RequestPriority priority)
 {
     m_priority = priority;
 }
@@ -250,7 +251,7 @@ void NetworkEventActor::get_response_headers(Message const& message)
     for (auto const& header : m_response_headers) {
         JsonObject header_obj;
         header_obj.set("name"sv, MUST(String::from_byte_string(header.name)));
-        header_obj.set("value"sv, MUST(String::from_byte_string(header.value)));
+        header_obj.set("value"sv, TextCodec::isomorphic_decode(header.value));
         headers.must_append(move(header_obj));
         header_size += static_cast<i64>(header.name.bytes().size() + header.value.bytes().size() + 4);
     }

@@ -6,118 +6,114 @@
 
 #pragma once
 
+#include <AK/Error.h>
 #include <AK/Function.h>
 #include <AK/Optional.h>
 #include <AK/Vector.h>
-#include <LibWeb/HTML/SessionHistoryEntry.h>
+#include <LibWebCommon/HTML/ApplyHistoryStep.h>
+#include <LibWebCommon/HTML/HistoryHandlingBehavior.h>
+#include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
+#include <LibWebCommon/HTML/UserNavigationInvolvement.h>
+#include <LibWebView/CanonicalSessionHistoryEntry.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
 
 namespace WebView {
 
-// AD-HOC: The HTML Standard stores a traversable navigable's session history entries on the traversable. Ladybird
-//         keeps an IPC-serializable mirror in the UI process so browser history survives WebContent process swaps
-//         and crash recovery. The mirror still uses the spec's session history entry and all used history steps model.
+inline constexpr size_t MAX_NESTED_HISTORY_DEPTH = 16;
+
+// NB: The UI process holds the traversable's session history, so that it survives WebContent process swaps and crash
+//     recovery. Entries cross to WebContent and to session storage as descriptors.
 //
 // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-session-history-entries
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-all-used-history-steps
 class WEBVIEW_API TraversableSessionHistory {
 public:
-    using Entry = Web::HTML::SessionHistoryEntryDescriptor;
-
     struct TraversalTarget {
         size_t target_step_index { 0 };
         i32 target_step { 0 };
-        Entry const* target_top_level_entry { nullptr };
+        size_t target_top_level_entry_index { 0 };
+        CanonicalSessionHistoryEntry const* target_top_level_entry { nullptr };
         bool target_step_is_top_level_entry { false };
         bool changes_top_level_entry { false };
     };
 
-    enum class UpdateResult {
-        // WebContent sent the same complete top-level traversable session
-        // history that the UI process stores authoritatively.
-        CompleteSnapshot,
-
-        // WebContent sent a valid partial view of session history. The UI
-        // process merged it into the authoritative history mirror, but
-        // WebContent cannot be assumed to know or use every UI history step.
-        MergedPartialSnapshot,
-
-        // WebContent sent a snapshot that cannot describe the current UI-owned
-        // traversable session history.
-        InvalidSnapshot,
-    };
+    TraversableSessionHistory() = default;
+    TraversableSessionHistory(TraversableSessionHistory&&) = default;
+    TraversableSessionHistory& operator=(TraversableSessionHistory&&) = default;
 
     bool is_empty() const { return m_entries.is_empty(); }
     size_t size() const { return m_entries.size(); }
-    size_t used_step_count() const { return m_used_steps.size(); }
-    Optional<size_t> current_used_step_index() const { return m_current_used_step_index; }
+    size_t used_step_count() const { return used_steps().size(); }
+    Optional<i32> current_step() const { return m_current_session_history_step; }
+    // The index in the used steps of the used step the current step resolves to.
+    Optional<size_t> current_used_step_index() const;
     Optional<size_t> current_top_level_entry_index() const;
 
     void clear();
-    void navigate(URL::URL, Web::HTML::CrossProcessId document_state_id);
-    void navigate(URL::URL, Web::HTML::CrossProcessId document_state_id, Web::HTML::DocumentResource);
-    void replace_current_entry_url(URL::URL, Web::HTML::CrossProcessId document_state_id);
-    void replace_current_entry(URL::URL, Web::HTML::CrossProcessId document_state_id, Web::HTML::DocumentResource);
+    bool initialize_for_testing(Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32> used_steps, size_t current_used_step_index);
+    void initialize_with_initial_history_entry(NonnullRefPtr<CanonicalSessionHistoryEntry> initial_history_entry);
+    [[nodiscard]] ErrorOr<void> restore_from_ui_snapshot(Vector<Web::HTML::SessionHistoryEntryDescriptor> entries, Vector<i32> used_steps, size_t current_used_step_index, Function<Web::HTML::CrossProcessId()> allocate_cross_process_id);
     void mark_current_entry_reload_pending();
-    void clear_current_entry_reload_pending();
-    bool update_entry(Optional<Web::HTML::CrossProcessId> nested_history_id, Utf16String const& navigation_api_key, Function<void(Entry&)> const& update_entry);
-    bool update_document_state(Optional<Web::HTML::CrossProcessId> nested_history_id, Utf16String const& navigation_api_key, Function<void(Web::HTML::SessionHistoryDocumentStateDescriptor&)> const& update_document_state);
-    bool append_nested_history(CanonicalNavigable const& parent_navigable, Web::HTML::SessionHistoryNestedHistoryDescriptor);
-    bool remove_nested_history(CanonicalNavigable const& parent_navigable, Web::HTML::CrossProcessId child_navigable_id);
-    UpdateResult update_from_web_content(Vector<Entry> entries, Vector<i32> used_steps, size_t current_used_step_index);
-    [[nodiscard]] bool did_seed_web_content_from_ui_process(Vector<Entry> entries, Vector<i32> used_steps, size_t current_used_step_index);
-    void did_seed_web_content_from_ui_process(size_t current_top_level_entry_index);
-    [[nodiscard]] bool did_restore_web_content_to_current_step(i32 step);
-    [[nodiscard]] bool did_apply_web_content_traversal_to_step(i32 step);
-    void forget_web_content_state();
-    Vector<Entry> entries() const;
+    Optional<i32> append_nested_history(CanonicalNavigable const& parent_navigable, CanonicalDocumentState& parent_document_state, Web::HTML::CrossProcessId child_navigable_id, NonnullRefPtr<CanonicalSessionHistoryEntry> history_entry);
+    bool remove_nested_history(CanonicalNavigable const& parent_navigable, Web::HTML::CrossProcessId parent_document_state_id, Web::HTML::CrossProcessId child_navigable_id);
+    void clear_the_forward_session_history();
+    // Clears the forward session history, then appends entry to navigable's session history entries at the step after
+    // the current one, which it returns. Changes nothing if navigable has no entries at or before the current step.
+    Optional<i32> push_session_history_entry(CanonicalNavigable const&, NonnullRefPtr<CanonicalSessionHistoryEntry>);
+    // Replaces entry_to_replace in navigable's session history entries with entry, at its step. Changes nothing if
+    // entry_to_replace is not among them.
+    bool replace_session_history_entry(CanonicalNavigable const&, CanonicalSessionHistoryEntry const& entry_to_replace, NonnullRefPtr<CanonicalSessionHistoryEntry>);
+    Vector<Web::HTML::SessionHistoryEntryDescriptor> entries() const;
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-all-used-history-steps
     Vector<i32> used_steps() const;
-    Vector<Entry> web_content_known_entries() const;
-    Vector<i32> web_content_known_used_steps() const;
-    Optional<i32> web_content_current_step() const;
-    bool web_content_uses_ui_step_coordinates() const { return m_web_content_uses_ui_step_coordinates; }
-    bool web_content_history_matches_mirror() const;
 
     [[nodiscard]] bool can_go_back() const;
     [[nodiscard]] bool can_go_forward() const;
     [[nodiscard]] bool has_only_top_level_used_steps() const;
-    [[nodiscard]] bool current_step_is_top_level_entry() const;
-    [[nodiscard]] Optional<i32> current_step_to_restore_after_loading_top_level_entry() const;
-    [[nodiscard]] bool web_content_can_traverse_to(TraversalTarget const&) const;
     [[nodiscard]] Optional<TraversalTarget> traversal_target_for_delta(int delta) const;
     [[nodiscard]] Optional<TraversalTarget> traversal_target_for_step(i32 step) const;
-    [[nodiscard]] Optional<Vector<Entry> const&> get_session_history_entries(CanonicalNavigable const&) const;
+    [[nodiscard]] Optional<Vector<NonnullRefPtr<CanonicalSessionHistoryEntry>> const&> get_session_history_entries(CanonicalNavigable const&) const;
+    [[nodiscard]] Optional<i32> get_the_used_step(i32 step) const;
+    [[nodiscard]] CanonicalSessionHistoryEntry* get_the_target_history_entry(CanonicalNavigable const&, i32 step) const;
+    [[nodiscard]] Optional<Web::HTML::HistoryObjectLengthAndIndex> get_the_history_object_length_and_index(i32 step) const;
+    [[nodiscard]] Optional<Vector<Web::HTML::SessionHistoryEntryDescriptor>> get_session_history_entries_for_the_navigation_api(CanonicalNavigable const&, i32 target_step) const;
+    [[nodiscard]] Vector<Web::HTML::CrossProcessId> get_all_navigables_whose_current_session_history_entry_will_change_or_reload(CanonicalNavigable const& traversable, i32 target_step) const;
+    [[nodiscard]] Vector<Web::HTML::CrossProcessId> get_all_navigables_that_might_experience_a_cross_document_traversal(CanonicalNavigable const& traversable, i32 target_step) const;
+    [[nodiscard]] Vector<Web::HTML::CrossProcessId> get_all_navigables_that_only_need_history_object_length_index_update(CanonicalNavigable const& traversable, i32 target_step) const;
+    void set_current_session_history_step(i32 step)
+    {
+        VERIFY(used_steps().contains_slow(step));
+        m_current_session_history_step = step;
+    }
     [[nodiscard]] Optional<size_t> target_step_index_for_delta(int delta) const;
     [[nodiscard]] Optional<i32> step_at(size_t index) const;
-    [[nodiscard]] Entry const* current_entry() const;
-    [[nodiscard]] Entry const* entry_at(size_t index) const;
-    [[nodiscard]] Entry const* entry_for_step(i32 step) const;
-    [[nodiscard]] Entry const* top_level_entry_for_step(i32 step) const;
+    [[nodiscard]] CanonicalSessionHistoryEntry* current_entry() const;
+    [[nodiscard]] CanonicalSessionHistoryEntry* entry_at(size_t index) const;
+    [[nodiscard]] CanonicalSessionHistoryEntry* entry_for_step(i32 step) const;
+    [[nodiscard]] CanonicalSessionHistoryEntry* top_level_entry_for_step(i32 step) const;
 
     void traverse_to(size_t index);
 
 private:
+    // The entries of navigable among those at or before step, which clearing the forward session history at step keeps.
+    [[nodiscard]] Optional<Vector<NonnullRefPtr<CanonicalSessionHistoryEntry>> const&> session_history_entries_at_or_before(CanonicalNavigable const&, i32 step) const;
+
     // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-session-history-entries
-    Vector<Entry> m_entries;
+    Vector<NonnullRefPtr<CanonicalSessionHistoryEntry>> m_entries;
 
-    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-all-used-history-steps
-    Vector<i32> m_used_steps;
-
-    // Index of the current session history step within m_used_steps.
     // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-current-session-history-step
-    Optional<size_t> m_current_used_step_index;
-
-    // WebContent's latest current session history step, translated into the
-    // UI-owned traversable session history's step coordinate space.
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-current-session-history-step
-    Vector<Entry> m_web_content_known_entries;
-    Vector<i32> m_web_content_known_used_steps;
-    Optional<i32> m_web_content_current_step;
-    // False when a partial snapshot was translated into the UI-owned step
-    // coordinate space. In that state WebContent still uses its original step
-    // numbers, so the UI must reseed/load instead of delegating traversal by step.
-    bool m_web_content_uses_ui_step_coordinates { false };
+    // NB: A step that removing a navigable or replacing an entry made unused stays until applying the history step
+    //     resolves it to the used step at or before it, as getting the used step does.
+    Optional<i32> m_current_session_history_step;
 };
+
+struct SessionHistorySnapshot {
+    Vector<Web::HTML::SessionHistoryEntryDescriptor> entries;
+    Vector<i32> used_steps;
+    size_t current_used_step_index { 0 };
+};
+
+WEBVIEW_API ErrorOr<void> validate_snapshot_is_restorable(Vector<Web::HTML::SessionHistoryEntryDescriptor> const& entries, Vector<i32> const& used_steps, size_t current_used_step_index);
 
 }

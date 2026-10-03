@@ -9,24 +9,23 @@
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/CSS/StyleValues/RustStyleValueHandle.h>
 
 namespace Web::CSS {
 
 // https://drafts.css-houdini.org/css-typed-om-1/#cssstylevalue
-class CSSStyleValue : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(CSSStyleValue, Bindings::PlatformObject);
+class CSSStyleValue : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(CSSStyleValue, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(CSSStyleValue);
 
 public:
-    [[nodiscard]] static GC::Ref<CSSStyleValue> create(JS::Realm&, Utf16FlyString associated_property, NonnullRefPtr<StyleValue const>);
+    [[nodiscard]] static GC::Ref<CSSStyleValue> create(Utf16FlyString associated_property, StyleValue const&);
 
     virtual ~CSSStyleValue() override;
 
-    virtual void initialize(JS::Realm&) override;
-
     Optional<Utf16FlyString> const& associated_property() const { return m_associated_property; }
-    RefPtr<StyleValue const> const& source_value() const { return m_source_value; }
+    RustStyleValueHandle const& source_value() const { return m_source_value; }
 
     static WebIDL::ExceptionOr<GC::Ref<CSSStyleValue>> parse(JS::VM&, Utf16FlyString const& property, Utf16View css_text);
     static WebIDL::ExceptionOr<GC::RootVector<GC::Ref<CSSStyleValue>>> parse_all(JS::VM&, Utf16FlyString const& property, Utf16View css_text);
@@ -47,16 +46,20 @@ public:
     virtual WebIDL::ExceptionOr<NonnullRefPtr<StyleValue const>> create_an_internal_representation(PropertyNameAndID const&, PerformTypeCheck) const;
 
 protected:
-    explicit CSSStyleValue(JS::Realm&);
-    explicit CSSStyleValue(JS::Realm&, NonnullRefPtr<StyleValue const> source_value);
+    explicit CSSStyleValue();
+    explicit CSSStyleValue(StyleValue const& source_value);
+
+    // Wraps the held Rust value in a C++ StyleValue facade on demand.
+    RefPtr<StyleValue const> source_style_value() const;
 
 private:
-    explicit CSSStyleValue(JS::Realm&, Utf16FlyString associated_property, NonnullRefPtr<StyleValue const> source_value);
+    explicit CSSStyleValue(Utf16FlyString associated_property, StyleValue const& source_value);
 
     // https://drafts.css-houdini.org/css-typed-om-1/#dom-cssstylevalue-associatedproperty-slot
     Optional<Utf16FlyString> m_associated_property;
 
-    RefPtr<StyleValue const> m_source_value;
+    // Shared handle to the Rust-owned value data this object was reified from.
+    RustStyleValueHandle m_source_value;
 };
 
 }

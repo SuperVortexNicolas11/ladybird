@@ -43,7 +43,6 @@ public:
 
     static ValueComparingNonnullRefPtr<CalculatedStyleValue const> create(CalcNodeRef root, NumericType resolved_type, CalculationContext context);
 
-    void serialize(StringBuilder&, SerializationMode) const;
     ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
     bool equals(StyleValue const& other) const;
     StyleValueFFI::CalcNode const* rust_calculation_root() const { return m_value->calculated.rust_calculation.node; }
@@ -83,7 +82,7 @@ public:
     bool contains_percentage() const;
     bool is_fully_simplified() const;
 
-    GC::Ref<CSSStyleValue> reify(JS::Realm&, Utf16FlyString const& associated_property) const;
+    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
 
     // Whether any node of the calculation is an anchor() function, which layout must
     // resolve with the anchor context of the box being positioned.

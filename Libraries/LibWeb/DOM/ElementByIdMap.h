@@ -15,9 +15,12 @@ namespace Web::DOM {
 
 class ElementByIdMap {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     void add(Utf16FlyString const& element_id, Element&);
     void remove(Utf16FlyString const& element_id, Element&);
     GC::Ptr<Element> get(Utf16View element_id, Node const& scope_root) const;
+    bool contains(Utf16FlyString const& element_id) const { return m_map.contains(element_id); }
     void for_each_element_with_id(Utf16View element_id, Node const& scope_root, Function<void(Element&)> callback) const;
 
     template<typename Callback>

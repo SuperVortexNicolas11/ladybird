@@ -6,12 +6,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/kmalloc.h>
 #include <LibCore/EventLoop.h>
 #include <LibURL/URL.h>
 #include <LibWakeLock/DisplaySleepInhibitor.h>
-#include <LibWeb/HTML/SelectedFile.h>
+#include <LibWebCommon/HTML/SelectedFile.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/DownloadPresentation.h>
+#include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/WebContentClient.h>
 #include <UI/Qt/Application.h>
@@ -19,6 +21,7 @@
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/Icon.h>
+#include <UI/Qt/JavaScriptDialog.h>
 #if defined(AK_OS_MACOS)
 #    include <UI/Qt/MacWindow.h>
 #endif
@@ -26,6 +29,7 @@
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/WindowControlButton.h>
 
+#include <LibWebView/TabPerformanceMonitor.h>
 #include <QColorDialog>
 #include <QFileDialog>
 #include <QFont>
@@ -34,7 +38,6 @@
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QImage>
-#include <QInputDialog>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
@@ -45,16 +48,40 @@
 #include <QResizeEvent>
 #include <QScreen>
 #include <QScrollArea>
+#include <QStyleOptionToolButton>
+#include <QStylePainter>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <UI/Qt/PerformanceMonitorWidget.h>
 
 namespace Ladybird {
 
 static constexpr auto WINDOW_DRAG_REGION_PROPERTY = "LadybirdWindowDragRegion";
 
-class HamburgerButton final : public QToolButton {
+class ToolbarButton : public QToolButton {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     using QToolButton::QToolButton;
+
+protected:
+    virtual void paintEvent(QPaintEvent*) override
+    {
+        QStyleOptionToolButton option;
+        initStyleOption(&option);
+
+        QStylePainter painter(this);
+        ChromeStyle::paint_circular_control_frame(painter, *this);
+
+        painter.drawComplexControl(QStyle::CC_ToolButton, option);
+    }
+};
+
+class HamburgerButton final : public ToolbarButton {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    using ToolbarButton::ToolbarButton;
 
 protected:
     virtual void mousePressEvent(QMouseEvent* event) override
@@ -86,9 +113,11 @@ private:
     }
 };
 
-class DownloadsButton final : public QToolButton {
+class DownloadsButton final : public ToolbarButton {
 public:
-    using QToolButton::QToolButton;
+    AK_ALLOC_WITH_KMALLOC;
+
+    using ToolbarButton::ToolbarButton;
 
     void set_progress(Optional<double> progress)
     {
@@ -120,7 +149,7 @@ public:
 protected:
     virtual void paintEvent(QPaintEvent* event) override
     {
-        QToolButton::paintEvent(event);
+        ToolbarButton::paintEvent(event);
 
         if (!m_progress.has_value())
             return;
@@ -160,7 +189,7 @@ static constexpr int TOOLBAR_BUTTON_SIZE = 34;
 
 static QToolButton* create_toolbar_button(QWidget& parent, QAction& action)
 {
-    auto* button = new QToolButton(&parent);
+    auto* button = new ToolbarButton(&parent);
     button->setDefaultAction(&action);
     button->setAutoRaise(true);
     button->setFocusPolicy(Qt::NoFocus);
@@ -203,6 +232,8 @@ static constexpr int PRIVATE_SESSION_POPOVER_WIDTH = 320;
 
 class ElidedLabel final : public QLabel {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit ElidedLabel(QString text, Qt::TextElideMode elide_mode, QWidget* parent = nullptr)
         : QLabel(text, parent)
         , m_elide_mode(elide_mode)
@@ -238,6 +269,8 @@ private:
 
 class DownloadRow final : public QFrame {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit DownloadRow(WebView::FileDownloader::Download const& download, QWidget* parent)
         : QFrame(parent)
         , m_download_id(download.id)
@@ -269,6 +302,18 @@ public:
 
         row_layout->addLayout(details_layout, 1);
 
+        m_pause_button = new QPushButton("Pause", this);
+        m_pause_button->setFocusPolicy(Qt::NoFocus);
+        QObject::connect(m_pause_button, &QPushButton::clicked, this, [this] {
+            if (m_is_paused) {
+                if (on_resume_download)
+                    on_resume_download(m_download_id);
+            } else if (on_pause_download) {
+                on_pause_download(m_download_id);
+            }
+        });
+        row_layout->addWidget(m_pause_button, 0, Qt::AlignTop);
+
         m_cancel_button = new QPushButton("Cancel", this);
         m_cancel_button->setFocusPolicy(Qt::NoFocus);
         QObject::connect(m_cancel_button, &QPushButton::clicked, this, [this] {
@@ -295,7 +340,7 @@ public:
 
         bool geometry_changed = false;
         auto progress = download.progress();
-        auto show_progress = download.status == WebView::FileDownloader::DownloadStatus::InProgress && progress.has_value();
+        auto show_progress = WebView::FileDownloader::status_is_active(download.status) && progress.has_value();
         auto progress_bar_is_visible = !m_progress_bar->isHidden();
         if (progress_bar_is_visible != show_progress) {
             m_progress_bar->setVisible(show_progress);
@@ -304,7 +349,17 @@ public:
         if (progress.has_value())
             m_progress_bar->setValue(static_cast<int>(*progress * 1000.0));
 
-        auto should_show_cancel = download.status == WebView::FileDownloader::DownloadStatus::InProgress;
+        m_is_paused = download.status == WebView::FileDownloader::DownloadStatus::Paused;
+        m_pause_button->setText(m_is_paused ? "Resume" : "Pause");
+
+        auto should_show_pause = download.can_resume && WebView::FileDownloader::status_is_active(download.status);
+        auto pause_button_is_visible = !m_pause_button->isHidden();
+        if (pause_button_is_visible != should_show_pause) {
+            m_pause_button->setVisible(should_show_pause);
+            geometry_changed = true;
+        }
+
+        auto should_show_cancel = WebView::FileDownloader::status_is_active(download.status);
         auto cancel_button_is_visible = !m_cancel_button->isHidden();
         if (cancel_button_is_visible != should_show_cancel) {
             m_cancel_button->setVisible(should_show_cancel);
@@ -315,17 +370,23 @@ public:
     }
 
     Function<void(u64)> on_cancel_download;
+    Function<void(u64)> on_pause_download;
+    Function<void(u64)> on_resume_download;
 
 private:
     u64 m_download_id { 0 };
+    bool m_is_paused { false };
     ElidedLabel* m_file_name_label { nullptr };
     ElidedLabel* m_status_label { nullptr };
     QProgressBar* m_progress_bar { nullptr };
+    QPushButton* m_pause_button { nullptr };
     QPushButton* m_cancel_button { nullptr };
 };
 
 class DownloadsPopover final : public QFrame {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit DownloadsPopover(QWidget* parent)
         : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
     {
@@ -413,6 +474,8 @@ public:
     }
 
     Function<void(u64)> on_cancel_download;
+    Function<void(u64)> on_pause_download;
+    Function<void(u64)> on_resume_download;
     Function<void()> on_open_all_downloads;
 
 private:
@@ -440,6 +503,14 @@ private:
                 if (on_cancel_download)
                     on_cancel_download(id);
             };
+            row->on_pause_download = [this](u64 id) {
+                if (on_pause_download)
+                    on_pause_download(id);
+            };
+            row->on_resume_download = [this](u64 id) {
+                if (on_resume_download)
+                    on_resume_download(id);
+            };
             m_rows_layout->addWidget(row);
             m_download_rows.append(row);
         }
@@ -464,6 +535,8 @@ private:
 
 class PrivateSessionPopover final : public QFrame {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit PrivateSessionPopover(QWidget* parent)
         : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
     {
@@ -526,7 +599,7 @@ public:
     Function<void()> on_confirm;
 };
 
-Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client, size_t page_index)
+Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client, Web::PageId page_index)
     : QWidget(window)
     , m_window(window)
 {
@@ -543,6 +616,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     };
 
     m_view = new WebContentView(this, parent_client, page_index, AK::move(view_initial_state));
+    m_javascript_dialog = new JavaScriptDialog(m_view);
     m_find_in_page = new FindInPageWidget(this, m_view);
     m_find_in_page->setVisible(false);
 
@@ -699,6 +773,13 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
 
     toolbar_layout->addWidget(m_downloads_button, 0, Qt::AlignVCenter);
     toolbar_layout->addWidget(m_private_badge, 0, Qt::AlignVCenter);
+    m_performance_monitor = new PerformanceMonitorWidget(m_toolbar);
+    toolbar_layout->addWidget(m_performance_monitor, 0, Qt::AlignVCenter);
+    (void)WebView::TabPerformanceMonitor::the();
+    m_performance_monitor->setVisible(WebView::Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowTabPerformanceMonitor));
+    view().on_performance_stats = [this](WebView::TabPerformanceStats const& stats) {
+        static_cast<PerformanceMonitorWidget*>(m_performance_monitor)->set_stats(stats);
+    };
     toolbar_layout->addWidget(m_hamburger_button, 0, Qt::AlignVCenter);
 
     if constexpr (!use_native_macos_window_controls()) {
@@ -734,11 +815,25 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     };
     set_loading(view().is_loading());
 
+    view().on_load_finish = [this](auto const&) {
+        m_suppress_javascript_dialogs_until_navigation = false;
+    };
+
+    view().on_top_level_navigation_commit = [this] {
+        m_suppress_javascript_dialogs_until_navigation = false;
+    };
+
+    view().on_browser_history_traversal_complete = [this] {
+        m_suppress_javascript_dialogs_until_navigation = false;
+    };
+
     view().on_url_change = [this](auto const& url) {
         m_location_edit->set_url(url);
     };
 
-    QObject::connect(m_location_edit, &QLineEdit::returnPressed, this, &Tab::location_edit_return_pressed);
+    m_location_edit->on_navigation = [this](auto input, auto fallback_url, auto destination_kind) {
+        location_edit_return_pressed(AK::move(input), AK::move(fallback_url), destination_kind);
+    };
     QObject::connect(m_location_edit, &LocationEdit::focus_return_requested, this, [this] {
         view().setFocus();
     });
@@ -766,101 +861,154 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
         update_tab_icon();
     };
 
-    view().on_request_alert = [this](auto const& message) {
-        m_dialog = new QMessageBox(QMessageBox::Icon::Warning, "Ladybird", qstring_from_utf16_string(message), QMessageBox::StandardButton::Ok, &view());
+    auto javascript_dialog_title = [this] {
+        auto origin = view().url().origin();
+        if (!origin.is_opaque())
+            return qstring_from_ak_string(origin.serialize());
+        return qformatted("{}://", qstring_from_ak_string(view().url().scheme()));
+    };
 
-        QObject::connect(m_dialog, &QDialog::finished, this, [this]() {
+    view().on_request_alert = [this, javascript_dialog_title](auto const& message) {
+        if (m_suppress_javascript_dialogs_until_navigation) {
             view().alert_closed();
-            m_dialog = nullptr;
-        });
-
-        m_dialog->open();
+            return;
+        }
+        m_javascript_dialog->show_alert(javascript_dialog_title(), qstring_from_utf16_string(message));
     };
 
-    view().on_request_confirm = [this](auto const& message) {
-        m_dialog = new QMessageBox(QMessageBox::Icon::Question, "Ladybird", qstring_from_utf16_string(message), QMessageBox::StandardButton::Ok | QMessageBox::StandardButton::Cancel, &view());
-
-        QObject::connect(m_dialog, &QDialog::finished, this, [this](auto result) {
-            view().confirm_closed(result == QMessageBox::StandardButton::Ok || result == QDialog::Accepted);
-            m_dialog = nullptr;
-        });
-
-        m_dialog->open();
+    view().on_request_confirm = [this, javascript_dialog_title](auto const& message) {
+        if (m_suppress_javascript_dialogs_until_navigation) {
+            view().confirm_closed(false);
+            return;
+        }
+        m_javascript_dialog->show_confirm(javascript_dialog_title(), qstring_from_utf16_string(message));
     };
 
-    view().on_request_prompt = [this](auto const& message, auto const& default_) {
-        m_dialog = new QInputDialog(&view());
-
-        auto& dialog = static_cast<QInputDialog&>(*m_dialog);
-        dialog.setWindowTitle("Ladybird");
-        dialog.setLabelText(qstring_from_utf16_string(message));
-        dialog.setTextValue(qstring_from_utf16_string(default_));
-
-        QObject::connect(m_dialog, &QDialog::finished, this, [this](auto result) {
-            if (result == QDialog::Accepted) {
-                auto& dialog = static_cast<QInputDialog&>(*m_dialog);
-                view().prompt_closed(utf16_string_from_qstring(dialog.textValue()));
-            } else {
-                view().prompt_closed({});
-            }
-
-            m_dialog = nullptr;
-        });
-
-        m_dialog->open();
+    view().on_request_prompt = [this, javascript_dialog_title](auto const& message, auto const& default_) {
+        if (m_suppress_javascript_dialogs_until_navigation) {
+            view().prompt_closed({});
+            return;
+        }
+        m_javascript_dialog->show_prompt(javascript_dialog_title(), qstring_from_utf16_string(message), qstring_from_utf16_string(default_));
     };
 
     view().on_request_set_prompt_text = [this](auto const& message) {
-        if (m_dialog && is<QInputDialog>(*m_dialog))
-            static_cast<QInputDialog&>(*m_dialog).setTextValue(qstring_from_utf16_string(message));
+        m_javascript_dialog->set_prompt_text(qstring_from_utf16_string(message));
+    };
+
+    m_javascript_dialog->on_complete = [this](auto type, bool accepted, auto const& prompt_text) {
+        switch (type) {
+        case JavaScriptDialog::Type::Alert:
+            view().alert_closed();
+            break;
+        case JavaScriptDialog::Type::Confirm:
+            view().confirm_closed(accepted);
+            break;
+        case JavaScriptDialog::Type::Prompt:
+            if (accepted)
+                view().prompt_closed(utf16_string_from_qstring(prompt_text));
+            else
+                view().prompt_closed({});
+            break;
+        }
+    };
+
+    view().on_before_browser_initiated_navigation = [this] {
+        m_suppress_javascript_dialogs_until_navigation = true;
+        m_javascript_dialog->dismiss();
+    };
+
+    view().on_web_content_crashed = [this](auto) {
+        m_suppress_javascript_dialogs_until_navigation = false;
+        m_javascript_dialog->reset();
+
+        // Close pickers owned by the crashed renderer with their completion signals disconnected; they
+        // must not reply to its replacement.
+        if (m_color_picker_dialog) {
+            auto* dialog = m_color_picker_dialog.data();
+            m_color_picker_dialog = nullptr;
+            QObject::disconnect(dialog, nullptr, this, nullptr);
+            dialog->close();
+            dialog->deleteLater();
+        }
+        if (m_file_picker_dialog) {
+            auto* dialog = m_file_picker_dialog.data();
+            m_file_picker_dialog = nullptr;
+            QObject::disconnect(dialog, nullptr, this, nullptr);
+            dialog->close();
+        }
+        if (m_external_url_confirmation_dialog)
+            m_external_url_confirmation_dialog->close();
+    };
+
+    view().on_request_external_url_confirmation = [this](auto const& url, auto const& initiator_origin, auto const& handler, auto on_complete) {
+        if (m_javascript_dialog->is_open() || m_color_picker_dialog || m_external_url_confirmation_dialog) {
+            on_complete(false);
+            return;
+        }
+
+        auto initiator = initiator_origin.is_opaque() ? "This page"_string : initiator_origin.serialize();
+        auto application_name = handler.application_name().is_empty() ? "another application"sv : handler.application_name().bytes_as_string_view();
+        auto title = handler.application_name().is_empty() ? "Open external application?"_string : MUST(String::formatted("Open {}?", application_name));
+        auto message = MUST(String::formatted("{} wants to open a {} link with {}.", initiator, url.scheme(), application_name));
+        auto details = MUST(String::formatted("URL: '{}'", url));
+        auto open_button_text = handler.application_name().is_empty() ? "Open"_string : MUST(String::formatted("Open {}", application_name));
+
+        auto* dialog = new QMessageBox(&view());
+        m_external_url_confirmation_dialog = dialog;
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setIcon(QMessageBox::Icon::Question);
+        dialog->setWindowTitle(qstring_from_ak_string(title));
+        dialog->setTextFormat(Qt::PlainText);
+        dialog->setText(qstring_from_ak_string(message));
+        dialog->setDetailedText(qstring_from_ak_string(details));
+        auto* open_button = dialog->addButton(qstring_from_ak_string(open_button_text), QMessageBox::ButtonRole::AcceptRole);
+        dialog->addButton(QMessageBox::StandardButton::Cancel);
+        dialog->setDefaultButton(QMessageBox::StandardButton::Cancel);
+
+        QObject::connect(dialog, &QDialog::finished, this, [this, dialog = QPointer<QMessageBox> { dialog }, open_button, on_complete = AK::move(on_complete)](auto) mutable {
+            auto accepted = dialog && dialog->clickedButton() == open_button;
+            if (m_external_url_confirmation_dialog == dialog)
+                m_external_url_confirmation_dialog = nullptr;
+            on_complete(accepted);
+        });
+
+        dialog->open();
     };
 
     view().on_request_accept_dialog = [this]() {
-        if (m_dialog)
-            m_dialog->accept();
+        m_javascript_dialog->accept();
     };
 
     view().on_request_dismiss_dialog = [this]() {
-        if (m_dialog)
-            m_dialog->reject();
+        m_javascript_dialog->dismiss();
     };
 
     view().on_request_color_picker = [this](Color current_color) {
-        m_dialog = new QColorDialog(QColor(current_color.red(), current_color.green(), current_color.blue()), &view());
+        m_color_picker_dialog = new QColorDialog(QColor(current_color.red(), current_color.green(), current_color.blue()), &view());
 
-        auto& dialog = static_cast<QColorDialog&>(*m_dialog);
+        auto& dialog = *m_color_picker_dialog;
         dialog.setWindowTitle("Ladybird");
         dialog.setOption(QColorDialog::ShowAlphaChannel, false);
         QObject::connect(&dialog, &QColorDialog::currentColorChanged, this, [this](QColor const& color) {
             view().color_picker_update(Color(color.red(), color.green(), color.blue()), Web::HTML::ColorPickerUpdateState::Update);
         });
 
-        QObject::connect(m_dialog, &QDialog::finished, this, [this](auto result) {
+        QObject::connect(m_color_picker_dialog, &QDialog::finished, this, [this](auto result) {
             if (result == QDialog::Accepted) {
-                auto& dialog = static_cast<QColorDialog&>(*m_dialog);
+                auto& dialog = *m_color_picker_dialog;
                 view().color_picker_update(Color(dialog.selectedColor().red(), dialog.selectedColor().green(), dialog.selectedColor().blue()), Web::HTML::ColorPickerUpdateState::Closed);
             } else {
                 view().color_picker_update({}, Web::HTML::ColorPickerUpdateState::Closed);
             }
 
-            m_dialog = nullptr;
+            m_color_picker_dialog = nullptr;
         });
 
-        m_dialog->open();
+        m_color_picker_dialog->open();
     };
 
     view().on_request_file_picker = [this](auto const& accepted_file_types, auto allow_multiple_files) {
-        Vector<Web::HTML::SelectedFile> selected_files;
-
-        auto create_selected_file = [&](auto const& qfile_path) {
-            auto file_path = ak_byte_string_from_qstring(qfile_path);
-
-            if (auto file = WebView::create_selected_file(file_path); file.is_error())
-                warnln("Unable to open file {}: {}", file_path, file.error());
-            else
-                selected_files.append(file.release_value());
-        };
-
         QStringList accepted_file_filters;
         QMimeDatabase mime_database;
 
@@ -906,18 +1054,32 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
         accepted_file_filters.size() > 1 ? accepted_file_filters.prepend("All files (*)") : accepted_file_filters.append("All files (*)");
         auto filters = accepted_file_filters.join(";;");
 
-        if (allow_multiple_files == Web::HTML::AllowMultipleFiles::Yes) {
-            auto paths = QFileDialog::getOpenFileNames(this, "Select files", QDir::homePath(), filters);
-            selected_files.ensure_capacity(static_cast<size_t>(paths.size()));
+        auto allow_multiple = allow_multiple_files == Web::HTML::AllowMultipleFiles::Yes;
+        auto* dialog = new QFileDialog(this, allow_multiple ? "Select files" : "Select file", QDir::homePath(), filters);
+        m_file_picker_dialog = dialog;
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setFileMode(allow_multiple ? QFileDialog::ExistingFiles : QFileDialog::ExistingFile);
 
-            for (auto const& path : paths)
-                create_selected_file(path);
-        } else {
-            auto path = QFileDialog::getOpenFileName(this, "Select file", QDir::homePath(), filters);
-            create_selected_file(path);
-        }
+        QObject::connect(dialog, &QDialog::finished, this, [this, dialog = QPointer<QFileDialog> { dialog }](int result) {
+            Vector<Web::HTML::SelectedFile> selected_files;
 
-        view().file_picker_closed(std::move(selected_files));
+            if (dialog && result == QDialog::Accepted) {
+                for (auto const& path : dialog->selectedFiles()) {
+                    auto file_path = ak_byte_string_from_qstring(path);
+
+                    if (auto file = WebView::create_selected_file(file_path); file.is_error())
+                        warnln("Unable to open file {}: {}", file_path, file.error());
+                    else
+                        selected_files.append(file.release_value());
+                }
+            }
+
+            if (m_file_picker_dialog == dialog)
+                m_file_picker_dialog = nullptr;
+            view().file_picker_closed(std::move(selected_files));
+        });
+
+        dialog->open();
     };
 
     view().on_find_in_page = [this](auto current_match_index, auto const& total_match_count) {
@@ -932,17 +1094,14 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
 
     view().on_reposition_window = [this](auto const& position) {
         m_window->move(position.x(), position.y());
-        view().did_update_window_rect();
     };
 
     view().on_resize_window = [this](auto const& size) {
         m_window->resize(size.width(), size.height());
-        view().did_update_window_rect();
     };
 
     view().on_maximize_window = [this]() {
         m_window->showMaximized();
-        view().did_update_window_rect();
     };
 
     view().on_minimize_window = [this]() {
@@ -967,7 +1126,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
 
     auto* duplicate_tab_action = new QAction("&Duplicate Tab", this);
     QObject::connect(duplicate_tab_action, &QAction::triggered, this, [this]() {
-        m_window->new_tab_from_url(view().url(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_tab(*this));
+        m_window->duplicate_tab(*this);
     });
 
     auto* move_to_start_action = new QAction("Move to &Start", this);
@@ -1121,19 +1280,11 @@ void Tab::connect_hamburger_menu()
     QObject::connect(&m_window->hamburger_menu(), &QMenu::aboutToHide, m_hamburger_button, [this]() {
         m_hamburger_button->setDown(false);
     });
-
-    update_hamburger_menu();
-}
-
-void Tab::update_hamburger_menu()
-{
-    auto show_menu_bar = show_menubar_option_available() && WebView::Application::settings().show_menu_bar();
-    m_hamburger_button->setVisible(!show_menu_bar);
 }
 
 void Tab::navigate(URL::URL const& url)
 {
-    view().load(url);
+    view().load_from_user_input(url);
 }
 
 void Tab::load_html(StringView html)
@@ -1141,18 +1292,25 @@ void Tab::load_html(StringView html)
     view().load_html(html);
 }
 
-void Tab::location_edit_return_pressed()
+void Tab::location_edit_return_pressed(String input, Optional<URL::URL> fallback_url, WebView::OmniboxDestinationKind destination_kind)
 {
-    auto text = m_location_edit->text();
-    if (text.isEmpty())
+    if (input.is_empty())
         return;
 
-    if (auto url = m_location_edit->url(); url.has_value()) {
-        view().set_next_history_visit_transition(WebView::HistoryVisitTransition::Omnibox);
-        navigate(*url);
+    view().set_next_history_visit_transition(WebView::HistoryVisitTransition::Omnibox);
+    if (destination_kind == WebView::OmniboxDestinationKind::Search) {
+        if (fallback_url.has_value())
+            view().load(*fallback_url);
+        else
+            view().load_navigation_error_page(input);
     } else {
-        view().load_navigation_error_page(ak_string_from_qstring(text));
+        view().load_from_user_input(input, AK::move(fallback_url));
     }
+
+    auto is_external_url = destination_kind == WebView::OmniboxDestinationKind::URL
+        && WebView::classify_user_input(input).classification == WebView::UserInputClassification::ExternalURL;
+    if (is_external_url)
+        m_location_edit->set_url(view().url());
 
     view().setFocus();
 }
@@ -1177,11 +1335,6 @@ void Tab::update_tab_title()
     emit title_changed(tab_index(), title());
 }
 
-void Tab::show_menu_bar_changed()
-{
-    update_hamburger_menu();
-}
-
 void Tab::tab_settings_changed()
 {
     auto const& tab_settings = WebView::Application::settings().tab_settings();
@@ -1196,6 +1349,8 @@ void Tab::tab_settings_changed()
 
 void Tab::config_variable_changed(WebView::ConfigVariableID variable)
 {
+    if (variable == WebView::ConfigVariableID::ShowTabPerformanceMonitor)
+        m_performance_monitor->setVisible(WebView::Application::settings().config_variable_as_bool(variable));
     if (variable == WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle)
         update_tab_title();
 }
@@ -1257,6 +1412,13 @@ void Tab::resizeEvent(QResizeEvent* event)
     QWidget::resizeEvent(event);
     if (m_hover_label->isVisible())
         update_hover_label();
+}
+
+void Tab::hideEvent(QHideEvent* event)
+{
+    QWidget::hideEvent(event);
+
+    m_hover_label->hide();
 }
 
 void Tab::update_hover_label()
@@ -1380,8 +1542,16 @@ void Tab::show_downloads_popover()
         m_downloads_popover = new DownloadsPopover(this);
         m_downloads_popover->on_cancel_download = [this](u64 id) {
             auto& file_downloader = WebView::Application::the().file_downloader();
-            if (auto download = file_downloader.download(id); download.has_value() && download->status == WebView::FileDownloader::DownloadStatus::InProgress)
+            if (auto download = file_downloader.download(id); download.has_value() && WebView::FileDownloader::status_is_active(download->status))
                 file_downloader.cancel_download(id);
+            update_downloads_popover();
+        };
+        m_downloads_popover->on_pause_download = [this](u64 id) {
+            WebView::Application::the().file_downloader().pause_download(id);
+            update_downloads_popover();
+        };
+        m_downloads_popover->on_resume_download = [this](u64 id) {
+            WebView::Application::the().file_downloader().resume_download(id);
             update_downloads_popover();
         };
         m_downloads_popover->on_open_all_downloads = [this] {
@@ -1520,6 +1690,9 @@ void Tab::find_next()
 
 void Tab::request_close()
 {
+    m_suppress_javascript_dialogs_until_navigation = true;
+    m_javascript_dialog->dismiss();
+
     if (!view().needs_beforeunload_check()) {
         auto request_close = view().prepare_for_immediate_close();
         if (m_window->definitely_close_tab(tab_index()))

@@ -8,13 +8,14 @@
 #pragma once
 
 #include <AK/Atomic.h>
+#include <AK/Mutex.h>
 #include <AK/Queue.h>
+#include <AK/kmalloc.h>
 #include <LibCore/Socket.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/Forward.h>
 #include <LibIPC/ReceivedMessageBytes.h>
 #include <LibIPC/TransportHandle.h>
-#include <LibSync/Mutex.h>
 
 namespace IPC {
 
@@ -23,6 +24,8 @@ class TransportSocketWindows {
     AK_MAKE_NONMOVABLE(TransportSocketWindows);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     struct Paired {
         NonnullOwnPtr<TransportSocketWindows> local;
         TransportHandle remote_handle;
@@ -41,6 +44,11 @@ public:
     void close_after_sending_all_pending_messages();
 
     void wait_until_readable();
+
+    // Both are no-ops here: post_message() writes to the socket before it returns, and the read path below reads the
+    // socket itself, so neither direction has a queue that can lag behind another transport.
+    void flush() { }
+    void wait_until_incoming_is_current() { }
 
     ErrorOr<void> post_message(MessageDataType, Vector<Attachment>& attachments);
 
@@ -64,7 +72,7 @@ private:
 private:
     NonnullOwnPtr<Core::LocalSocket> m_socket;
     Atomic<bool> m_socket_is_open { true };
-    Sync::Mutex m_send_mutex;
+    Mutex m_send_mutex;
     ByteBuffer m_unprocessed_bytes;
     int m_peer_pid = -1;
 };

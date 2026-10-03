@@ -6,11 +6,15 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
 #include <AK/Function.h>
+#include <AK/HashTable.h>
+#include <AK/JsonValue.h>
 #include <AK/LexicalPath.h>
 #include <AK/NonnullRawPtr.h>
 #include <AK/Optional.h>
+#include <LibCompositing/Types.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Forward.h>
@@ -25,31 +29,45 @@
 #include <LibMain/Main.h>
 #include <LibRequests/Forward.h>
 #include <LibURL/URL.h>
-#include <LibWeb/CSS/PreferredColorScheme.h>
-#include <LibWeb/CSS/PreferredContrast.h>
-#include <LibWeb/CSS/PreferredMotion.h>
-#include <LibWeb/Clipboard/SystemClipboard.h>
-#include <LibWeb/Compositor/Types.h>
-#include <LibWeb/HTML/ActivateTab.h>
-#include <LibWeb/HTML/CrossProcessId.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/CSS/PreferredContrast.h>
+#include <LibWebCommon/CSS/PreferredMotion.h>
+#include <LibWebCommon/Clipboard/SystemClipboard.h>
+#include <LibWebCommon/HTML/ActivateTab.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
+#include <LibWebCommon/HTML/ReplicatedNavigableState.h>
+#include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
+#include <LibWebCommon/HTML/VisibilityState.h>
+#include <LibWebCommon/Page/InputEvent.h>
+#include <LibWebCommon/Page/PageId.h>
+#include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowserProcess.h>
+#include <LibWebView/BrowsingSession.h>
+#include <LibWebView/DownloadStore.h>
+#include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/Options.h>
-#include <LibWebView/PrivateBrowsing.h>
 #include <LibWebView/Process.h>
 #include <LibWebView/ProcessManager.h>
 #include <LibWebView/Profile.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/StorageJar.h>
+#include <LibWebView/WebDriverSessionConfig.h>
 
 #if defined(AK_OS_MACOS)
 #    include <LibIPC/TransportBootstrapMach.h>
 #endif
 
-namespace Web {
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+#    include <LibWasmCompilerClient/Client.h>
+#endif
 
+namespace Compositing {
+
+struct KeyEvent;
 struct MouseEvent;
 struct PinchEvent;
 
@@ -64,6 +82,8 @@ class WEBVIEW_API Application : public DevTools::DevToolsDelegate {
     AK_MAKE_NONCOPYABLE(Application);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual ~Application();
 
     ErrorOr<int> execute();
@@ -79,21 +99,46 @@ public:
     static BrowserOptions const& browser_options() { return the().m_browser_options; }
     static RequestServerOptions const& request_server_options() { return the().m_request_server_options; }
     static WebContentOptions& web_content_options() { return the().m_web_content_options; }
+    static FontService& font_service() { return *the().m_font_service; }
+    JsonValue const& site_compatibility_data() const { return m_site_compatibility_data; }
+    ErrorOr<void> reload_site_compatibility_data();
+
+    bool claim_cpu_profiler(ProcessType);
+    void set_cpu_profiler_process(Core::Process, OwnPtr<Core::File> control_socket);
 
     virtual Optional<String> system_font_family() const { return {}; }
+    virtual Optional<String> ui_font_family() const { return {}; }
 
     static Requests::RequestClient& request_server_client(IsPrivate = IsPrivate::No);
+    static Requests::RequestControlClient& request_server_control_client() { return *the().m_request_server_control_client; }
     static ImageDecoderClient::Client& image_decoder_client() { return *the().m_image_decoder_client; }
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    static WasmCompilerClient::Client& wasm_compiler_client() { return *the().m_wasm_compiler_client; }
+#endif
 
+    virtual bool supports_system_menu_bar() const { return false; }
     virtual bool supports_vertical_tabs() const { return false; }
     virtual bool supports_private_browsing_windows() const { return false; }
     virtual bool supports_client_side_window_decorations() const { return false; }
+    // Returns true if the platform sends momentum scroll events after a touchpad flick.
+    // If it does not, the compositor makes the fling.
+    virtual bool platform_reports_scroll_momentum() const { return true; }
+
+    void appearance_changed(Badge<ApplicationSettingsObserver>);
     void tab_settings_changed(Badge<ApplicationSettingsObserver>);
 
     static BookmarkStore& bookmark_store() { return *the().m_bookmark_store; }
     void update_bookmark_action_for_current_web_view();
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
     void show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>);
+    void background_networking_settings_changed(Badge<ApplicationSettingsObserver>);
+    void content_blocker_settings_changed(Badge<ApplicationSettingsObserver>);
+    bool content_blocker_list_update_in_progress() const;
+    void update_content_blocker_lists(Badge<SettingsUI>);
+    void download_content_blocker_list_if_needed(Badge<Application, SettingsUI>, StringView identifier);
+    ErrorOr<void> import_local_content_blocker_list(String name, String contents);
+    void remove_content_blocker_list(Badge<SettingsUI>, StringView identifier);
+    Optional<UnixDateTime> content_blocker_list_last_updated_at(StringView identifier) const;
 
     struct BookmarkID {
         String id;
@@ -116,10 +161,19 @@ public:
     virtual NonnullRefPtr<BookmarkFolderPromise> display_add_bookmark_folder_dialog(Optional<String const&> default_title = {}) const;
     virtual NonnullRefPtr<BookmarkFolderPromise> display_edit_bookmark_folder_dialog([[maybe_unused]] BookmarkItem::Folder const& current_folder) const;
 
-    static HistoryStore& history_store(IsPrivate);
-    static CookieJar& cookie_jar(IsPrivate);
-    static HSTSStore& hsts_store(IsPrivate);
-    static StorageJar& storage_jar(IsPrivate);
+    static BrowsingSession& default_session() { return *the().m_default_session; }
+
+    static NonnullRefPtr<BrowsingSession> session_for_new_view(IsPrivate);
+
+    static RefPtr<BrowsingSession> existing_session(IsPrivate);
+
+    // A RequestServer client uses the cookies of the browsing session it was created for, whatever RequestServer says.
+    void did_connect_request_server_client(int client_id, BrowsingSession&);
+    RefPtr<BrowsingSession> session_for_request_server_client(int client_id) const;
+    Vector<int> request_server_client_ids_for_testing(BrowsingSession const&) const;
+
+    // NB: Null once that session has ended, so a closed private tab is not offered back afterwards.
+    static SessionStore* session_store(IsPrivate);
 
     static ProcessManager& process_manager() { return *the().m_process_manager; }
 #if defined(AK_OS_MACOS)
@@ -135,28 +189,38 @@ public:
     ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process(ViewImplementation&);
     struct ChildFrameWebContentProcess {
         NonnullRefPtr<WebContentClient> client;
-        u64 page_id { 0 };
+        Web::PageId page_id { 0 };
     };
-    ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Web::HTML::CrossProcessId root_navigable_id);
-    u64 allocate_page_id();
+    ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state);
+    Web::PageId allocate_page_id();
     Web::HTML::CrossProcessIdAllocator allocate_cross_process_id_allocator();
     Web::HTML::CrossProcessId allocate_ui_process_cross_process_id();
 
-    void maybe_close_private_browsing_session();
     void reset_private_browsing_session();
 
-    Web::Compositor::CompositorContextId allocate_compositor_context_id();
+    void notify_webdriver_window_created(String const& handle);
+    void notify_webdriver_window_closed(String const& handle);
+    void webdriver_browser_connection_died(Badge<WebDriverBrowserConnection>);
+    void push_webdriver_session_config(ViewImplementation&);
+    void push_webdriver_session_config(WebContentPage&);
+    void update_webdriver_session_config(Badge<WebDriverBrowserConnection>, Function<void(WebDriverSessionConfig&)> update);
+    Optional<u64> webdriver_page_load_timeout() const;
+    void complete_webdriver_content_command(u64 command_id, Web::WebDriver::Response);
+
+    Web::CompositorContextId allocate_compositor_context_id();
     ErrorOr<void> connect_web_content_to_compositor(WebContentClient&);
     ErrorOr<IPC::TransportHandle> connect_new_compositor_canvas_client();
-    void register_compositor_context(WebContentClient&, Web::Compositor::CompositorContextId, Optional<u64> page_id);
-    ErrorOr<void> try_register_compositor_context(WebContentClient&, Web::Compositor::CompositorContextId, Optional<u64> page_id);
-    void update_compositor_viewport(Web::Compositor::CompositorContextId, Gfx::IntSize viewport_size, Web::Compositor::WindowResizingInProgress = Web::Compositor::WindowResizingInProgress::No);
-    void update_compositor_display_metadata(Web::Compositor::CompositorContextId, Optional<u64> display_id, double refresh_rate);
-    bool send_async_scroll_to_compositor(Web::Compositor::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels);
-    bool handle_mouse_event_in_compositor(Web::Compositor::CompositorContextId, Web::MouseEvent const&);
-    bool handle_pinch_event_in_compositor(Web::Compositor::CompositorContextId, Web::PinchEvent const&);
-    bool dispatch_mouse_event_to_web_content(Web::Compositor::CompositorContextId, Web::MouseEvent const&);
-    void notify_compositor_presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId, i32 bitmap_id);
+    void register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
+    ErrorOr<void> try_register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
+    void update_compositor_viewport(Web::CompositorContextId, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress = Compositing::WindowResizingInProgress::No);
+    void update_compositor_paused_debugger_overlay(Web::CompositorContextId, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action);
+    void update_compositor_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
+    void update_compositor_context_visibility(Web::CompositorContextId, Web::HTML::VisibilityState);
+    bool handle_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&);
+    bool dispatch_key_event_to_web_content(Web::CompositorContextId, Web::KeyEvent const&);
+    void handle_pinch_event_in_compositor(Web::CompositorContextId, Web::PinchEvent const&);
+    bool handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId, Web::MouseEvent const&);
+    void notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id);
 
     Function<void()> on_compositor_process_death;
 
@@ -168,6 +232,10 @@ public:
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const;
     virtual void open_urls_in_new_tabs(ReadonlySpan<URL::URL>) const;
     virtual void open_url_in_new_window(URL::URL const&, IsPrivate) { }
+    virtual void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab) const;
+    virtual void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, IsPrivate) { }
+
+    virtual void resolve_external_url_handler(URL::URL const&, ExternalURLHandlerCallback callback) const { callback(nullptr); }
 
     void open_bookmark_in_new_tab(String const& bookmark_id, Web::HTML::ActivateTab) const;
     void open_bookmark_folder_in_new_tabs(String const& folder_id) const;
@@ -204,8 +272,8 @@ public:
     virtual Utf16String clipboard_text(ClipboardType = ClipboardType::Text) const;
     virtual void set_clipboard_text(String, ClipboardType = ClipboardType::Text);
 
-    virtual Vector<Web::Clipboard::SystemClipboardRepresentation> clipboard_entries() const;
-    virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem);
+    virtual Web::Clipboard::SystemClipboardItem clipboard_item() const { return m_clipboard; }
+    virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem item) { m_clipboard = move(item); }
     void insert_clipboard_entry(Web::Clipboard::SystemClipboardRepresentation);
 
     struct BrowsingDataSizes {
@@ -226,9 +294,10 @@ public:
         UnixDateTime since { UnixDateTime::earliest() };
         Delete delete_cached_files { Delete::No };
         Delete delete_history { Delete::No };
+        Delete delete_download_history { Delete::No };
         Delete delete_site_data { Delete::No };
     };
-    void clear_browsing_data(ClearBrowsingDataOptions const&);
+    NonnullRefPtr<Core::Promise<Empty>> clear_browsing_data(ClearBrowsingDataOptions const&);
 
     Action& reload_action() { return *m_reload_action; }
     Action& copy_selection_action() { return *m_copy_selection_action; }
@@ -247,6 +316,8 @@ public:
     Action& open_settings_page_action() { return *m_open_settings_page_action; }
 
     Menu& zoom_menu() { return *m_zoom_menu; }
+    Action& zoom_in_action() { return *m_zoom_in_action; }
+    Action& zoom_out_action() { return *m_zoom_out_action; }
     Action& reset_zoom_action() { return *m_reset_zoom_action; }
 
     Menu& color_scheme_menu() { return *m_color_scheme_menu; }
@@ -269,7 +340,7 @@ public:
 
     FileDownloader& file_downloader() { return m_file_downloader; }
 
-    void apply_view_options(Badge<ViewImplementation>, ViewImplementation&);
+    void apply_view_options(Badge<ViewImplementation>, ViewImplementation&, WebContentPage&);
 
     ErrorOr<void> toggle_devtools_enabled();
     ErrorOr<void> launch_devtools_client();
@@ -291,8 +362,13 @@ protected:
 
     virtual void create_platform_arguments(Core::ArgsParser&) { }
     virtual void create_platform_options(BrowserOptions&, RequestServerOptions&, WebContentOptions&) { }
-    virtual bool should_coordinate_browser_process() const { return true; }
+    virtual void create_platform_actions() { }
     virtual Core::EventLoop& create_platform_event_loop();
+
+    virtual bool should_coordinate_browser_process() const { return true; }
+    // An application whose state must not leak between runs — or into a developer's own browsing state.
+    virtual bool should_use_temporary_profile_by_default() const { return false; }
+    virtual SiteIsolationMode default_site_isolation_mode() const { return SiteIsolationMode::TopLevel; }
 
     virtual Optional<ByteString> ask_user_for_download_path([[maybe_unused]] ByteString const& file) const { return {}; }
 
@@ -307,9 +383,10 @@ protected:
 
     Main::Arguments& arguments() { return m_arguments; }
 
+    bool has_spare_web_content_process() const { return m_spare_web_content_process; }
+
 private:
-    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, u64 initial_page_id, Optional<Web::HTML::CrossProcessId> root_navigable_id = {});
-    PrivateBrowsingSession& ensure_private_browsing_session();
+    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {}, Web::HTML::VisibilityState system_visibility_state = Web::HTML::VisibilityState::Hidden);
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
     ErrorOr<void> launch_compositor_process();
@@ -318,12 +395,30 @@ private:
     void crash_compositor_process();
     ErrorOr<void> launch_request_server();
     ErrorOr<void> launch_image_decoder_server();
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    ErrorOr<void> launch_wasm_compiler_server();
+#endif
     ErrorOr<void> launch_devtools_server();
     ErrorOr<void> load_content_blocker_lists();
+    void apply_content_blocker_settings();
+    void rebuild_content_blocker_list_paths();
+    ByteString content_blocker_list_path(StringView identifier) const;
+    ErrorOr<void> save_content_blocker_list(ByteString const& path, ReadonlyBytes);
+    enum class ContentBlockerListUpdateTrigger {
+        Automatic,
+        UserInitiated,
+    };
+    void start_content_blocker_list_update(ContentBlockerListUpdateTrigger, Optional<StringView> requested_identifier = {});
+    void start_next_content_blocker_list_update();
+    void did_receive_content_blocker_list_update_data(ReadonlyBytes);
+    void stop_current_content_blocker_list_update_and_continue();
+    void finish_current_content_blocker_list_update();
     ErrorOr<NonnullRawPtr<Core::GeolocationProvider>> ensure_geolocation_provider();
 
     void initialize_actions();
     void update_vertical_tabs_action();
+
+    WebDriverBrowserConnection* webdriver_browser_connection();
 
     struct MenuData {
         Menu& menu;
@@ -393,9 +488,21 @@ private:
     virtual void listen_for_style_sheet_sources(DevTools::TabDescription const&, OnStyleSheetSourceReceived) const override;
     virtual void stop_listening_for_style_sheet_sources(DevTools::TabDescription const&) const override;
     virtual void retrieve_sources(DevTools::TabDescription const&, OnSourcesReceived) const override;
-    virtual void retrieve_source(DevTools::TabDescription const&, Web::HTML::ScriptRegistry::Identifier, OnSourceReceived) const override;
+    virtual void retrieve_source(DevTools::TabDescription const&, Web::HTML::ScriptRegistryIdentifier, OnSourceReceived) const override;
     virtual void listen_for_sources(DevTools::TabDescription const&, OnSourceAvailable) const override;
     virtual void stop_listening_for_sources(DevTools::TabDescription const&) const override;
+    virtual void attach_debugger(DevTools::TabDescription const&, OnDebuggerPaused, OnDebuggerResumed) const override;
+    virtual void configure_debugger(DevTools::TabDescription const&, DebuggerConfiguration) const override;
+    virtual void detach_debugger(DevTools::TabDescription const&) const override;
+    virtual void interrupt_debugger(DevTools::TabDescription const&) const override;
+    virtual void resume_debugger(DevTools::TabDescription const&, DebuggerResumeMode) const override;
+    virtual void update_debugger_blackboxing(DevTools::TabDescription const&, Utf16String, Vector<DebuggerBlackboxRange>, DebuggerBlackboxingOperation) const override;
+    virtual void set_debugger_breakpoint(DevTools::TabDescription const&, DebuggerBreakpointLocation, DebuggerBreakpointOptions, OnDebuggerBreakpointOperationComplete) const override;
+    virtual void remove_debugger_breakpoint(DevTools::TabDescription const&, DebuggerBreakpointLocation, OnDebuggerBreakpointOperationComplete) const override;
+    virtual void retrieve_debugger_environments(DevTools::TabDescription const&, u64 frame_id, OnDebuggerEnvironmentsReceived) const override;
+    virtual void evaluate_javascript_in_debugger_frame(DevTools::TabDescription const&, u64 frame_id, String const&, OnDebuggerEvaluationComplete) const override;
+    virtual void retrieve_debugger_object_properties(DevTools::TabDescription const&, u64 object_id, OnDebuggerObjectPropertiesReceived) const override;
+    virtual void retrieve_debugger_source_positions(DevTools::TabDescription const&, Web::HTML::ScriptRegistryIdentifier, OnDebuggerSourcePositionsReceived) const override;
     virtual void resolve_dom_node_url(DevTools::TabDescription const&, Optional<Web::UniqueNodeID>, String const&, OnResolvedURLReceived) const override;
     virtual void evaluate_javascript(DevTools::TabDescription const&, String const&, OnScriptEvaluationComplete) const override;
     virtual void listen_for_console_messages(DevTools::TabDescription const&, OnConsoleMessage) const override;
@@ -418,19 +525,52 @@ private:
 
     OwnPtr<BookmarkStore> m_bookmark_store;
     OwnPtr<ApplicationBookmarkStoreObserver> m_bookmark_store_observer;
-    OwnPtr<HistoryStore> m_history_store;
+
     OwnPtr<AutocompleteService> m_autocomplete_service;
 
     Main::Arguments m_arguments;
     BrowserOptions m_browser_options;
+    Optional<Core::Process> m_cpu_profiler_process;
+    OwnPtr<Core::File> m_cpu_profiler_control_socket;
+    bool m_cpu_profiler_claimed { false };
+    Vector<int> m_cpu_profiler_signal_handlers;
     RequestServerOptions m_request_server_options;
     WebContentOptions m_web_content_options;
+    RefPtr<FontService> m_font_service;
+    JsonValue m_site_compatibility_data;
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
+    RefPtr<Core::Timer> m_content_blocker_list_update_timer;
+    struct PendingContentBlockerListUpdate {
+        String identifier;
+        String name;
+        URL::URL url;
+        ByteString path;
+        ContentBlockerListUpdateTrigger trigger;
+        u8 redirect_count { 0 };
+    };
+    Vector<ByteString> m_explicit_content_blocker_list_paths;
+    ByteString m_content_blocker_lists_directory;
+    Vector<PendingContentBlockerListUpdate> m_pending_content_blocker_list_updates;
+    Optional<PendingContentBlockerListUpdate> m_active_content_blocker_list_update;
+    ByteBuffer m_content_blocker_list_update_payload;
+    bool m_content_blocker_list_update_response_ok { false };
+    RefPtr<Requests::Request> m_content_blocker_list_update_request;
+    bool m_content_blocker_list_update_cancelled { false };
+    bool m_content_blocker_list_update_had_success { false };
 
+    RefPtr<WebDriverBrowserConnection> m_webdriver_browser_connection;
+    bool m_webdriver_browser_connection_failed { false };
+    WebDriverSessionConfig m_webdriver_session_config;
+
+    RefPtr<Requests::RequestControlClient> m_request_server_control_client;
     RefPtr<Requests::RequestClient> m_request_server_client;
     RefPtr<Requests::RequestClient> m_private_request_server_client;
     RefPtr<ImageDecoderClient::Client> m_image_decoder_client;
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    RefPtr<WasmCompilerClient::Client> m_wasm_compiler_client;
+#endif
     RefPtr<CompositorClient> m_compositor_client;
+    RefPtr<FontServiceConnection> m_compositor_font_service_connection;
     bool m_reported_compositor_gpu_presentation_unavailable { false };
     size_t m_compositor_restart_count { 0 };
     enum class CompositorRecoveryState {
@@ -441,17 +581,17 @@ private:
     CompositorRecoveryState m_compositor_recovery_state { CompositorRecoveryState::Idle };
 
     RefPtr<WebContentClient> m_spare_web_content_process;
+    // Every WebContent client, from its launch until its process exits. A page keeps no hold on its client.
+    HashTable<NonnullRefPtr<WebContentClient>> m_web_content_clients;
     bool m_has_queued_task_to_launch_spare_web_content_process { false };
     u64 m_next_page_or_compositor_context_id { 1 };
     u64 m_next_cross_process_id_namespace { 1 };
     Web::HTML::CrossProcessIdAllocator m_ui_process_cross_process_id_allocator;
 
-    RefPtr<Database::Database> m_database;
-    RefPtr<Database::Database> m_history_database;
-    OwnPtr<CookieJar> m_cookie_jar;
-    OwnPtr<HSTSStore> m_hsts_store;
-    OwnPtr<StorageJar> m_storage_jar;
-    OwnPtr<PrivateBrowsingSession> m_private_browsing_session;
+    OwnPtr<DownloadStore> m_download_store;
+    RefPtr<BrowsingSession> m_default_session;
+    WeakPtr<BrowsingSession> m_private_session;
+    HashMap<int, WeakPtr<BrowsingSession>> m_request_server_client_sessions;
 
     OwnPtr<Core::GeolocationProvider> m_geolocation_provider;
     OwnPtr<Core::TimeZoneWatcher> m_time_zone_watcher;
@@ -472,6 +612,8 @@ private:
     RefPtr<Action> m_open_settings_page_action;
 
     RefPtr<Menu> m_zoom_menu;
+    RefPtr<Action> m_zoom_in_action;
+    RefPtr<Action> m_zoom_out_action;
     RefPtr<Action> m_reset_zoom_action;
 
     RefPtr<Menu> m_color_scheme_menu;
@@ -507,7 +649,7 @@ private:
     StringView m_user_agent_string;
     StringView m_navigator_compatibility_mode;
 
-    Optional<Web::Clipboard::SystemClipboardItem> m_clipboard;
+    Web::Clipboard::SystemClipboardItem m_clipboard;
 
     FileDownloader m_file_downloader;
 

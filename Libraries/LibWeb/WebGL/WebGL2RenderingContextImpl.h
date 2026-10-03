@@ -15,14 +15,14 @@
 #include <LibWeb/WebGL/Types.h>
 #include <LibWeb/WebGL/WebGLRenderingContextImpl.h>
 #include <LibWeb/WebIDL/Buffers.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::WebGL {
 
 using namespace Web::HTML;
 
 class WebGL2RenderingContextImpl : public WebGLRenderingContextImpl {
-    WEB_NON_IDL_PLATFORM_OBJECT(WebGL2RenderingContextImpl, WebGLRenderingContextImpl);
+    WEB_NON_IDL_WRAPPABLE(WebGL2RenderingContextImpl, WebGLRenderingContextImpl);
 
 public:
     WebGL2RenderingContextImpl(JS::Realm&, NonnullOwnPtr<WebGLContextProxy>);

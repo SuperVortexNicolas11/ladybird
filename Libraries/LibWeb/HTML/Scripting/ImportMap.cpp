@@ -16,7 +16,7 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Infra/JSON.h>
 #include <LibWeb/Infra/SerializedURL.h>
-#include <LibWeb/Infra/Strings.h>
+#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::HTML {
 
@@ -322,7 +322,7 @@ static ModuleSpecifierMap merge_module_specifier_maps(JS::Realm& realm, ModuleSp
 // https://html.spec.whatwg.org/multipage/webappapis.html#merge-existing-and-new-import-maps
 void merge_existing_and_new_import_maps(Window& global, ImportMap& new_import_map)
 {
-    auto& realm = global.realm();
+    auto& realm = global.principal_realm();
 
     // 1. Let newImportMapScopes be a deep copy of newImportMap's scopes.
     auto new_import_map_scopes = new_import_map.scopes();

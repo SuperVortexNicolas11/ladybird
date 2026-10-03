@@ -164,6 +164,8 @@ requires(!IsLvalueReference<T>) class [[nodiscard]] Optional<T> : public Optiona
     static_assert(!IsLvalueReference<T> && !IsRvalueReference<T>);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     using ValueType = T;
 
     ALWAYS_INLINE constexpr Optional()
@@ -666,8 +668,12 @@ struct SentinelOptionalTraits;
 
 template<typename T, typename Traits = SentinelOptionalTraits<T>>
 class SentinelOptional : public OptionalBase<T> {
+    AK_MAKE_DEFAULT_MOVABLE(SentinelOptional);
+    AK_MAKE_DEFAULT_COPYABLE(SentinelOptional);
+
 public:
     SentinelOptional() = default;
+    ALWAYS_INLINE constexpr ~SentinelOptional() = default;
 
     template<SameAs<OptionalNone> V>
     constexpr SentinelOptional(V) { }

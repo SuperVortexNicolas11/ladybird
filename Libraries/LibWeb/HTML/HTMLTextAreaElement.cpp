@@ -8,11 +8,9 @@
  */
 
 #include <AK/Utf16View.h>
-#include <LibWeb/Bindings/HTMLTextAreaElement.h>
-#include <LibWeb/Bindings/InputEvent.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
@@ -24,11 +22,12 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/Numbers.h>
-#include <LibWeb/Infra/Strings.h>
-#include <LibWeb/Layout/TextAreaBox.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/InputEvent.h>
+#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::HTML {
 
@@ -41,22 +40,15 @@ HTMLTextAreaElement::HTMLTextAreaElement(DOM::Document& document, DOM::Qualified
 
 HTMLTextAreaElement::~HTMLTextAreaElement() = default;
 
-void HTMLTextAreaElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
+// `:user-valid` and `:user-invalid` turn on the first time the user has interacted with the
+// control, which no attribute and no value says. The style engine is told what the element now
+// holds rather than asking.
+void HTMLTextAreaElement::set_user_validity(bool flag)
 {
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
-
-    // AD-HOC: We rewrite `display: inline` to `display: inline-block`.
-    //         This is required for the internal shadow tree to work correctly in layout.
-    if (style.display().is_inline_outside() && style.display().is_flow_inside())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::InlineBlock)));
-}
-
-void HTMLTextAreaElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLTextAreaElement);
-    Base::initialize(realm);
+    if (m_user_validity == flag)
+        return;
+    m_user_validity = flag;
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
 }
 
 void HTMLTextAreaElement::visit_edges(Cell::Visitor& visitor)
@@ -72,10 +64,10 @@ void HTMLTextAreaElement::did_receive_focus()
 {
     if (!m_text_node)
         return;
-    m_text_node->set_needs_repaint();
+    m_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     if (m_placeholder_text_node)
-        m_placeholder_text_node->set_needs_repaint();
+        m_placeholder_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     document().get_selection()->remove_all_ranges();
 }
@@ -83,16 +75,16 @@ void HTMLTextAreaElement::did_receive_focus()
 void HTMLTextAreaElement::did_lose_focus()
 {
     if (m_text_node)
-        m_text_node->set_needs_repaint();
+        m_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     if (m_placeholder_text_node)
-        m_placeholder_text_node->set_needs_repaint();
+        m_placeholder_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     // The change event fires when the value is committed, if that makes sense for the control,
     // or else when the control loses focus
-    // https://github.com/whatwg/html/issues/1080
-    // INTEROP: Other engines synchronously notify script when the control loses focus.
-    auto change_event = DOM::Event::create(realm(), HTML::EventNames::change);
+    auto change_event = DOM::Event::create(
+        HTML::EventNames::change,
+        HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
     change_event->set_bubbles(true);
     dispatch_event(change_event);
 }
@@ -133,12 +125,10 @@ void HTMLTextAreaElement::clear_algorithm()
 
     // Unlike their associated reset algorithms, changes made to form controls as part of these algorithms do count as
     // changes caused by the user (and thus, e.g. do cause input events to fire).
-    // https://github.com/whatwg/html/issues/1080
-    // INTEROP: Other engines dispatch this event synchronously after clearing the value.
-    Bindings::InputEventInit input_event_init;
+    UIEvents::InputEventInit input_event_init;
     input_event_init.bubbles = true;
     input_event_init.composed = true;
-    auto input_event = UIEvents::InputEvent::create_from_platform_event(realm(), HTML::EventNames::input, input_event_init);
+    auto input_event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, input_event_init, {}, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
     dispatch_event(input_event);
 }
 
@@ -205,6 +195,8 @@ void HTMLTextAreaElement::set_value(Utf16View value)
 
             set_the_selection_range(m_text_node->length(), m_text_node->length());
         }
+
+        CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
     }
 }
 
@@ -253,7 +245,7 @@ WebIDL::Long HTMLTextAreaElement::max_length() const
 WebIDL::ExceptionOr<void> HTMLTextAreaElement::set_max_length(WebIDL::Long value)
 {
     // The maxLength IDL attribute must reflect the maxlength content attribute, limited to only non-negative numbers.
-    set_attribute_value(HTML::AttributeNames::maxlength, TRY(convert_non_negative_integer_to_string(realm(), value)));
+    set_attribute_value(HTML::AttributeNames::maxlength, Utf16String::from_utf8(TRY(convert_non_negative_integer_to_string(value))));
     return {};
 }
 
@@ -271,7 +263,7 @@ WebIDL::Long HTMLTextAreaElement::min_length() const
 WebIDL::ExceptionOr<void> HTMLTextAreaElement::set_min_length(WebIDL::Long value)
 {
     // The minLength IDL attribute must reflect the minlength content attribute, limited to only non-negative numbers.
-    set_attribute_value(HTML::AttributeNames::minlength, TRY(convert_non_negative_integer_to_string(realm(), value)));
+    set_attribute_value(HTML::AttributeNames::minlength, Utf16String::from_utf8(TRY(convert_non_negative_integer_to_string(value))));
     return {};
 }
 
@@ -349,7 +341,7 @@ void HTMLTextAreaElement::create_shadow_tree_if_needed()
     if (shadow_root())
         return;
 
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
     shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
 
@@ -357,10 +349,10 @@ void HTMLTextAreaElement::create_shadow_tree_if_needed()
     {
         static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
         if (!style) {
-            style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
+            style = CSS::CSSStyleProperties::create({}, {});
             style->set_declarations_from_text(u"display: flex;"sv);
         }
-        element->set_inline_style(*style);
+        set_own_inline_style(*element, *style);
     }
     MUST(shadow_root->append_child(element));
 
@@ -368,16 +360,16 @@ void HTMLTextAreaElement::create_shadow_tree_if_needed()
     {
         static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
         if (!style) {
-            style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
+            style = CSS::CSSStyleProperties::create({}, {});
             style->set_declarations_from_text(u"width: 100%;"sv);
         }
-        m_inner_text_element->set_inline_style(*style);
+        set_own_inline_style(*m_inner_text_element, *style);
     }
     MUST(element->append_child(*m_inner_text_element));
 
     // NOTE: If `children_changed()` was called before now, `m_raw_value` will hold the text content.
     //       Otherwise, it will get filled in whenever that does get called.
-    m_text_node = realm().create<DOM::Text>(document(), m_raw_value);
+    m_text_node = DOM::Text::create(document(), m_raw_value);
     handle_maxlength_attribute();
     MUST(m_inner_text_element->append_child(*m_text_node));
 
@@ -385,7 +377,7 @@ void HTMLTextAreaElement::create_shadow_tree_if_needed()
     MUST(element->append_child(*m_placeholder_element));
     m_placeholder_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::Placeholder);
 
-    m_placeholder_text_node = realm().create<DOM::Text>(document(), get_attribute_value(HTML::AttributeNames::placeholder));
+    m_placeholder_text_node = DOM::Text::create(document(), get_attribute_value(HTML::AttributeNames::placeholder));
     MUST(m_placeholder_element->append_child(*m_placeholder_text_node));
 
     update_placeholder_visibility();
@@ -408,8 +400,9 @@ static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_visible()
 {
     static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
+        style = CSS::CSSStyleProperties::create({}, {});
         style->set_declarations_from_text(uR"~~~(
+                display: block;
                 width: 100%;
                 overflow: hidden;
                 margin-inline-start: -100%;
@@ -424,7 +417,7 @@ static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_hidden()
 {
     static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
+        style = CSS::CSSStyleProperties::create({}, {});
         style->set_declarations_from_text(u"display: none;"sv);
     }
     return *style;
@@ -438,9 +431,9 @@ void HTMLTextAreaElement::update_placeholder_visibility()
         return;
     auto placeholder_text = get_attribute(AttributeNames::placeholder);
     if (placeholder_text.has_value() && m_text_node->data().is_empty())
-        m_placeholder_element->set_inline_style(placeholder_style_when_visible());
+        set_own_inline_style(*m_placeholder_element, placeholder_style_when_visible());
     else
-        m_placeholder_element->set_inline_style(placeholder_style_when_hidden());
+        set_own_inline_style(*m_placeholder_element, placeholder_style_when_hidden());
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#the-textarea-element:children-changed-steps
@@ -455,10 +448,11 @@ void HTMLTextAreaElement::children_changed(ChildrenChangedMetadata const& metada
         if (m_text_node)
             m_text_node->set_data(m_raw_value);
         update_placeholder_visibility();
+        CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
     }
 }
 
-void HTMLTextAreaElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const& value, Optional<Utf16FlyString> const&)
+void HTMLTextAreaElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const&)
 {
     if (name == HTML::AttributeNames::placeholder) {
         if (m_placeholder_text_node)
@@ -466,6 +460,11 @@ void HTMLTextAreaElement::form_associated_element_attribute_changed(Utf16FlyStri
         update_placeholder_visibility();
     } else if (name == HTML::AttributeNames::maxlength) {
         handle_maxlength_attribute();
+    } else if (first_is_one_of(name, HTML::AttributeNames::rows, HTML::AttributeNames::cols)) {
+        // rows and cols feed the element's default preferred size, which reaches layout
+        // only through the replaced-content facts; nothing else schedules a relayout.
+        if (old_value != value)
+            set_needs_layout_update(DOM::SetNeedsLayoutReason::DefaultPreferredSizeAttributeChange);
     }
 
     // AD-HOC: A change to any of these attributes can change whether the element satisfies its constraints, and
@@ -482,16 +481,17 @@ void HTMLTextAreaElement::did_edit_text_node(Utf16FlyString const& input_type, O
     // AD-HOC: Editing the value may change which validity pseudo-classes match.
     CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
-    // https://html.spec.whatwg.org/multipage/form-elements.html#the-textarea-element
-    // https://github.com/whatwg/html/issues/1080
-    // INTEROP: Although HTML specifies queuing this event, other engines dispatch it synchronously for text edits.
-    //          Controlled textareas rely on observing each edit before rendering can restore an older value.
-    Bindings::InputEventInit input_event_init;
+    // Any time the user causes the element's raw value to change, the user agent must queue an element task on the user
+    // interaction task source given the textarea element to fire an event named input at the textarea element, with the
+    // bubbles and composed attributes initialized to true.
+    UIEvents::InputEventInit input_event_init;
     input_event_init.bubbles = true;
     input_event_init.composed = true;
     input_event_init.input_type = input_type;
     input_event_init.data = data;
-    auto input_event = UIEvents::InputEvent::create_from_platform_event(realm(), HTML::EventNames::input, input_event_init);
+    // https://w3c.github.io/uievents/#dom-inputevent-iscomposing
+    input_event_init.is_composing = document().is_input_method_composing();
+    auto input_event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, input_event_init, {}, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
     dispatch_event(input_event);
 
     // A textarea element's dirty value flag must be set to true whenever the user interacts with the control in a way that changes the raw value.
@@ -536,9 +536,9 @@ Optional<Utf16String> HTMLTextAreaElement::placeholder_value() const
     return get_attribute_value(HTML::AttributeNames::placeholder);
 }
 
-RefPtr<Layout::Node> HTMLTextAreaElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+CSS::ElementBoxKind HTMLTextAreaElement::box_kind() const
 {
-    return make_ref_counted<Layout::TextAreaBox>(document(), *this, style);
+    return CSS::ElementBoxKind::TextArea;
 }
 
 }

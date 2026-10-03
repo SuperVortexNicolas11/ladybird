@@ -46,6 +46,12 @@ public:
     [[nodiscard]] u32 normal_function_length_offset() const { return m_normal_function_length_offset; }
     [[nodiscard]] u32 normal_function_name_offset() const { return m_normal_function_name_offset; }
 
+    // NOTE: These shapes store "length" and "name" at the same offsets as the normal function shape.
+    [[nodiscard]] GC::Ref<Shape> async_function_shape() { return *m_async_function_shape; }
+    [[nodiscard]] GC::Ref<Shape> generator_function_shape() { return *m_generator_function_shape; }
+    [[nodiscard]] GC::Ref<Shape> async_generator_function_shape() { return *m_async_generator_function_shape; }
+    [[nodiscard]] u32 generator_function_prototype_property_offset() const { return m_generator_function_prototype_property_offset; }
+
     [[nodiscard]] GC::Ref<Shape> native_function_shape() { return *m_native_function_shape; }
     [[nodiscard]] u32 native_function_length_offset() const { return m_native_function_length_offset; }
     [[nodiscard]] u32 native_function_name_offset() const { return m_native_function_name_offset; }
@@ -64,9 +70,6 @@ public:
     [[nodiscard]] u32 regexp_builtin_exec_array_index_offset() const { return m_regexp_builtin_exec_array_index_offset; }
     [[nodiscard]] u32 regexp_builtin_exec_array_input_offset() const { return m_regexp_builtin_exec_array_input_offset; }
     [[nodiscard]] u32 regexp_builtin_exec_array_groups_offset() const { return m_regexp_builtin_exec_array_groups_offset; }
-
-    [[nodiscard]] GC::Ref<Shape> default_array_prototype_shape() const { return *m_default_array_prototype_shape; }
-    [[nodiscard]] GC::Ref<Shape> default_object_prototype_shape() const { return *m_default_object_prototype_shape; }
 
     [[nodiscard]] GC::Ref<Shape> regexp_builtin_exec_array_shape() const { return *m_regexp_builtin_exec_array_shape; }
 
@@ -194,6 +197,11 @@ private:
     u32 m_normal_function_length_offset { 0 };
     u32 m_normal_function_name_offset { 0 };
 
+    GC::Ptr<Shape> m_async_function_shape;
+    GC::Ptr<Shape> m_generator_function_shape;
+    GC::Ptr<Shape> m_async_generator_function_shape;
+    u32 m_generator_function_prototype_property_offset { 0 };
+
     GC::Ptr<Shape> m_native_function_shape;
     u32 m_native_function_length_offset { 0 };
     u32 m_native_function_name_offset { 0 };
@@ -207,9 +215,6 @@ private:
     u32 m_mapped_arguments_object_length_offset { 0 };
     u32 m_mapped_arguments_object_well_known_symbol_iterator_offset { 0 };
     u32 m_mapped_arguments_object_callee_offset { 0 };
-
-    GC::Ptr<Shape> m_default_array_prototype_shape;
-    GC::Ptr<Shape> m_default_object_prototype_shape;
 
     GC::Ptr<Shape> m_regexp_builtin_exec_array_shape;
     u32 m_regexp_builtin_exec_array_index_offset { 0 };

@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/SVGStyleElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
 
 namespace Web::SVG {
@@ -17,12 +16,6 @@ SVGStyleElement::SVGStyleElement(DOM::Document& document, DOM::QualifiedName qua
 }
 
 SVGStyleElement::~SVGStyleElement() = default;
-
-void SVGStyleElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGStyleElement);
-    Base::initialize(realm);
-}
 
 void SVGStyleElement::visit_edges(Cell::Visitor& visitor)
 {
@@ -53,6 +46,12 @@ void SVGStyleElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ance
 {
     Base::removed_from(is_subtree_root, old_ancestor, old_root);
     update_a_style_block_for_dynamic_change();
+}
+
+void SVGStyleElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<Node> old_ancestor)
+{
+    Base::moved_from(is_subtree_root, old_ancestor);
+    style_element_moved();
 }
 
 void SVGStyleElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)

@@ -5,58 +5,83 @@
  */
 
 #include <AK/Assertions.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Node.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/NodeArena.h>
-#include <LibWeb/Layout/TextNode.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/PaintingRustBridge.h>
 
 namespace Web::Layout {
 
-NodeArena::NodeArena()
-    : m_handle(RustFFI::layout_arena_create())
+NodeArena::NodeArena(RenderDocument& render_document)
+    : m_render_document(render_document)
+    , m_handle(RustFFI::render_state_arena_for_unconverted_entry(render_document.host()))
 {
     VERIFY(m_handle);
+    Painting::register_geometry_host(*this);
 }
 
-NodeArena::~NodeArena()
+NodeArena::~NodeArena() = default;
+
+void NodeArena::free_subtree(Compositing::RustFFI::NodeSlotId root)
 {
-    RustFFI::layout_arena_destroy(m_handle);
+    RustFFI::render_state_drop_subtree(host(), root);
 }
 
-RustFFI::NodeAllocation NodeArena::allocate()
+Node* NodeArena::node_if_live(Compositing::RustFFI::NodeSlotId slot) const
 {
-    auto allocation = RustFFI::layout_arena_allocate(m_handle);
-    VERIFY(allocation.data);
-    return allocation;
+    return static_cast<Node*>(RustFFI::layout_arena_node_shell_if_live(m_handle, slot));
 }
 
-void NodeArena::free(RustFFI::NodeSlotId slot, u32 generation)
+u64 NodeArena::table_cell_measurement_cache_miss_count() const
 {
-    RustFFI::layout_arena_free(m_handle, slot, generation);
+    return RustFFI::render_state_layout_counts(host()).table_cell_measurement_cache_misses;
 }
 
-void NodeArena::enroll_text_node_for_content_sync(TextNode const& text_node)
+u64 NodeArena::intrinsic_measurement_count() const
 {
-    m_text_nodes_enrolled_for_content_sync.append(text_node.make_weak_ptr<TextNode>());
+    return RustFFI::render_state_layout_counts(host()).intrinsic_measurements;
 }
 
-void NodeArena::sync_enrolled_text_node_content()
+u64 NodeArena::intrinsic_inline_measurement_count() const
 {
-    if (m_text_nodes_enrolled_for_content_sync.is_empty())
-        return;
-    // A node that is alive but detached keeps its enrollment: it cannot
-    // resolve style-dependent text without a parent, and it may be reinserted
-    // by a later tree update without another enrollment trigger.
-    Vector<WeakPtr<TextNode>> still_detached_text_nodes;
-    for (auto& weak_text_node : m_text_nodes_enrolled_for_content_sync) {
-        auto const* text_node = weak_text_node.ptr();
-        if (!text_node)
-            continue;
-        if (!text_node->parent()) {
-            still_detached_text_nodes.append(move(weak_text_node));
-            continue;
-        }
-        text_node->sync_text_content_to_arena();
-    }
-    m_text_nodes_enrolled_for_content_sync = move(still_detached_text_nodes);
+    return RustFFI::render_state_layout_counts(host()).intrinsic_inline_measurements;
+}
+
+bool destroy_layout_subtree(Node& node)
+{
+    return RustFFI::render_state_drop_subtree(node.document_host(), Node::slot_id(&node));
+}
+
+void NodeArena::start_reporting_box_presence(Badge<DOM::Document>)
+{
+    RustFFI::layout_arena_set_box_presence_host(m_handle, this, [](void* context, u32 style_node, u8 bits) {
+        auto& document = *static_cast<NodeArena*>(context)->m_document;
+        // The document has no StyleNodeID; it is named by 0.
+        GC::Ptr<DOM::Node> node = &document;
+        if (style_node != 0)
+            node = document.style_computer().node_for_style_node(CSS::StyleNodeID { style_node });
+        if (node)
+            node->set_box_presence({}, bits & RustFFI::BOX_PRESENCE_HAS_LAYOUT_BOX, bits & RustFFI::BOX_PRESENCE_HAS_COMMITTED_BOX);
+    });
+}
+
+void NodeArena::stop_reporting_box_presence(Badge<DOM::Document>)
+{
+    RustFFI::layout_arena_clear_box_presence_host(m_handle);
+}
+
+void NodeArena::commit_box_presence(DOM::Node& node)
+{
+    auto const* layout_node = node.unsafe_layout_node();
+    node.set_box_presence({}, layout_node, layout_node && Painting::has_committed_box(*layout_node));
+}
+
+void NodeArena::sync_enrolled_content_for_layout()
+{
+    RustFFI::layout_arena_sync_enrolled_content_for_layout(m_handle);
 }
 
 }

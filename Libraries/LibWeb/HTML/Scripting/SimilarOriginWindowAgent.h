@@ -20,7 +20,9 @@ namespace Web::HTML {
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#similar-origin-window-agent
 struct SimilarOriginWindowAgent : public Agent {
-    static NonnullOwnPtr<SimilarOriginWindowAgent> create(GC::Heap&);
+    AK_ALLOC_WITH_KMALLOC;
+
+    static WEB_API NonnullOwnPtr<SimilarOriginWindowAgent> create(GC::Heap&);
 
     // https://dom.spec.whatwg.org/#mutation-observer-compound-microtask-queued-flag
     // Each similar-origin window agent has a mutation observer microtask queued (a boolean), which is initially false. [HTML]
@@ -53,5 +55,13 @@ private:
 };
 
 WEB_API SimilarOriginWindowAgent& relevant_similar_origin_window_agent(JS::Object const&);
+WEB_API SimilarOriginWindowAgent& relevant_similar_origin_window_agent(DOM::Node const&);
+WEB_API SimilarOriginWindowAgent& relevant_similar_origin_window_agent(Window const&);
+
+}
+
+namespace Web::Bindings {
+
+WEB_API HTML::SimilarOriginWindowAgent& main_thread_similar_origin_window_agent();
 
 }

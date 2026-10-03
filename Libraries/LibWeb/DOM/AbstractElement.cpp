@@ -5,7 +5,7 @@
  */
 
 #include <AK/Utf16StringBuilder.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
@@ -31,7 +31,6 @@ AbstractElement::AbstractElement(Element const& element, Optional<CSS::PseudoEle
 void AbstractElement::visit(GC::Cell::Visitor& visitor) const
 {
     visitor.visit(m_element);
-    visitor.visit(m_inheritance_override);
 }
 
 Document& AbstractElement::document() const
@@ -92,22 +91,19 @@ Layout::NodeWithStyle* AbstractElement::unsafe_layout_node()
 GC::Ptr<Element const> AbstractElement::parent_element() const
 {
     if (m_pseudo_element.has_value())
-        return m_element;
+        return m_element.ptr();
     return m_element->parent_element();
 }
 
 Element* AbstractElement::flat_tree_parent_element() const
 {
     if (m_pseudo_element.has_value())
-        return m_element;
+        return m_element.ptr();
     return m_element->flat_tree_parent_element();
 }
 
 Optional<AbstractElement> AbstractElement::element_to_inherit_style_from() const
 {
-    if (m_inheritance_override)
-        return AbstractElement { *m_inheritance_override };
-
     GC::Ptr<Element const> element = m_element->element_to_inherit_style_from(m_pseudo_element);
 
     if (!element)
@@ -116,44 +112,49 @@ Optional<AbstractElement> AbstractElement::element_to_inherit_style_from() const
     return AbstractElement { const_cast<DOM::Element&>(*element) };
 }
 
-Optional<AbstractElement> AbstractElement::walk_layout_tree(WalkMethod walk_method)
+// https://drafts.csswg.org/css-pseudo-4/#highlight-cascade
+// When any supported property is not given a value by the cascade, or given a value of inherit or unset, its
+// specified value is determined by inheritance from the corresponding highlight pseudo-element of its originating
+// element's parent element.
+Optional<AbstractElement> AbstractElement::highlight_inheritance_parent() const
 {
-    // NB: Called during style recalculation.
-    Layout::Node* node = unsafe_layout_node();
-    if (!node)
+    if (!m_pseudo_element.has_value() || !CSS::is_highlight_pseudo_element(*m_pseudo_element))
         return OptionalNone {};
 
-    while (true) {
-        switch (walk_method) {
-        case WalkMethod::Previous:
-            node = node->previous_in_pre_order();
-            break;
-        case WalkMethod::PreviousSibling:
-            node = node->previous_sibling();
-            break;
-        }
-        if (!node)
-            return OptionalNone {};
-
-        if (auto* previous_element = as_if<Element>(node->dom_node()))
-            return AbstractElement { *previous_element };
-
-        if (node->is_generated_for_pseudo_element())
-            return AbstractElement { *node->pseudo_element_generator(), node->generated_for_pseudo_element() };
+    // An ancestor without a record for this pseudo-element has no declarations for it, so the nearest record is
+    // what its own would have inherited anyway.
+    for (auto ancestor = m_element->element_to_inherit_style_from({}); ancestor; ancestor = ancestor->element_to_inherit_style_from({})) {
+        if (!!ancestor->style_record_identity(*m_pseudo_element))
+            return AbstractElement { *ancestor, m_pseudo_element };
     }
+    return OptionalNone {};
 }
 
-bool AbstractElement::is_before(AbstractElement const& other) const
+GC::Ptr<Node> AbstractElement::root()
 {
-    // NB: Called during style recalculation.
-    auto this_node = unsafe_layout_node();
-    auto other_node = other.unsafe_layout_node();
-    return this_node && other_node && this_node->is_before(*other_node);
+    if (m_pseudo_element.has_value()) {
+        if (auto pseudo_element = m_element->get_pseudo_element(*m_pseudo_element); pseudo_element.has_value())
+            return pseudo_element->root();
+
+        return nullptr;
+    }
+
+    return m_element->root();
 }
 
-CSS::ComputedValues const* AbstractElement::computed_values() const
+CSS::ComputedStyleRecordView AbstractElement::computed_style() const
 {
-    return m_element->computed_values(m_pseudo_element);
+    return m_element->computed_style(m_pseudo_element);
+}
+
+CSS::StyleRecordID AbstractElement::style_record_identity() const
+{
+    return m_element->style_record_identity(m_pseudo_element);
+}
+
+void const* AbstractElement::style_record_payloads() const
+{
+    return m_element->style_record_payloads(m_pseudo_element);
 }
 
 GC::Ptr<CSS::CSSStyleProperties const> AbstractElement::inline_style() const
@@ -182,6 +183,11 @@ void AbstractElement::set_custom_property_data(RefPtr<CSS::CustomPropertyData co
     m_element->set_custom_property_data(m_pseudo_element, move(data));
 }
 
+void AbstractElement::replace_custom_property_data(Badge<CSS::StyleComputer>, RefPtr<CSS::CustomPropertyData const> data)
+{
+    m_element->replace_custom_property_data(m_pseudo_element, move(data));
+}
+
 RefPtr<CSS::StyleValue const> AbstractElement::get_custom_property(Utf16FlyString const& name) const
 {
     auto data = custom_property_data();
@@ -190,36 +196,6 @@ RefPtr<CSS::StyleValue const> AbstractElement::get_custom_property(Utf16FlyStrin
     if (auto const* property = data->get(name))
         return property->value;
     return nullptr;
-}
-
-bool AbstractElement::has_non_empty_counters_set() const
-{
-    if (m_pseudo_element.has_value())
-        return m_element->get_synthetic_pseudo_element(*m_pseudo_element)->has_non_empty_counters_set();
-    return m_element->has_non_empty_counters_set();
-}
-
-Optional<CSS::CountersSet const&> AbstractElement::counters_set() const
-{
-    if (m_pseudo_element.has_value())
-        return m_element->get_synthetic_pseudo_element(*m_pseudo_element)->counters_set();
-    return m_element->counters_set();
-}
-
-CSS::CountersSet& AbstractElement::ensure_counters_set()
-{
-    if (m_pseudo_element.has_value())
-        return m_element->get_synthetic_pseudo_element(*m_pseudo_element)->ensure_counters_set();
-    return m_element->ensure_counters_set();
-}
-
-void AbstractElement::set_counters_set(OwnPtr<CSS::CountersSet>&& counters_set)
-{
-    if (m_pseudo_element.has_value()) {
-        m_element->get_synthetic_pseudo_element(*m_pseudo_element)->set_counters_set(move(counters_set));
-    } else {
-        m_element->set_counters_set(move(counters_set));
-    }
 }
 
 Utf16String AbstractElement::debug_description() const

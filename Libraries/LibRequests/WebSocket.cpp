@@ -10,8 +10,6 @@
 
 namespace Requests {
 
-static constexpr size_t WEBSOCKET_SHARED_MEMORY_THRESHOLD = 16 * MiB;
-
 WebSocket::WebSocket(RequestClient& client, u64 websocket_id)
     : m_client(client)
     , m_websocket_id(websocket_id)
@@ -25,7 +23,11 @@ WebSocket::ReadyState WebSocket::ready_state()
 
 void WebSocket::set_ready_state(ReadyState ready_state)
 {
+    if (m_ready_state == ready_state)
+        return;
     m_ready_state = ready_state;
+    if (on_ready_state_change)
+        on_ready_state_change();
 }
 
 ByteString WebSocket::subprotocol_in_use()

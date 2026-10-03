@@ -22,6 +22,370 @@ fn title_casify(dashy_name: &str) -> String {
         .collect()
 }
 
+fn generate_math_functions(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let math_functions_path = manifest_dir.parent().unwrap().join("CSS/MathFunctions.json");
+    println!("cargo:rerun-if-changed={}", math_functions_path.display());
+
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&math_functions_path)?)?;
+    let functions = value
+        .as_object()
+        .ok_or("MathFunctions.json does not contain a JSON object")?;
+    let mut output = String::from(
+        "// This file is generated from CSS/MathFunctions.json.\n\n\
+         #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
+         pub(crate) enum MathFunction {\n\
+             Calc,\n",
+    );
+    for name in functions.keys() {
+        writeln!(output, "    {},", title_casify(name))?;
+    }
+    output.push_str("}\n\npub(crate) fn math_function_from_name(name: &[u16]) -> Option<MathFunction> {\n");
+    output.push_str("    let equals = |expected: &[u8]| {\n");
+    output.push_str("        name.len() == expected.len() && name.iter().zip(expected).all(|(&left, &right)| {\n");
+    output.push_str("            u8::try_from(left).is_ok_and(|left| left.eq_ignore_ascii_case(&right))\n");
+    output.push_str("        })\n    };\n");
+    output.push_str("    if equals(b\"calc\") { return Some(MathFunction::Calc); }\n");
+    for name in functions.keys() {
+        writeln!(
+            output,
+            "    if equals(b\"{name}\") {{ return Some(MathFunction::{}); }}",
+            title_casify(name)
+        )?;
+    }
+    output.push_str("    None\n}\n");
+    std::fs::write(out_dir.join("math_functions_generated.rs"), output)?;
+    Ok(())
+}
+
+fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let media_features_path = manifest_dir.parent().unwrap().join("CSS/MediaFeatures.json");
+    println!("cargo:rerun-if-changed={}", media_features_path.display());
+
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&media_features_path)?)?;
+    let features = value
+        .as_object()
+        .ok_or("MediaFeatures.json does not contain a JSON object")?;
+    let mut output = String::from(
+        "// This file is generated from CSS/MediaFeatures.json.\n\n\
+         pub(crate) const MEDIA_FEATURE_VALUE_BOOLEAN: u8 = 1 << 0;\n\
+         pub(crate) const MEDIA_FEATURE_VALUE_INTEGER: u8 = 1 << 1;\n\
+         pub(crate) const MEDIA_FEATURE_VALUE_LENGTH: u8 = 1 << 2;\n\
+         pub(crate) const MEDIA_FEATURE_VALUE_RATIO: u8 = 1 << 3;\n\
+         pub(crate) const MEDIA_FEATURE_VALUE_RESOLUTION: u8 = 1 << 4;\n\n\
+         pub(crate) struct MediaFeatureMetadata {\n\
+             pub name: &'static str,\n\
+             pub allows_range: bool,\n\
+             pub accepted_value_types: u8,\n\
+             pub accepted_keywords: &'static [u16],\n\
+             pub false_keywords: &'static [u16],\n\
+         }\n\n\
+         pub(crate) const MEDIA_FEATURES: &[MediaFeatureMetadata] = &[\n",
+    );
+    for (name, feature) in features {
+        let allows_range = match feature["type"].as_str() {
+            Some("discrete") => false,
+            Some("range") => true,
+            _ => return Err(format!("unknown media feature type for {name}").into()),
+        };
+        let values = feature["values"]
+            .as_array()
+            .ok_or("media feature values is not an array")?;
+        let mut value_types = Vec::new();
+        let mut keywords = Vec::new();
+        for value in values {
+            let value = value.as_str().ok_or("media feature value is not a string")?;
+            match value {
+                "<mq-boolean>" => value_types.push("MEDIA_FEATURE_VALUE_BOOLEAN"),
+                "<integer>" => value_types.push("MEDIA_FEATURE_VALUE_INTEGER"),
+                "<length>" => value_types.push("MEDIA_FEATURE_VALUE_LENGTH"),
+                "<ratio>" => value_types.push("MEDIA_FEATURE_VALUE_RATIO"),
+                "<resolution>" => value_types.push("MEDIA_FEATURE_VALUE_RESOLUTION"),
+                value if !value.starts_with('<') => keywords.push(value),
+                value => return Err(format!("unknown media feature value {value}").into()),
+            }
+        }
+        let value_types = if value_types.is_empty() {
+            "0".to_string()
+        } else {
+            value_types.join(" | ")
+        };
+        let keyword_constant = |keyword: &str| keyword.replace('-', "_").to_ascii_uppercase();
+        let accepted_keywords = keywords
+            .iter()
+            .map(|keyword| format!("crate::css::css_enums::keyword::{}", keyword_constant(keyword)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let false_keywords = feature
+            .get("false-keywords")
+            .and_then(serde_json::Value::as_array)
+            .map(|keywords| {
+                keywords
+                    .iter()
+                    .map(|keyword| {
+                        let keyword = keyword.as_str().ok_or("false keyword is not a string")?;
+                        Ok(format!("crate::css::css_enums::keyword::{}", keyword_constant(keyword)))
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn Error>>>()
+            })
+            .transpose()?
+            .unwrap_or_default()
+            .join(", ");
+        writeln!(
+            output,
+            "    MediaFeatureMetadata {{ name: \"{name}\", allows_range: {allows_range}, accepted_value_types: {value_types}, accepted_keywords: &[{accepted_keywords}], false_keywords: &[{false_keywords}] }},"
+        )?;
+    }
+    output.push_str("];\n");
+    std::fs::write(out_dir.join("media_features_generated.rs"), output)?;
+    Ok(())
+}
+
+fn generate_named_colors(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let colors_path = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("LibGfx/Color.cpp");
+    println!("cargo:rerun-if-changed={}", colors_path.display());
+
+    let source = std::fs::read_to_string(&colors_path)?;
+    let table = source
+        .split_once("constexpr Array web_colors {")
+        .ok_or("Color.cpp has no web_colors table")?
+        .1
+        .split_once("    };")
+        .ok_or("Color.cpp has no end of web_colors table")?
+        .0;
+    let mut colors = Vec::new();
+    for line in table.lines().map(str::trim) {
+        let Some(entry) = line.strip_prefix("WebColor { 0x") else {
+            continue;
+        };
+        let (rgb, name) = entry.split_once(", \"").ok_or("malformed web_colors entry")?;
+        let name = name.strip_suffix("\"sv },").ok_or("malformed web_colors name")?;
+        let rgb = u32::from_str_radix(rgb, 16)?;
+        colors.push((name, rgb));
+    }
+    if colors.is_empty() {
+        return Err("Color.cpp web_colors table is empty".into());
+    }
+
+    let mut output = String::from(
+        "// Generated by build.rs from LibGfx/Color.cpp. Do not edit.\n\n\
+         #[allow(dead_code)]\n\
+         pub(crate) fn named_color_from_name(name: crate::css::css_tokenizer::TokenizerInput<'_>) -> Option<[u8; 4]> {\n\
+             let equals = |expected: &[u8]| {\n\
+                 name.len() == expected.len() && (0..name.len()).zip(expected).all(|(index, &right)| {\n\
+                     let left = name.code_unit_at(index);\n\
+                     u8::try_from(left).is_ok_and(|left| left.eq_ignore_ascii_case(&right))\n\
+                 })\n\
+             };\n",
+    );
+    for (name, rgb) in colors {
+        writeln!(
+            output,
+            "    if equals(b\"{name}\") {{ return Some([0x{:02x}, 0x{:02x}, 0x{:02x}, 0xff]); }}",
+            rgb >> 16,
+            (rgb >> 8) & 0xff,
+            rgb & 0xff
+        )?;
+    }
+    output.push_str("    None\n}\n");
+    std::fs::write(out_dir.join("named_colors_generated.rs"), output)?;
+    Ok(())
+}
+
+fn generate_descriptor_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let descriptors_path = manifest_dir.parent().unwrap().join("CSS/Descriptors.json");
+    let properties_path = manifest_dir.parent().unwrap().join("CSS/Properties.json");
+    println!("cargo:rerun-if-changed={}", descriptors_path.display());
+    println!("cargo:rerun-if-changed={}", properties_path.display());
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&descriptors_path)?)?;
+    let properties: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&properties_path)?)?;
+    let at_rules = value
+        .as_object()
+        .ok_or("Descriptors.json does not contain a JSON object")?;
+    let properties = properties
+        .as_object()
+        .ok_or("Properties.json does not contain a JSON object")?;
+    let mut descriptor_names = at_rules
+        .values()
+        .flat_map(|at_rule| at_rule["descriptors"].as_object().unwrap())
+        .filter(|(_, descriptor)| descriptor.get("legacy-alias-for").is_none())
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    descriptor_names.sort_unstable();
+    descriptor_names.dedup();
+    if descriptor_names.len() >= usize::from(u8::MAX) {
+        return Err("too many descriptors for u8 identifiers".into());
+    }
+    let descriptor_id = |name: &str| {
+        descriptor_names
+            .binary_search(&name)
+            .map(|id| id as u8)
+            .map_err(|_| format!("missing descriptor ID for {name}"))
+    };
+    let mut output = String::from(
+        "// Generated by build.rs from CSS/Descriptors.json. Do not edit.\n\n\
+         use crate::css::property_metadata::property_id;\n\n\
+         #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
+         pub(crate) enum DescriptorSyntax { Keyword(&'static str), Property(u16), ValueType(DescriptorValueType) }\n\n\
+         #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
+         pub(crate) enum DescriptorValueType { CounterStyleSystem, CounterStyleAdditiveSymbols, CounterStyleName, CounterStyleNegative, CounterStylePad, CounterStyleRange, CropOrCross, FamilyName, FontSrcList, FontWeightAbsolutePair, Length, OptionalDeclarationValue, PageSize, PositivePercentage, String, Symbol, Symbols, UnicodeRangeTokens }\n\n\
+         pub(crate) struct DescriptorMetadata { pub id: u8, pub syntax: &'static [DescriptorSyntax], pub allow_arbitrary_substitution_functions: bool, pub allow_css_wide_keywords: bool }\n\n\
+         #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
+         pub(crate) struct DescriptorLonghand { pub descriptor_id: u8, pub property_id: u16 }\n\n\
+         fn equals(value: &[u16], expected: &[u8]) -> bool { value.len() == expected.len() && value.iter().zip(expected).all(|(&left, &right)| u8::try_from(left).is_ok_and(|left| left.eq_ignore_ascii_case(&right))) }\n\n\
+         pub(crate) fn descriptor_metadata(at_rule: u8, name: &[u16]) -> Option<DescriptorMetadata> {\n    match at_rule {\n",
+    );
+    for (at_rule_index, (_at_rule_name, at_rule)) in at_rules.iter().enumerate() {
+        writeln!(output, "        {at_rule_index} => {{")?;
+        let descriptors = at_rule["descriptors"].as_object().unwrap();
+        for (name, descriptor) in descriptors {
+            if let Some(alias) = descriptor.get("legacy-alias-for").and_then(serde_json::Value::as_str) {
+                writeln!(
+                    output,
+                    "            if equals(name, b\"{name}\") {{ return descriptor_metadata(at_rule, &\"{alias}\".encode_utf16().collect::<Vec<_>>()); }}"
+                )?;
+                continue;
+            }
+            write!(
+                output,
+                "            if equals(name, b\"{name}\") {{ return Some(DescriptorMetadata {{ id: {}, syntax: &[",
+                descriptor_id(name)?
+            )?;
+            for syntax in descriptor["syntax"]
+                .as_array()
+                .ok_or("descriptor syntax is not an array")?
+            {
+                let syntax = syntax.as_str().ok_or("descriptor syntax is not a string")?;
+                if let Some(property) = syntax.strip_prefix("<'").and_then(|value| value.strip_suffix("'>")) {
+                    let constant = property.replace('-', "_").to_ascii_uppercase();
+                    write!(output, "DescriptorSyntax::Property(property_id::{constant}),")?;
+                } else if syntax.starts_with('<') {
+                    let value_type = match syntax {
+                        "<family-name>" => "FamilyName",
+                        "<font-src-list>" => "FontSrcList",
+                        "<font-weight-absolute>{1,2}" => "FontWeightAbsolutePair",
+                        "<declaration-value>?" => "OptionalDeclarationValue",
+                        "<length>" => "Length",
+                        "<page-size>" => "PageSize",
+                        "<percentage [0,∞]>" => "PositivePercentage",
+                        "<string>" => "String",
+                        "<unicode-range-token>#" => "UnicodeRangeTokens",
+                        "<counter-style-system>" => "CounterStyleSystem",
+                        "<counter-style-negative>" => "CounterStyleNegative",
+                        "<symbol>" => "Symbol",
+                        "<symbol>+" => "Symbols",
+                        "<counter-style-range>" => "CounterStyleRange",
+                        "<counter-style-pad>" => "CounterStylePad",
+                        "<counter-style-name>" => "CounterStyleName",
+                        "<counter-style-additive-symbols>" => "CounterStyleAdditiveSymbols",
+                        other => return Err(format!("unknown descriptor syntax {other}").into()),
+                    };
+                    write!(
+                        output,
+                        "DescriptorSyntax::ValueType(DescriptorValueType::{value_type}),"
+                    )?;
+                } else if syntax == "crop || cross" {
+                    write!(output, "DescriptorSyntax::ValueType(DescriptorValueType::CropOrCross),")?;
+                } else {
+                    write!(output, "DescriptorSyntax::Keyword(\"{syntax}\"),")?;
+                }
+            }
+            writeln!(
+                output,
+                "], allow_arbitrary_substitution_functions: {}, allow_css_wide_keywords: {} }}); }}",
+                descriptor
+                    .get("allow-arbitrary-substitution-functions")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                descriptor
+                    .get("allow-css-wide-keywords")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            )?;
+        }
+        if let Some(custom) = at_rule.get("custom-descriptors") {
+            write!(
+                output,
+                "            if name.starts_with(&[u16::from(b'-'), u16::from(b'-')]) && name.len() > 2 {{ return Some(DescriptorMetadata {{ id: {}, syntax: &[",
+                descriptor_names.len()
+            )?;
+            for syntax in custom["syntax"].as_array().unwrap() {
+                let property = syntax.as_str().unwrap().trim_start_matches("<'").trim_end_matches("'>");
+                let constant = property.replace('-', "_").to_ascii_uppercase();
+                write!(output, "DescriptorSyntax::Property(property_id::{constant}),")?;
+            }
+            writeln!(
+                output,
+                "], allow_arbitrary_substitution_functions: true, allow_css_wide_keywords: true }}); }}"
+            )?;
+        }
+        output.push_str("            None\n        }\n");
+    }
+    output.push_str("        _ => None,\n    }\n}\n");
+    writeln!(
+        output,
+        "\npub(crate) const CUSTOM_DESCRIPTOR_ID: u8 = {};",
+        descriptor_names.len()
+    )?;
+    output.push_str("\npub(crate) fn descriptor_longhands(at_rule: u8, descriptor_id: u8) -> &'static [DescriptorLonghand] {\n    match (at_rule, descriptor_id) {\n");
+    for (at_rule_index, (_at_rule_name, at_rule)) in at_rules.iter().enumerate() {
+        let descriptors = at_rule["descriptors"].as_object().unwrap();
+        for (name, descriptor) in descriptors {
+            if descriptor.get("legacy-alias-for").is_some() {
+                continue;
+            }
+            let Some(property_name) = descriptor["syntax"]
+                .as_array()
+                .and_then(|syntax| (syntax.len() == 1).then(|| syntax[0].as_str()).flatten())
+                .and_then(|syntax| syntax.strip_prefix("<'"))
+                .and_then(|syntax| syntax.strip_suffix("'>"))
+            else {
+                continue;
+            };
+            let Some(longhands) = properties
+                .get(property_name)
+                .and_then(|property| property.get("longhands"))
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            if longhands.is_empty() {
+                continue;
+            }
+            let mut generated_longhands = Vec::new();
+            for longhand in longhands {
+                let longhand = longhand.as_str().ok_or("property longhand is not a string")?;
+                if !descriptors.contains_key(longhand) {
+                    generated_longhands.clear();
+                    break;
+                }
+                generated_longhands.push((
+                    descriptor_id(longhand)?,
+                    longhand.replace('-', "_").to_ascii_uppercase(),
+                ));
+            }
+            if generated_longhands.is_empty() {
+                continue;
+            }
+            write!(output, "        ({at_rule_index}, {}) => &[", descriptor_id(name)?)?;
+            for (longhand_id, property_constant) in generated_longhands {
+                write!(
+                    output,
+                    "DescriptorLonghand {{ descriptor_id: {longhand_id}, property_id: property_id::{property_constant} }},"
+                )?;
+            }
+            output.push_str("],\n");
+        }
+    }
+    output.push_str("        _ => &[],\n    }\n}\n");
+    std::fs::write(out_dir.join("descriptor_metadata_generated.rs"), output)?;
+    Ok(())
+}
+
 fn ordered_pseudo_element_names(
     pseudo_elements: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
@@ -78,12 +442,15 @@ fn write_enum_and_from_ffi(output: &mut String, enum_name: &str, variants: &[Str
     }
     writeln!(output, "}}").unwrap();
     writeln!(output).unwrap();
-    let fn_name = if enum_name == "PseudoClassType" {
-        "pseudo_class_from_ffi"
-    } else {
-        "pseudo_element_from_ffi"
-    };
-    writeln!(output, "fn {fn_name}(value: u8) -> {enum_name} {{").unwrap();
+    // Only the pseudo-classes cross the boundary as numbers.
+    if enum_name != "PseudoClassType" {
+        return;
+    }
+    writeln!(
+        output,
+        "pub(crate) fn pseudo_class_from_ffi(value: u8) -> {enum_name} {{"
+    )
+    .unwrap();
     writeln!(output, "    match value {{").unwrap();
     for (index, variant) in variants.iter().enumerate() {
         writeln!(output, "        {index} => {enum_name}::{variant},").unwrap();
@@ -92,6 +459,620 @@ fn write_enum_and_from_ffi(output: &mut String, enum_name: &str, variants: &[Str
     writeln!(output, "    }}").unwrap();
     writeln!(output, "}}").unwrap();
     writeln!(output).unwrap();
+}
+
+fn generate_style_engine_event_kinds(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let specification_path = manifest_dir.join("StyleEngineBoundary.json");
+    println!("cargo:rerun-if-changed={}", specification_path.display());
+    let specification: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&specification_path)?)?;
+    let events = specification["events"]
+        .as_array()
+        .ok_or("StyleEngineBoundary.json does not contain an events array")?;
+
+    let mut event_kind = String::from(
+        "// Generated by build.rs from StyleEngineBoundary.json.\n\n\
+         #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
+         #[repr(u16)]\n\
+         pub enum EventKind {\n",
+    );
+    let mut all_event_kinds = String::from("}\n\npub const ALL_EVENT_KINDS: &[EventKind] = &[\n");
+    let mut decode =
+        String::from("\nimpl EventKind {\n    fn decode(raw: u64) -> Result<Self, Error> {\n        match raw {\n");
+    let mut stub = String::from(
+        "// Generated by build.rs from StyleEngineBoundary.json.\n\n\
+         #[allow(dead_code)]\n\
+         pub enum EventKind {\n",
+    );
+    let mut previous_id = 0;
+    let mut names = std::collections::HashSet::new();
+    for event in events {
+        let fields = event.as_array().ok_or("event entry is not an array")?;
+        if fields.len() != 2 {
+            return Err("event entry must contain an ID and name".into());
+        }
+        let id = fields[0].as_u64().ok_or("event ID is not an unsigned integer")?;
+        let name = fields[1].as_str().ok_or("event name is not a string")?;
+        if id <= previous_id {
+            return Err("event IDs must be strictly increasing and never reused".into());
+        }
+        if !names.insert(name) {
+            return Err(format!("duplicate event name {name}").into());
+        }
+        writeln!(event_kind, "    {name} = {id},")?;
+        writeln!(all_event_kinds, "    EventKind::{name},")?;
+        writeln!(decode, "            {id} => Ok(Self::{name}),")?;
+        writeln!(stub, "    {name},")?;
+        previous_id = id;
+    }
+    event_kind.push_str(&all_event_kinds);
+    event_kind.push_str("];\n");
+    event_kind.push_str(&decode);
+    event_kind.push_str("            _ => Err(Error::UnknownEvent(raw)),\n        }\n    }\n}\n");
+    stub.push_str("}\n");
+    std::fs::write(out_dir.join("style_engine_event_kind_generated.rs"), event_kind)?;
+    std::fs::write(out_dir.join("style_engine_event_kind_stub_generated.rs"), stub)?;
+    Ok(())
+}
+
+fn boundary_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str, Box<dyn Error>> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("boundary operation is missing string field {field}").into())
+}
+
+fn boundary_type_names(kind: &str) -> Result<(&'static str, &'static str, &'static str, &'static str), Box<dyn Error>> {
+    match kind {
+        "bool" => Ok(("bool", "bool", "write_bool", "read_bool")),
+        "cascade_origin" => Ok((
+            "FfiCascadeOrigin",
+            "StyleEngineFFI::FfiCascadeOrigin",
+            "write_u8",
+            "read_cascade_origin",
+        )),
+        "u8" => Ok(("u8", "u8", "write_u8", "read_u8")),
+        "u32" => Ok(("u32", "u32", "write_u32", "read_u32")),
+        "sheet_id" => Ok(("u32", "SheetID", "write_u32", "read_u32")),
+        "style_atom" => Ok(("u32", "StyleAtomID", "write_u32", "read_u32")),
+        "style_node" => Ok(("u32", "StyleNodeID", "write_u32", "read_u32")),
+        "style_rule_id" => Ok(("u32", "StyleEngineRuleID", "write_u32", "read_u32")),
+        "tree_scope_id" => Ok(("u32", "TreeScopeID", "write_u32", "read_u32")),
+        "u64" => Ok(("u64", "u64", "write_u64", "read_u64")),
+        "style_record" => Ok(("u64", "StyleRecordID", "write_u64", "read_u64")),
+        "usize_u64" => Ok(("usize", "size_t", "write_u64", "read_u64")),
+        "u16_slice" => Ok(("*const u16", "ReadonlySpan<u16>", "write_u16_slice", "read_u16_vec")),
+        "u32_slice" => Ok(("*const u32", "ReadonlySpan<u32>", "write_u32_slice", "read_u32_vec")),
+        "u64_slice" => Ok(("*const u64", "ReadonlySpan<u64>", "write_u64_slice", "read_u64_vec")),
+        "applied_animation_definition_slice" => Ok((
+            "*const FfiAppliedAnimationDefinition",
+            "ReadonlySpan<StyleEngineFFI::FfiAppliedAnimationDefinition>",
+            "write_applied_animation_definitions",
+            "read_raw_slice::<bridge::FfiAppliedAnimationDefinition>",
+        )),
+        "style_atom_slice" => Ok((
+            "*const u32",
+            "ReadonlySpan<StyleAtomID>",
+            "write_u32_slice",
+            "read_u32_vec",
+        )),
+        "style_node_slice" => Ok((
+            "*const u32",
+            "ReadonlySpan<StyleNodeID>",
+            "write_u32_slice",
+            "read_u32_vec",
+        )),
+        _ => Err(format!("unknown boundary type {kind}").into()),
+    }
+}
+
+fn generate_style_engine_boundary(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let specification_path = manifest_dir.join("StyleEngineBoundary.json");
+    let specification: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&specification_path)?)?;
+    let operations = specification["operations"]
+        .as_array()
+        .ok_or("StyleEngineBoundary.json does not contain an operations array")?;
+    let declared_events = specification["events"]
+        .as_array()
+        .ok_or("StyleEngineBoundary.json does not contain an events array")?
+        .iter()
+        .map(|event| {
+            event
+                .as_array()
+                .and_then(|fields| fields.get(1))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "event entry must contain a string name".into())
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, Box<dyn Error>>>()?;
+    let bespoke_events = specification["bespoke_events"]
+        .as_array()
+        .ok_or("StyleEngineBoundary.json does not contain a bespoke_events array")?
+        .iter()
+        .map(|event| {
+            event
+                .as_str()
+                .ok_or_else(|| "bespoke event name is not a string".into())
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, Box<dyn Error>>>()?;
+
+    let mut rust = String::from("// Generated by build.rs from StyleEngineBoundary.json.\n\n");
+    let mut native = String::from("pub mod operations {\nuse super::*;\n");
+    let mut replay = String::from(
+        "// Generated by build.rs from StyleEngineBoundary.json.\n\n\
+         fn replay_generated_boundary_event(\n\
+             kind: EventKind,\n\
+             payload: &mut PayloadReader<'_>,\n\
+             live_engines: &[Option<libweb_rust::css::style::StyleEngineHandle>],\n\
+         ) -> Result<bool, Box<dyn std::error::Error>> {\n\
+             match kind {\n",
+    );
+    let mut cpp_declarations =
+        String::from("// Generated by Libraries/LibWeb/Rust/build.rs from StyleEngineBoundary.json.\n");
+    let mut cpp_definitions =
+        String::from("// Generated by Libraries/LibWeb/Rust/build.rs from StyleEngineBoundary.json.\n\n");
+    let mut ffi_names = std::collections::HashSet::new();
+    let mut operation_events = std::collections::HashSet::new();
+    // The operations the host queues as changes of the document's render state, which applies them to the engine in
+    // the order the host made them.
+    let mut style_change_variants = String::new();
+    let mut style_change_arms = String::new();
+    // The reads the host asks the document's render state, which answers them from the engine.
+    let mut style_query_variants = String::new();
+    let mut style_answer_variants = String::new();
+    let mut style_query_arms = String::new();
+
+    for operation in operations {
+        let object = operation.as_object().ok_or("boundary operation is not an object")?;
+        let event = boundary_string(object, "event")?;
+        let ffi = object.get("ffi").and_then(serde_json::Value::as_str);
+        let operation_name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| ffi.and_then(|name| name.strip_prefix("style_engine_")))
+            .ok_or("operation needs a native name or FFI name")?;
+        let return_kind = boundary_string(object, "return")?;
+        let body = boundary_string(object, "body")?;
+        let receiver = object
+            .get("receiver")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("mut");
+        let cpp_const = object
+            .get("cpp_const")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(receiver == "const");
+        let (is_change, is_query) = match object.get("owner").and_then(serde_json::Value::as_str) {
+            None => (false, false),
+            Some("change") => (true, false),
+            Some("query") => (false, true),
+            Some(other) => return Err(format!("unknown boundary owner {other}").into()),
+        };
+        if is_change && (return_kind != "void" || receiver != "mut" || ffi.is_none()) {
+            return Err(format!("the change {event} must be an FFI write that answers nothing").into());
+        }
+        if is_query && (return_kind == "void" || ffi.is_none()) {
+            return Err(format!("the query {event} must be an FFI read that answers something").into());
+        }
+        if let Some(ffi) = ffi
+            && !ffi_names.insert(ffi)
+        {
+            return Err(format!("duplicate boundary function {ffi}").into());
+        }
+        if !operation_events.insert(event) {
+            return Err(format!("duplicate generated boundary event {event}").into());
+        }
+        let arguments = object["args"]
+            .as_array()
+            .ok_or("boundary operation args is not an array")?;
+        let mut parsed_arguments = Vec::new();
+        for argument in arguments {
+            let fields = argument.as_array().ok_or("boundary argument is not an array")?;
+            if fields.len() != 2 {
+                return Err("boundary argument must contain a name and type".into());
+            }
+            let name = fields[0].as_str().ok_or("boundary argument name is not a string")?;
+            let kind = fields[1].as_str().ok_or("boundary argument type is not a string")?;
+            let names = boundary_type_names(kind)?;
+            parsed_arguments.push((name, kind, names));
+        }
+        let recorded_arguments = match object.get("record_order") {
+            Some(order) => {
+                let order = order.as_array().ok_or("boundary record_order is not an array")?;
+                if order.len() != parsed_arguments.len() {
+                    return Err("boundary record_order must contain every argument".into());
+                }
+                let mut seen = std::collections::HashSet::new();
+                order
+                    .iter()
+                    .map(|name| {
+                        let name = name.as_str().ok_or("boundary record_order name is not a string")?;
+                        if !seen.insert(name) {
+                            return Err(format!("duplicate boundary record_order argument {name}").into());
+                        }
+                        parsed_arguments
+                            .iter()
+                            .find(|argument| argument.0 == name)
+                            .ok_or_else(|| format!("unknown boundary record_order argument {name}").into())
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn Error>>>()?
+            }
+            None => parsed_arguments.iter().collect(),
+        };
+        let (rust_return, cpp_return, result_writer, result_reader) = match return_kind {
+            "void" => ("", "void", "", ""),
+            other => {
+                let (rust_type, cpp_type, writer, reader) = boundary_type_names(other)?;
+                (rust_type, cpp_type, writer, reader)
+            }
+        };
+        let engine_type = "crate::css::style::StyleEngineHandle";
+        let engine_borrow = if receiver == "const" {
+            "engine.get()"
+        } else {
+            "engine.get_mut()"
+        };
+        let replay_engine_borrow = engine_borrow;
+
+        if let Some(ffi) = ffi
+            && is_change
+        {
+            writeln!(
+                rust,
+                "/// Generated from the StyleEngine boundary specification: queues the change for the document's render state.\n///\n/// # Safety\n/// `document_host` must be a live document host, on the document's thread, and every borrowed argument must be live for this call.\n#[unsafe(no_mangle)]"
+            )?;
+            write!(
+                rust,
+                "pub unsafe extern \"C\" fn {ffi}(document_host: *const crate::render_state::DocumentHost"
+            )?;
+            for (name, kind, (rust_type, _, _, _)) in &parsed_arguments {
+                write!(rust, ", {name}: {rust_type}")?;
+                if kind.ends_with("_slice") {
+                    write!(rust, ", {name}_count: usize")?;
+                }
+            }
+            rust.push_str(") {\n    abort_on_panic(|| {\n");
+            write!(style_change_variants, "    {event} {{")?;
+            write!(style_change_arms, "            Self::{event} {{")?;
+            for (name, kind, (rust_type, _, _, _)) in &parsed_arguments {
+                if kind.ends_with("_slice") {
+                    let element_type = rust_type.trim_start_matches("*const ");
+                    writeln!(
+                        rust,
+                        "        let {name}: Box<[{element_type}]> = if {name}_count == 0 || {name}.is_null() {{ Box::default() }} else {{ unsafe {{ std::slice::from_raw_parts({name}, {name}_count) }}.into() }};"
+                    )?;
+                    write!(style_change_variants, " {name}: Box<[{element_type}]>,")?;
+                } else {
+                    write!(style_change_variants, " {name}: {rust_type},")?;
+                }
+                write!(style_change_arms, " {name},")?;
+            }
+            style_change_variants.push_str(" },\n");
+            write!(style_change_arms, " }} => operations::{operation_name}(engine")?;
+            for (name, kind, _) in &parsed_arguments {
+                if kind.ends_with("_slice") {
+                    write!(style_change_arms, ", &{name}")?;
+                } else {
+                    write!(style_change_arms, ", {name}")?;
+                }
+            }
+            style_change_arms.push_str("),\n");
+            write!(rust, "        let change = StyleChange::{event} {{")?;
+            for (name, _, _) in &parsed_arguments {
+                write!(rust, " {name},")?;
+            }
+            rust.push_str(" };\n        assert!(!document_host.is_null(), \"document host is null\");\n        unsafe { &*document_host }.queue_change(crate::render_state::ArenaChange::Style(change));\n    });\n}\n\n");
+        } else if let Some(ffi) = ffi
+            && is_query
+        {
+            writeln!(
+                rust,
+                "/// Generated from the StyleEngine boundary specification: asks the document's render state.\n///\n/// # Safety\n/// `document_host` must be a live document host, on the document's thread, and every borrowed argument must be live for this call.\n#[unsafe(no_mangle)]"
+            )?;
+            write!(
+                rust,
+                "pub unsafe extern \"C\" fn {ffi}(document_host: *const crate::render_state::DocumentHost"
+            )?;
+            for (name, kind, (rust_type, _, _, _)) in &parsed_arguments {
+                write!(rust, ", {name}: {rust_type}")?;
+                if kind.ends_with("_slice") {
+                    write!(rust, ", {name}_count: usize")?;
+                }
+            }
+            writeln!(rust, ") -> {rust_return} {{\n    abort_on_panic(|| {{")?;
+            write!(style_query_variants, "    {event} {{")?;
+            write!(style_query_arms, "            Self::{event} {{")?;
+            for (name, kind, (rust_type, _, _, _)) in &parsed_arguments {
+                if kind.ends_with("_slice") {
+                    let element_type = rust_type.trim_start_matches("*const ");
+                    writeln!(
+                        rust,
+                        "        let {name}: Box<[{element_type}]> = if {name}_count == 0 || {name}.is_null() {{ Box::default() }} else {{ unsafe {{ std::slice::from_raw_parts({name}, {name}_count) }}.into() }};"
+                    )?;
+                    write!(style_query_variants, " {name}: Box<[{element_type}]>,")?;
+                } else {
+                    write!(style_query_variants, " {name}: {rust_type},")?;
+                }
+                write!(style_query_arms, " {name},")?;
+            }
+            style_query_variants.push_str(" },\n");
+            writeln!(style_answer_variants, "    {event}({rust_return}),")?;
+            write!(
+                style_query_arms,
+                " }} => GeneratedStyleAnswer::{event}(operations::{operation_name}(engine"
+            )?;
+            for (name, kind, _) in &parsed_arguments {
+                if kind.ends_with("_slice") {
+                    write!(style_query_arms, ", &{name}")?;
+                } else {
+                    write!(style_query_arms, ", {name}")?;
+                }
+            }
+            style_query_arms.push_str(")),\n");
+            write!(rust, "        let query = GeneratedStyleQuery::{event} {{")?;
+            for (name, _, _) in &parsed_arguments {
+                write!(rust, " {name},")?;
+            }
+            writeln!(
+                rust,
+                " }};\n        let GeneratedStyleAnswer::{event}(result) = (unsafe {{ crate::css::style::engine_calls::ask_engine_generated(document_host, query) }}) else {{ unreachable!(\"a read is answered with its own result\") }};\n        result\n    }})\n}}\n"
+            )?;
+        } else if let Some(ffi) = ffi {
+            writeln!(
+                rust,
+                "/// Generated from the StyleEngine boundary specification.\n///\n/// # Safety\n/// `engine` and every borrowed argument must be live for this call.\n#[unsafe(no_mangle)]"
+            )?;
+            write!(rust, "pub unsafe extern \"C\" fn {ffi}(engine: {engine_type}")?;
+            for (name, kind, (rust_type, _, _, _)) in &parsed_arguments {
+                write!(rust, ", {name}: {rust_type}")?;
+                if kind.ends_with("_slice") {
+                    write!(rust, ", {name}_count: usize")?;
+                }
+            }
+            if return_kind != "void" {
+                writeln!(rust, ") -> {rust_return} {{")?;
+            } else {
+                rust.push_str(") {\n");
+            }
+            writeln!(
+                rust,
+                "    abort_on_panic(|| {{\n        let engine = unsafe {{ {engine_borrow} }};"
+            )?;
+        }
+        let native_receiver = if receiver == "const" {
+            "&StyleEngine"
+        } else {
+            "&mut StyleEngine"
+        };
+        write!(native, "pub fn {operation_name}(engine: {native_receiver}")?;
+        for (name, kind, (rust_type, _, _, _)) in &parsed_arguments {
+            if kind.ends_with("_slice") {
+                let element_type = rust_type.trim_start_matches("*const ");
+                write!(native, ", {name}: &[{element_type}]")?;
+                if ffi.is_some() && !is_change && !is_query {
+                    writeln!(
+                        rust,
+                        "        let {name}: &[{element_type}] = if {name}_count == 0 || {name}.is_null() {{ &[] }} else {{ unsafe {{ std::slice::from_raw_parts({name}, {name}_count) }} }};"
+                    )?;
+                }
+            } else {
+                write!(native, ", {name}: {rust_type}")?;
+            }
+        }
+        if return_kind == "void" {
+            native.push_str(") {\n");
+        } else {
+            writeln!(native, ") -> {rust_return} {{")?;
+        }
+        if ffi.is_some() && !is_change && !is_query {
+            write!(rust, "        operations::{operation_name}(engine")?;
+            for (name, _, _) in &parsed_arguments {
+                write!(rust, ", {name}")?;
+            }
+            rust.push_str(if return_kind == "void" {
+                ");\n    });\n}\n\n"
+            } else {
+                ")\n    })\n}\n\n"
+            });
+        }
+        for (name, _, _) in &parsed_arguments {
+            writeln!(native, "        let recorded_{name} = {name};")?;
+        }
+        writeln!(native, "        {body}")?;
+        let payload_name = if parsed_arguments.is_empty() && return_kind == "void" {
+            "_"
+        } else {
+            "payload"
+        };
+        writeln!(
+            native,
+            "        engine.record_boundary_call(EventKind::{event}, |{payload_name}| {{"
+        )?;
+        for (name, kind, (_, _, writer, _)) in &recorded_arguments {
+            if *kind == "cascade_origin" {
+                writeln!(native, "            payload.{writer}(recorded_{name} as u8);")?;
+            } else if *kind == "usize_u64" {
+                writeln!(
+                    native,
+                    "            payload.{writer}(u64::try_from(recorded_{name}).expect(\"boundary value exceeds u64\"));"
+                )?;
+            } else {
+                writeln!(native, "            payload.{writer}(recorded_{name});")?;
+            }
+        }
+        if return_kind != "void" {
+            if return_kind == "usize_u64" {
+                writeln!(
+                    native,
+                    "            payload.{result_writer}(u64::try_from(result).expect(\"boundary result exceeds u64\"));"
+                )?;
+            } else {
+                writeln!(native, "            payload.{result_writer}(result);")?;
+            }
+        }
+        native.push_str("        });\n");
+        if return_kind != "void" {
+            native.push_str("        result\n");
+            native.push_str("}\n\n");
+        } else {
+            native.push_str("}\n\n");
+        }
+
+        let generate_replay = object
+            .get("replay")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if generate_replay {
+            writeln!(replay, "        EventKind::{event} => {{")?;
+            writeln!(replay, "            let engine = read_engine(payload, live_engines)?;")?;
+            for (name, kind, (_, _, _, reader)) in &recorded_arguments {
+                if *kind == "cascade_origin" {
+                    writeln!(replay, "            let {name} = {reader}(payload)?;")?;
+                } else {
+                    writeln!(replay, "            let {name} = payload.{reader}()?;")?;
+                }
+            }
+            if return_kind == "void" {
+                write!(
+                    replay,
+                    "            bridge::operations::{operation_name}(unsafe {{ {replay_engine_borrow} }}"
+                )?;
+            } else {
+                write!(
+                    replay,
+                    "            let actual = bridge::operations::{operation_name}(unsafe {{ {replay_engine_borrow} }}"
+                )?;
+            }
+            for (name, kind, _) in &parsed_arguments {
+                if kind.ends_with("_slice") {
+                    write!(replay, ", &{name}")?;
+                } else {
+                    write!(replay, ", {name}")?;
+                }
+            }
+            replay.push_str(");\n");
+            if return_kind != "void" {
+                writeln!(replay, "            let expected = payload.{result_reader}()?;")?;
+                writeln!(
+                    replay,
+                    "            if actual != expected {{ return Err(format!(\"{operation_name} diverged: expected {{expected:?}}, got {{actual:?}}\").into()); }}"
+                )?;
+            }
+            replay.push_str("            Ok(true)\n        }\n");
+        }
+
+        let Some(cpp) = object.get("cpp").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let ffi = ffi.ok_or("C++ operation needs an FFI name")?;
+        let cpp_result = object.get("cpp_result").and_then(serde_json::Value::as_str);
+        let cpp_return = match cpp_result {
+            Some("optional_u32") => "Optional<u32>",
+            Some(other) => return Err(format!("unknown C++ boundary result {other}").into()),
+            None => cpp_return,
+        };
+        if return_kind != "void" {
+            cpp_declarations.push_str("[[nodiscard]] ");
+        }
+        write!(cpp_declarations, "{cpp_return} {cpp}(")?;
+        for (index, (name, _, (_, cpp_type, _, _))) in parsed_arguments.iter().enumerate() {
+            if index != 0 {
+                cpp_declarations.push_str(", ");
+            }
+            write!(cpp_declarations, "{cpp_type} {name}")?;
+        }
+        if cpp_const {
+            cpp_declarations.push_str(") const;\n");
+        } else {
+            cpp_declarations.push_str(");\n");
+        }
+
+        write!(cpp_definitions, "{cpp_return} StyleEngine::{cpp}(")?;
+        for (index, (name, _, (_, cpp_type, _, _))) in parsed_arguments.iter().enumerate() {
+            if index != 0 {
+                cpp_definitions.push_str(", ");
+            }
+            write!(cpp_definitions, "{cpp_type} {name}")?;
+        }
+        if cpp_const {
+            cpp_definitions.push_str(") const\n{\n");
+        } else {
+            cpp_definitions.push_str(")\n{\n");
+        }
+        if cpp_result == Some("optional_u32") {
+            cpp_definitions.push_str("    auto result = ");
+        } else if return_kind != "void" {
+            if matches!(
+                return_kind,
+                "sheet_id" | "style_atom" | "style_node" | "style_rule_id" | "tree_scope_id"
+            ) {
+                write!(cpp_definitions, "    return {cpp_return} {{ ")?;
+            } else {
+                cpp_definitions.push_str("    return ");
+            }
+        } else {
+            cpp_definitions.push_str("    ");
+        }
+        if is_change || is_query {
+            write!(cpp_definitions, "StyleEngineFFI::{ffi}(m_render_document->host()")?;
+        } else {
+            write!(cpp_definitions, "StyleEngineFFI::{ffi}(m_impl")?;
+        }
+        for (name, kind, _) in &parsed_arguments {
+            if matches!(
+                *kind,
+                "sheet_id" | "style_atom" | "style_node" | "style_record" | "style_rule_id" | "tree_scope_id"
+            ) {
+                write!(cpp_definitions, ", {name}.value()")?;
+            } else if matches!(*kind, "style_atom_slice" | "style_node_slice") {
+                write!(
+                    cpp_definitions,
+                    ", reinterpret_cast<u32 const*>({name}.data()), {name}.size()"
+                )?;
+            } else if kind.ends_with("_slice") {
+                write!(cpp_definitions, ", {name}.data(), {name}.size()")?;
+            } else {
+                write!(cpp_definitions, ", {name}")?;
+            }
+        }
+        if matches!(
+            return_kind,
+            "sheet_id" | "style_atom" | "style_node" | "style_rule_id" | "tree_scope_id"
+        ) {
+            cpp_definitions.push_str(") };\n");
+        } else {
+            cpp_definitions.push_str(");\n");
+        }
+        if cpp_result == Some("optional_u32") {
+            cpp_definitions.push_str("    if (result == 0)\n        return {};\n    return result;\n");
+        }
+        cpp_definitions.push_str("}\n\n");
+    }
+
+    replay.push_str("        _ => Ok(false),\n    }\n}\n");
+    let generated_events = operation_events.into_iter().collect::<std::collections::BTreeSet<_>>();
+    if !generated_events.is_disjoint(&bespoke_events) {
+        return Err("boundary event cannot be both generated and bespoke".into());
+    }
+    let covered_events = generated_events.union(&bespoke_events).copied().collect();
+    if declared_events != covered_events {
+        return Err("every boundary event must be generated or explicitly bespoke".into());
+    }
+    native.push_str("}\n");
+    rust.push_str(&native);
+    write!(
+        rust,
+        "\n/// A write of the host to the document's style engine, which the render state applies to it.\npub(crate) enum StyleChange {{\n{style_change_variants}}}\n\nimpl StyleChange {{\n    pub(crate) fn apply(self, engine: &mut StyleEngine) {{\n        match self {{\n{style_change_arms}        }}\n    }}\n}}\n"
+    )?;
+    write!(
+        rust,
+        "\n/// A read of the host of the document's style engine, which the render state answers from it.\npub(crate) enum GeneratedStyleQuery {{\n{style_query_variants}}}\n\n/// The answer to a [`GeneratedStyleQuery`].\npub(crate) enum GeneratedStyleAnswer {{\n{style_answer_variants}}}\n\nimpl GeneratedStyleQuery {{\n    pub(crate) fn answer(self, engine: &mut StyleEngine) -> GeneratedStyleAnswer {{\n        match self {{\n{style_query_arms}        }}\n    }}\n}}\n"
+    )?;
+    std::fs::write(out_dir.join("style_engine_boundary_generated.rs"), rust)?;
+    std::fs::write(out_dir.join("style_engine_replay_generated.rs"), replay)?;
+    std::fs::write(out_dir.join("StyleEngineBridgeGenerated.h"), cpp_declarations)?;
+    std::fs::write(out_dir.join("StyleEngineBridgeGenerated.inc"), cpp_definitions)?;
+    Ok(())
 }
 
 // Generates the Rust twins of the C++ PseudoClass and PseudoElement enums from the same JSON
@@ -112,11 +1093,27 @@ fn generate_selector_pseudo_types(manifest_dir: &Path, out_dir: &Path) -> Result
         }
     };
 
-    let pseudo_class_names = parse_object(&pseudo_classes_path)?
+    let pseudo_classes = parse_object(&pseudo_classes_path)?;
+    let pseudo_class_names = pseudo_classes
         .iter()
         .filter(|(_, value)| !value.as_object().unwrap().contains_key("legacy-alias-for"))
         .map(|(name, _)| title_casify(name))
         .collect::<Vec<_>>();
+    let mut state_fact_names = pseudo_classes
+        .iter()
+        .filter(|(_, value)| value["style-engine-state"].as_bool() == Some(true))
+        .map(|(name, _)| title_casify(name))
+        .collect::<Vec<_>>();
+    // NB: FfiStateFact discriminants persist in replay streams. PopoverOpen historically follows
+    //     Playing, so preserve that ordering at the compatibility boundary.
+    if let Some(popover_open) = state_fact_names.iter().position(|name| name == "PopoverOpen") {
+        let popover_open = state_fact_names.remove(popover_open);
+        let playing = state_fact_names
+            .iter()
+            .position(|name| name == "Playing")
+            .expect("PopoverOpen requires Playing in the state fact catalog");
+        state_fact_names.insert(playing + 1, popover_open);
+    }
 
     let pseudo_elements = parse_object(&pseudo_elements_path)?;
     let mut pseudo_element_names = ordered_pseudo_element_names(&pseudo_elements)?
@@ -137,7 +1134,209 @@ fn generate_selector_pseudo_types(manifest_dir: &Path, out_dir: &Path) -> Result
     write_enum_and_from_ffi(&mut output, "PseudoClassType", &pseudo_class_names);
     write_enum_and_from_ffi(&mut output, "PseudoElementType", &pseudo_element_names);
 
+    writeln!(output, "#[allow(dead_code)]")?;
+    writeln!(output, "impl PseudoClassType {{")?;
+    writeln!(output, "    pub(crate) fn from_name(name: &[u16]) -> Option<Self> {{")?;
+    for (name, value) in &pseudo_classes {
+        let target = value
+            .get("legacy-alias-for")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(name);
+        writeln!(
+            output,
+            "        if equals_ascii_case_insensitive(name, b\"{name}\") {{ return Some(Self::{}); }}",
+            title_casify(target)
+        )?;
+    }
+    writeln!(output, "        None")?;
+    writeln!(output, "    }}")?;
+    writeln!(output, "    #[allow(dead_code)]")?;
+    writeln!(output, "    pub(crate) fn name(self) -> &'static str {{")?;
+    writeln!(output, "        match self {{")?;
+    for (name, value) in &pseudo_classes {
+        if value.as_object().unwrap().contains_key("legacy-alias-for") {
+            continue;
+        }
+        writeln!(output, "            Self::{} => \"{name}\",", title_casify(name))?;
+    }
+    writeln!(output, "        }}")?;
+    writeln!(output, "    }}")?;
+    writeln!(output, "    pub(crate) fn metadata(self) -> PseudoClassMetadata {{")?;
+    writeln!(output, "        match self {{")?;
+    for (name, value) in &pseudo_classes {
+        let object = value.as_object().unwrap();
+        if object.contains_key("legacy-alias-for") {
+            continue;
+        }
+        let mut argument = object["argument"].as_str().unwrap();
+        let mut is_valid_as_identifier = argument.is_empty();
+        let is_valid_as_function = !argument.is_empty();
+        if argument.ends_with('?') {
+            is_valid_as_identifier = true;
+            argument = &argument[..argument.len() - 1];
+        }
+        let parameter_type = match argument {
+            "" => "None",
+            "<a-n-plus-b>" => "AnPlusB",
+            "<a-n-plus-b-of>" => "AnPlusBOf",
+            "<compound-selector>" => "CompoundSelector",
+            "<forgiving-selector-list>" => "ForgivingSelectorList",
+            "<forgiving-relative-selector-list>" => "ForgivingRelativeSelectorList",
+            "<ident>" => "Ident",
+            "<language-ranges>" => "LanguageRanges",
+            "<level>#" => "LevelList",
+            "<relative-selector-list>" => "RelativeSelectorList",
+            "<selector-list>" => "SelectorList",
+            _ => return Err(format!("unsupported pseudo-class parameter type {argument}").into()),
+        };
+        writeln!(
+            output,
+            "            Self::{} => PseudoClassMetadata {{ parameter_type: PseudoClassParameterType::{parameter_type}, is_valid_as_function: {is_valid_as_function}, is_valid_as_identifier: {is_valid_as_identifier} }},",
+            title_casify(name)
+        )?;
+    }
+    writeln!(output, "        }}")?;
+    writeln!(output, "    }}")?;
+    writeln!(output, "}}")?;
+
+    writeln!(output, "#[allow(dead_code)]")?;
+    writeln!(output, "impl PseudoElementType {{")?;
+    writeln!(
+        output,
+        "    pub(crate) fn from_name(name: &[u16]) -> Option<(Self, Option<&'static str>)> {{"
+    )?;
+    for (name, value) in &pseudo_elements {
+        let object = value.as_object().unwrap();
+        let (target, serialized_alias) = match object.get("alias-for").and_then(serde_json::Value::as_str) {
+            Some(target) => (target, format!("Some(\"{name}\")")),
+            None => (name.as_str(), "None".to_string()),
+        };
+        writeln!(
+            output,
+            "        if equals_ascii_case_insensitive(name, b\"{name}\") {{ return Some((Self::{}, {serialized_alias})); }}",
+            title_casify(target)
+        )?;
+    }
+    writeln!(output, "        None")?;
+    writeln!(output, "    }}")?;
+    writeln!(output, "    #[allow(dead_code)]")?;
+    writeln!(output, "    pub(crate) fn name(self) -> &'static str {{")?;
+    writeln!(output, "        match self {{")?;
+    for (name, value) in &pseudo_elements {
+        if value.as_object().unwrap().contains_key("alias-for") {
+            continue;
+        }
+        writeln!(output, "            Self::{} => \"{name}\",", title_casify(name))?;
+    }
+    writeln!(output, "            Self::UnknownWebKit => unreachable!(),")?;
+    writeln!(output, "        }}")?;
+    writeln!(output, "    }}")?;
+    writeln!(output, "    pub(crate) fn metadata(self) -> PseudoElementMetadata {{")?;
+    writeln!(output, "        match self {{")?;
+    for (name, value) in &pseudo_elements {
+        let object = value.as_object().unwrap();
+        if object.contains_key("alias-for") {
+            continue;
+        }
+        let is_valid_as_function = object.get("type").and_then(serde_json::Value::as_str) == Some("function");
+        let is_valid_as_identifier = !is_valid_as_function;
+        let function_syntax = object.get("function-syntax").and_then(serde_json::Value::as_str);
+        if is_valid_as_function != function_syntax.is_some() {
+            return Err(format!("pseudo-element {name} has inconsistent type and function-syntax").into());
+        }
+        let parameter_type = match function_syntax {
+            None => "None",
+            Some("<compound-selector>") => "CompoundSelector",
+            Some("<ident>+") => "IdentList",
+            Some("<pt-name-selector>") => "PTNameSelector",
+            Some(argument) => return Err(format!("unsupported pseudo-element parameter type {argument}").into()),
+        };
+        writeln!(
+            output,
+            "            Self::{} => PseudoElementMetadata {{ parameter_type: PseudoElementParameterType::{parameter_type}, is_valid_as_function: {is_valid_as_function}, is_valid_as_identifier: {is_valid_as_identifier} }},",
+            title_casify(name)
+        )?;
+    }
+    writeln!(output, "            Self::UnknownWebKit => unreachable!(),")?;
+    writeln!(output, "        }}")?;
+    writeln!(output, "    }}")?;
+    writeln!(output, "}}")?;
+
     std::fs::write(out_dir.join("selector_pseudo_generated.rs"), output)?;
+
+    let mut state_facts = String::from(
+        "// Generated by build.rs from CSS/PseudoClasses.json.\n\n\
+         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]\n\
+         #[repr(u8)]\n\
+         pub enum StateFact {\n",
+    );
+    for name in &state_fact_names {
+        writeln!(state_facts, "    {name},")?;
+    }
+    writeln!(state_facts, "}}\n\nimpl StateFact {{")?;
+    writeln!(state_facts, "    pub const ALL: [Self; {}] = [", state_fact_names.len())?;
+    for name in &state_fact_names {
+        writeln!(state_facts, "        Self::{name},")?;
+    }
+    state_facts.push_str("    ];\n}\n");
+    std::fs::write(out_dir.join("style_state_fact_generated.rs"), state_facts)?;
+
+    let mut compiler_mapping = String::from(
+        "// Generated by build.rs from CSS/PseudoClasses.json.\n\n\
+         fn state_fact_for(pseudo_class: PseudoClassType) -> Option<StateFact> {\n\
+         \x20   match pseudo_class {\n",
+    );
+    for name in &state_fact_names {
+        writeln!(
+            compiler_mapping,
+            "        PseudoClassType::{name} => Some(StateFact::{name}),"
+        )?;
+    }
+    compiler_mapping.push_str("        _ => None,\n    }\n}\n");
+    std::fs::write(out_dir.join("style_state_fact_compiler_generated.rs"), compiler_mapping)?;
+
+    let mut ffi_state_facts = String::from(
+        "// Generated by build.rs from CSS/PseudoClasses.json.\n\n\
+         #[derive(Clone, Copy, PartialEq, Eq)]\n\
+         #[repr(u8)]\n\
+         pub enum FfiStateFact {\n",
+    );
+    for (index, name) in state_fact_names.iter().enumerate() {
+        writeln!(ffi_state_facts, "    {name} = {index},")?;
+    }
+    ffi_state_facts.push_str(
+        "}\n\n\
+         fn decode_state_fact(fact: FfiStateFact) -> StateFact {\n\
+         \x20   StateFact::ALL[fact as usize]\n\
+         }\n",
+    );
+    std::fs::write(out_dir.join("ffi_state_fact_generated.rs"), ffi_state_facts)?;
+
+    let mut cpp_mapping = String::from(
+        "// Generated by Rust/build.rs from CSS/PseudoClasses.json.\n\n\
+         static Optional<StyleEngineFFI::FfiStateFact> state_fact_for(PseudoClass pseudo_class)\n\
+         {\n\
+         \x20   switch (pseudo_class) {\n",
+    );
+    for name in &state_fact_names {
+        writeln!(
+            cpp_mapping,
+            "    case PseudoClass::{name}:\n        return StyleEngineFFI::FfiStateFact::{name};"
+        )?;
+    }
+    cpp_mapping.push_str("    default:\n        return {};\n    }\n}\n");
+    std::fs::write(out_dir.join("StyleEngineStateFactsGenerated.inc"), cpp_mapping)?;
+
+    let mut selector_mapping = String::from(
+        "// Generated by Rust/build.rs from CSS/PseudoClasses.json.\n\n\
+         // The pseudo-class of each state fact, by the fact's value.\n\
+         static constexpr Array pseudo_classes_by_state_fact {\n",
+    );
+    for name in &state_fact_names {
+        writeln!(selector_mapping, "    CSS::PseudoClass::{name},")?;
+    }
+    selector_mapping.push_str("};\n");
+    std::fs::write(out_dir.join("SelectorStateFactsGenerated.inc"), selector_mapping)?;
     Ok(())
 }
 
@@ -154,6 +1353,22 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     let serde_json::Value::Object(properties) = value else {
         return Err("Properties.json does not contain a JSON object".into());
     };
+
+    let enums_path = manifest_dir.parent().unwrap().join("CSS/Enums.json");
+    let keywords_path = manifest_dir.parent().unwrap().join("CSS/Keywords.json");
+    println!("cargo:rerun-if-changed={}", enums_path.display());
+    println!("cargo:rerun-if-changed={}", keywords_path.display());
+    let enums_value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&enums_path)?)?;
+    let enums = enums_value
+        .as_object()
+        .ok_or("Enums.json does not contain a JSON object")?;
+    let keywords_value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&keywords_path)?)?;
+    let keywords = keywords_value.as_array().ok_or("Keywords.json is not an array")?;
+    let keyword_codes = keywords
+        .iter()
+        .enumerate()
+        .map(|(index, keyword)| (keyword.as_str().unwrap(), (index + 1) as u16))
+        .collect::<std::collections::HashMap<_, _>>();
 
     // Logical alias properties take their metadata from the first physical property of
     // their logical group, with local overrides, mirroring the C++ generator.
@@ -317,6 +1532,14 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
 
     let mut levels = vec![0u8; (last_longhand - first_longhand + 1) as usize];
     let mut animation_types = vec![0u8; levels.len()];
+    let mut layout_geometry_effects = vec![false; levels.len()];
+    let mut affects_layout = vec![false; levels.len()];
+    let mut affects_stacking_context = vec![false; levels.len()];
+    let mut affects_scrollable_overflow = vec![false; levels.len()];
+    let mut affects_accumulated_visual_contexts = vec![false; levels.len()];
+    let mut affects_hit_testing = vec![false; levels.len()];
+    let mut style_group_indices = vec![u8::MAX; levels.len()];
+    let mut initial_values = vec![String::new(); levels.len()];
     let mut numeric_range_rows = vec![String::new(); levels.len()];
     let value_types = [
         "anchor",
@@ -385,6 +1608,61 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
             "none" => 4,
             other => return Err(format!("unknown animation-type '{other}' for {name}").into()),
         };
+
+        let metadata_flag = |field: &str, default| {
+            property_field(name, field)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(default)
+        };
+        // Animation controls can select or retime an animation of any property, so their own
+        // direct layout metadata cannot bound the geometry they expose. Likewise, container-name
+        // can change which descendant container queries apply without changing its own box, and
+        // color can change SVG bounds when stroke resolves currentColor.
+        let may_affect_layout_geometry_indirectly = property_field(name, "style-group")
+            .is_some_and(|value| value.as_str() == Some("AnimationValues"))
+            || matches!(name.as_str(), "color" | "container-name");
+        layout_geometry_effects[index] = metadata_flag("affects-layout", true)
+            || metadata_flag("affects-accumulated-visual-contexts", false)
+            || metadata_flag("affects-scrollable-overflow", false)
+            || metadata_flag("affects-stacking-context", false)
+            || may_affect_layout_geometry_indirectly;
+        affects_layout[index] = metadata_flag("affects-layout", true);
+        affects_stacking_context[index] = metadata_flag("affects-stacking-context", false);
+        affects_scrollable_overflow[index] = metadata_flag("affects-scrollable-overflow", false);
+        affects_accumulated_visual_contexts[index] = metadata_flag("affects-accumulated-visual-contexts", false);
+        affects_hit_testing[index] = metadata_flag("affects-hit-testing", false);
+        let style_group = property_field(name, "style-group").and_then(|value| value.as_str().map(str::to_owned));
+        style_group_indices[index] = match style_group.as_deref() {
+            Some("InheritedTableValues") => 0,
+            Some("InheritedListValues") => 1,
+            Some("InheritedUIValues") => 2,
+            Some("InheritedSVGValues") => 3,
+            Some("InheritedTextValues") => 4,
+            Some("InheritedBoxValues") => 5,
+            Some("FontValues") => 6,
+            Some("AnimationValues") => 7,
+            Some("SVGResetValues") => 8,
+            Some("GridValues") => 9,
+            Some("AnchorValues") => 10,
+            Some("EffectsValues") => 11,
+            Some("MaskValues") => 12,
+            Some("TextResetValues") => 13,
+            Some("ContentValues") => 14,
+            Some("TransformValues") => 15,
+            Some("BackgroundValues") => 16,
+            Some("BorderValues") => 17,
+            Some("AlignmentValues") => 18,
+            Some("MiscResetValues") => 19,
+            Some("SizingValues") => 20,
+            Some("SurroundValues") => 21,
+            Some("BoxValues") => 22,
+            Some(group) => return Err(format!("unknown style group '{group}' for {name}").into()),
+            None => u8::MAX,
+        };
+
+        initial_values[index] = property_field(name, "initial")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .ok_or_else(|| format!("missing initial value for {name}"))?;
 
         let mut ranges = Vec::new();
         if let Some(valid_types) = property_field(name, "valid-types").and_then(|value| value.as_array().cloned()) {
@@ -465,6 +1743,273 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         .chain(&noninherited_longhands)
         .map(String::as_str)
         .collect();
+    // The C++ property-name generator accepts legacy aliases but maps them to
+    // their canonical IDs instead of assigning separate IDs.
+    let mut property_name_lookup: Vec<(&str, u16)> = properties
+        .iter()
+        .map(|(name, value)| {
+            let object = value.as_object().unwrap();
+            let target = object
+                .get("legacy-alias-for")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(name);
+            (name.as_str(), ids[target])
+        })
+        .collect();
+    property_name_lookup.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let longhand_names: Vec<&str> = inherited_longhands
+        .iter()
+        .chain(&noninherited_longhands)
+        .map(String::as_str)
+        .collect();
+    const WRITING_MODE_COUNT: usize = 5;
+    const DIRECTION_COUNT: usize = 2;
+    const LOGICAL_CONTEXT_COUNT: usize = WRITING_MODE_COUNT * DIRECTION_COUNT;
+    let mut logical_alias_to_physical = vec![0u16; longhand_names.len() * LOGICAL_CONTEXT_COUNT];
+    for (longhand_index, name) in longhand_names.iter().enumerate() {
+        let Some(alias) = properties[*name]
+            .get("logical-alias-for")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        let group_name = alias["group"].as_str().unwrap();
+        let mapping = alias["mapping"].as_str().unwrap();
+        let physical = groups[group_name]["physical"].as_object().unwrap();
+        for writing_mode in 0..WRITING_MODE_COUNT {
+            for direction in 0..DIRECTION_COUNT {
+                let ltr = direction == 0;
+                let physical_name = match mapping {
+                    "block-end" => match writing_mode {
+                        0 => "bottom",
+                        1 | 3 => "left",
+                        _ => "right",
+                    },
+                    "block-size" => {
+                        if writing_mode == 0 {
+                            "height"
+                        } else {
+                            "width"
+                        }
+                    }
+                    "block-start" => match writing_mode {
+                        0 => "top",
+                        1 | 3 => "right",
+                        _ => "left",
+                    },
+                    "block-xy" => {
+                        if writing_mode == 0 {
+                            "y"
+                        } else {
+                            "x"
+                        }
+                    }
+                    "end-end" => match writing_mode {
+                        0 => {
+                            if ltr {
+                                "bottom-right"
+                            } else {
+                                "bottom-left"
+                            }
+                        }
+                        1 | 3 => {
+                            if ltr {
+                                "bottom-left"
+                            } else {
+                                "top-left"
+                            }
+                        }
+                        2 => {
+                            if ltr {
+                                "bottom-right"
+                            } else {
+                                "top-right"
+                            }
+                        }
+                        _ => {
+                            if ltr {
+                                "top-right"
+                            } else {
+                                "bottom-right"
+                            }
+                        }
+                    },
+                    "end-start" => match writing_mode {
+                        0 => {
+                            if ltr {
+                                "bottom-left"
+                            } else {
+                                "bottom-right"
+                            }
+                        }
+                        1 | 3 => {
+                            if ltr {
+                                "top-left"
+                            } else {
+                                "bottom-left"
+                            }
+                        }
+                        2 => {
+                            if ltr {
+                                "top-right"
+                            } else {
+                                "bottom-right"
+                            }
+                        }
+                        _ => {
+                            if ltr {
+                                "bottom-right"
+                            } else {
+                                "top-right"
+                            }
+                        }
+                    },
+                    "inline-end" => match writing_mode {
+                        0 => {
+                            if ltr {
+                                "right"
+                            } else {
+                                "left"
+                            }
+                        }
+                        1..=3 => {
+                            if ltr {
+                                "bottom"
+                            } else {
+                                "top"
+                            }
+                        }
+                        _ => {
+                            if ltr {
+                                "top"
+                            } else {
+                                "bottom"
+                            }
+                        }
+                    },
+                    "inline-size" => {
+                        if writing_mode == 0 {
+                            "width"
+                        } else {
+                            "height"
+                        }
+                    }
+                    "inline-start" => match writing_mode {
+                        0 => {
+                            if ltr {
+                                "left"
+                            } else {
+                                "right"
+                            }
+                        }
+                        1..=3 => {
+                            if ltr {
+                                "top"
+                            } else {
+                                "bottom"
+                            }
+                        }
+                        _ => {
+                            if ltr {
+                                "bottom"
+                            } else {
+                                "top"
+                            }
+                        }
+                    },
+                    "inline-xy" => {
+                        if writing_mode == 0 {
+                            "x"
+                        } else {
+                            "y"
+                        }
+                    }
+                    "start-end" => match writing_mode {
+                        0 => {
+                            if ltr {
+                                "top-right"
+                            } else {
+                                "top-left"
+                            }
+                        }
+                        1 | 3 => {
+                            if ltr {
+                                "bottom-right"
+                            } else {
+                                "top-right"
+                            }
+                        }
+                        2 => {
+                            if ltr {
+                                "bottom-left"
+                            } else {
+                                "top-left"
+                            }
+                        }
+                        _ => {
+                            if ltr {
+                                "top-left"
+                            } else {
+                                "bottom-left"
+                            }
+                        }
+                    },
+                    "start-start" => match writing_mode {
+                        0 => {
+                            if ltr {
+                                "top-left"
+                            } else {
+                                "top-right"
+                            }
+                        }
+                        1 | 3 => {
+                            if ltr {
+                                "top-right"
+                            } else {
+                                "bottom-right"
+                            }
+                        }
+                        2 => {
+                            if ltr {
+                                "top-left"
+                            } else {
+                                "bottom-left"
+                            }
+                        }
+                        _ => {
+                            if ltr {
+                                "bottom-left"
+                            } else {
+                                "top-left"
+                            }
+                        }
+                    },
+                    _ => return Err(format!("unknown logical property mapping '{mapping}'").into()),
+                };
+                let property_name = physical[physical_name].as_str().unwrap();
+                let index = (longhand_index * WRITING_MODE_COUNT + writing_mode) * DIRECTION_COUNT + direction;
+                logical_alias_to_physical[index] = ids[property_name];
+            }
+        }
+    }
+    let mut physical_to_logical_alias = vec![0u16; logical_alias_to_physical.len()];
+    for (longhand_index, name) in longhand_names.iter().enumerate() {
+        let logical_property_id = ids[*name];
+        for writing_mode in 0..WRITING_MODE_COUNT {
+            for direction in 0..DIRECTION_COUNT {
+                let context_index = writing_mode * DIRECTION_COUNT + direction;
+                let physical_property_id =
+                    logical_alias_to_physical[longhand_index * LOGICAL_CONTEXT_COUNT + context_index];
+                if physical_property_id == 0 {
+                    continue;
+                }
+                let physical_index = usize::from(physical_property_id - first_longhand);
+                let reverse_index = physical_index * LOGICAL_CONTEXT_COUNT + context_index;
+                assert_eq!(physical_to_logical_alias[reverse_index], 0);
+                physical_to_logical_alias[reverse_index] = logical_property_id;
+            }
+        }
+    }
     fn expanded_longhands(
         name: &str,
         properties: &serde_json::Map<String, serde_json::Value>,
@@ -525,7 +2070,158 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
             properties[name].as_object().unwrap().contains_key("logical-alias-for")
         })
         .collect();
+    if groups.len() >= u8::MAX as usize {
+        return Err("too many logical property groups".into());
+    }
+    let mut logical_group_by_property = std::collections::HashMap::new();
+    for (index, group) in groups.values().enumerate() {
+        let group_id = (index + 1) as u8;
+        for member_kind in ["physical", "logical"] {
+            for property_name in group[member_kind].as_object().unwrap().values() {
+                logical_group_by_property.insert(property_name.as_str().unwrap(), group_id);
+            }
+        }
+    }
+    let logical_groups: Vec<u8> = property_names
+        .iter()
+        .map(|name| logical_group_by_property.get(name).copied().unwrap_or(0))
+        .collect();
     let expanded_longhand_counts: Vec<usize> = expanded_shorthand_longhands.iter().map(Vec::len).collect();
+
+    // Accepted property keywords and legacy aliases mirror property_accepts_keyword()
+    // and resolve_legacy_value_alias() in generate_libweb_css_property_id.py.
+    let mut accepted_keyword_rows = Vec::new();
+    let mut accepted_value_type_rows = Vec::new();
+    let mut custom_ident_blacklist_rows = Vec::new();
+    let mut keyword_alias_rows = Vec::new();
+    let mut keyword_only_rows = Vec::new();
+    let mut coordinating_list_rows = Vec::new();
+    let mut maximum_value_count_rows = Vec::new();
+    let mut percentages_resolve_to_rows = Vec::new();
+    let mut unitless_length_quirk_rows = Vec::new();
+    let mut hashless_hex_color_quirk_rows = Vec::new();
+    for name in &property_names {
+        let mut accepted_keywords = std::collections::BTreeSet::new();
+        let mut keyword_aliases = Vec::new();
+        if let Some(valid_identifiers) =
+            property_field(name, "valid-identifiers").and_then(|value| value.as_array().cloned())
+        {
+            for identifier in valid_identifiers {
+                let identifier = identifier.as_str().unwrap();
+                let (accepted, resolved) = identifier.split_once('>').unwrap_or((identifier, identifier));
+                accepted_keywords.insert(
+                    *keyword_codes
+                        .get(accepted)
+                        .ok_or("property identifier is not a CSS keyword")?,
+                );
+                if accepted != resolved {
+                    keyword_aliases.push((
+                        *keyword_codes
+                            .get(accepted)
+                            .ok_or("property alias is not a CSS keyword")?,
+                        *keyword_codes
+                            .get(resolved)
+                            .ok_or("property alias target is not a CSS keyword")?,
+                    ));
+                }
+            }
+        }
+
+        let valid_types = property_field(name, "valid-types")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        let accepted_value_types = valid_types
+            .iter()
+            .filter_map(|valid_type| {
+                let type_name = valid_type.as_str().unwrap().split(' ').next().unwrap();
+                if enums.contains_key(type_name) {
+                    return None;
+                }
+                Some(
+                    value_types
+                        .iter()
+                        .position(|candidate| *candidate == type_name)
+                        .ok_or_else(|| format!("unknown value type '{type_name}' for {name}")),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        accepted_value_type_rows.push(format!("    &{accepted_value_types:?},"));
+        let custom_ident_blacklist = valid_types
+            .iter()
+            .filter_map(|valid_type| {
+                let valid_type = valid_type.as_str().unwrap();
+                let parameters = valid_type.strip_prefix("custom-ident ![")?.strip_suffix(']')?;
+                Some(parameters.split(','))
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        custom_ident_blacklist_rows.push(format!("    &{custom_ident_blacklist:?},"));
+        for valid_type in &valid_types {
+            let type_name = valid_type.as_str().unwrap().split(' ').next().unwrap();
+            let Some(values) = enums.get(type_name).and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for value in values {
+                let value = value.as_str().unwrap();
+                let accepted = value.split_once('=').map_or(value, |(alias, _)| alias);
+                accepted_keywords.insert(*keyword_codes.get(accepted).ok_or("enum value is not a CSS keyword")?);
+            }
+        }
+
+        accepted_keyword_rows.push(format!("    &{:?},", accepted_keywords.into_iter().collect::<Vec<_>>()));
+        keyword_alias_rows.push(format!("    &{keyword_aliases:?},"));
+        keyword_only_rows.push(
+            (!valid_types.is_empty()
+                && valid_types.iter().all(|valid_type| {
+                    let type_name = valid_type.as_str().unwrap().split(' ').next().unwrap();
+                    enums.contains_key(type_name)
+                }))
+                || (valid_types.is_empty()
+                    && property_field(name, "valid-identifiers")
+                        .and_then(|value| value.as_array().cloned())
+                        .is_some_and(|identifiers| !identifiers.is_empty())),
+        );
+        coordinating_list_rows.push(
+            property_field(name, "multiplicity").and_then(|value| value.as_str().map(str::to_string))
+                == Some("coordinating-list".to_string()),
+        );
+        maximum_value_count_rows.push(
+            property_field(name, "max-values")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(1),
+        );
+        percentages_resolve_to_rows.push(match property_field(name, "percentages-resolve-to") {
+            Some(value) => {
+                let type_name = value.as_str().unwrap();
+                let value_type = value_types
+                    .iter()
+                    .position(|candidate| *candidate == type_name)
+                    .ok_or_else(|| format!("unknown percentage resolution type '{type_name}' for {name}"))?;
+                format!("    Some({value_type}),")
+            }
+            None => "    None,".to_string(),
+        });
+        unitless_length_quirk_rows.push(
+            property_field(name, "quirks")
+                .and_then(|value| value.as_array().cloned())
+                .is_some_and(|quirks| quirks.iter().any(|quirk| quirk.as_str() == Some("unitless-length"))),
+        );
+        hashless_hex_color_quirk_rows.push(
+            property_field(name, "quirks")
+                .and_then(|value| value.as_array().cloned())
+                .is_some_and(|quirks| quirks.iter().any(|quirk| quirk.as_str() == Some("hashless-hex-color"))),
+        );
+    }
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_NAMES: [&str; {}] = {:?};\n",
+        property_names.len(),
+        property_names
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_NAME_LOOKUP: [(&str, u16); {}] = {:?};\n",
+        property_name_lookup.len(),
+        property_name_lookup
+    ));
     output.push_str(&format!(
         "pub(crate) static PROPERTY_IDL_NAMES: [&str; {}] = {:?};\n",
         idl_names.len(),
@@ -537,9 +2233,74 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         logical_aliases
     ));
     output.push_str(&format!(
+        "pub(crate) static PROPERTY_LOGICAL_GROUPS: [u8; {}] = {:?};\n\n",
+        logical_groups.len(),
+        logical_groups
+    ));
+    output.push_str(&format!(
+        "pub(crate) static LOGICAL_ALIAS_TO_PHYSICAL: [u16; {}] = {:?};\n\n",
+        logical_alias_to_physical.len(),
+        logical_alias_to_physical
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PHYSICAL_TO_LOGICAL_ALIAS: [u16; {}] = {:?};\n\n",
+        physical_to_logical_alias.len(),
+        physical_to_logical_alias
+    ));
+    output.push_str(&format!(
         "pub(crate) static SHORTHAND_EXPANDED_LONGHAND_COUNTS: [usize; {}] = {:?};\n\n",
         expanded_longhand_counts.len(),
         expanded_longhand_counts
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_ACCEPTED_KEYWORDS: [&[u16]; {}] = [\n{}\n];\n\n",
+        accepted_keyword_rows.len(),
+        accepted_keyword_rows.join("\n")
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_ACCEPTED_VALUE_TYPES: [&[u8]; {}] = [\n{}\n];\n\n",
+        accepted_value_type_rows.len(),
+        accepted_value_type_rows.join("\n")
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_CUSTOM_IDENT_BLACKLISTS: [&[&str]; {}] = [\n{}\n];\n\n",
+        custom_ident_blacklist_rows.len(),
+        custom_ident_blacklist_rows.join("\n")
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_KEYWORD_ALIASES: [&[(u16, u16)]; {}] = [\n{}\n];\n\n",
+        keyword_alias_rows.len(),
+        keyword_alias_rows.join("\n")
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_ACCEPTS_ONLY_KEYWORDS: [bool; {}] = {:?};\n",
+        keyword_only_rows.len(),
+        keyword_only_rows
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_HAS_COORDINATING_LIST_MULTIPLICITY: [bool; {}] = {:?};\n\n",
+        coordinating_list_rows.len(),
+        coordinating_list_rows
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_MAXIMUM_VALUE_COUNTS: [u64; {}] = {:?};\n\n",
+        maximum_value_count_rows.len(),
+        maximum_value_count_rows
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_PERCENTAGES_RESOLVE_TO: [Option<u8>; {}] = [\n{}\n];\n",
+        percentages_resolve_to_rows.len(),
+        percentages_resolve_to_rows.join("\n")
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_HAS_UNITLESS_LENGTH_QUIRK: [bool; {}] = {:?};\n\n",
+        unitless_length_quirk_rows.len(),
+        unitless_length_quirk_rows
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_HAS_HASHLESS_HEX_COLOR_QUIRK: [bool; {}] = {:?};\n\n",
+        hashless_hex_color_quirk_rows.len(),
+        hashless_hex_color_quirk_rows
     ));
     output.push_str(&format!(
         "pub const FIRST_SHORTHAND_PROPERTY_ID: u16 = {};\n",
@@ -588,6 +2349,46 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         animation_types
     ));
     output.push_str(&format!(
+        "pub(crate) static PROPERTY_MAY_AFFECT_LAYOUT_GEOMETRY: [bool; {}] = {:?};\n",
+        layout_geometry_effects.len(),
+        layout_geometry_effects
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_AFFECTS_LAYOUT: [bool; {}] = {:?};\n",
+        affects_layout.len(),
+        affects_layout
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_AFFECTS_STACKING_CONTEXT: [bool; {}] = {:?};\n",
+        affects_stacking_context.len(),
+        affects_stacking_context
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_AFFECTS_SCROLLABLE_OVERFLOW: [bool; {}] = {:?};\n",
+        affects_scrollable_overflow.len(),
+        affects_scrollable_overflow
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_AFFECTS_ACCUMULATED_VISUAL_CONTEXTS: [bool; {}] = {:?};\n",
+        affects_accumulated_visual_contexts.len(),
+        affects_accumulated_visual_contexts
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_AFFECTS_HIT_TESTING: [bool; {}] = {:?};\n",
+        affects_hit_testing.len(),
+        affects_hit_testing
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_STYLE_GROUP_INDICES: [u8; {}] = {:?};\n",
+        style_group_indices.len(),
+        style_group_indices
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_INITIAL_VALUES: [&str; {}] = {:?};\n",
+        initial_values.len(),
+        initial_values
+    ));
+    output.push_str(&format!(
         "pub(crate) static PROPERTY_NUMERIC_RANGES: [&[FfiPropertyNumericRange]; {}] = [\n{}\n];\n",
         numeric_range_rows.len(),
         numeric_range_rows
@@ -598,6 +2399,21 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     ));
     output.push_str(&format!(
         "\npub(crate) static PSEUDO_ELEMENT_ALWAYS_ALLOWED_PROPERTIES: &[u16] = &{always_allowed_pseudo_properties:?};\n"
+    ));
+    let positional_shorthands: Vec<u16> = properties
+        .iter()
+        .filter(|(_, value)| {
+            value.as_object().is_some_and(|object| {
+                object
+                    .get("positional-value-list-shorthand")
+                    .and_then(|flag| flag.as_bool())
+                    == Some(true)
+            })
+        })
+        .map(|(name, _)| ids[name])
+        .collect();
+    output.push_str(&format!(
+        "\npub(crate) static POSITIONAL_VALUE_LIST_SHORTHANDS: &[u16] = &{positional_shorthands:?};\n"
     ));
     output.push_str(&format!(
         "pub(crate) static PSEUDO_ELEMENT_PROPERTY_WHITELISTS: [Option<&[u16]>; {}] = [\n{}\n];\n",
@@ -688,6 +2504,123 @@ fn generate_length_units(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<
     Ok(())
 }
 
+fn generate_environment_variables(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let path = manifest_dir.parent().unwrap().join("CSS/EnvironmentVariables.json");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let source = std::fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&source)?;
+    let variables = value.as_object().ok_or("EnvironmentVariables.json is not an object")?;
+    let mut output = String::from("// Generated by build.rs from EnvironmentVariables.json. Do not edit.\n\n");
+    output.push_str("pub(crate) static ENVIRONMENT_VARIABLES: &[(&str, usize, &str)] = &[\n");
+    for (name, descriptor) in variables {
+        let dimensions = descriptor["dimensions"]
+            .as_u64()
+            .ok_or_else(|| format!("environment variable {name} has no dimensions"))?;
+        let value_type = descriptor["type"]
+            .as_str()
+            .ok_or_else(|| format!("environment variable {name} has no type"))?;
+        output.push_str(&format!("    ({name:?}, {dimensions}, {value_type:?}),\n"));
+    }
+    output.push_str("];\n");
+    std::fs::write(out_dir.join("environment_variables_generated.rs"), output)?;
+    Ok(())
+}
+
+// Generates transform function names for the Rust serializer from TransformFunctions.json,
+// following the C++ generator's enum member order (the file's key order).
+fn generate_transform_functions(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let path = manifest_dir.parent().unwrap().join("CSS/TransformFunctions.json");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let functions = value.as_object().ok_or("TransformFunctions.json is not an object")?;
+
+    let mut output = String::new();
+    output.push_str("// Generated by build.rs from TransformFunctions.json. Do not edit.\n\n");
+    output.push_str(&format!(
+        "#[allow(dead_code)]\npub(crate) static TRANSFORM_FUNCTION_NAMES: [&str; {}] = [\n",
+        functions.len()
+    ));
+    for name in functions.keys() {
+        output.push_str(&format!("    \"{name}\",\n"));
+    }
+    output.push_str("];\n\n");
+
+    // Function index constants mirroring the C++ TransformFunction enum, which
+    // the generator emits in the JSON object's order.
+    output.push_str("#[allow(dead_code)]\npub(crate) mod transform_function {\n");
+    for (index, name) in functions.keys().enumerate() {
+        let mut constant = String::new();
+        for character in name.chars() {
+            if character.is_ascii_uppercase() {
+                constant.push('_');
+            }
+            constant.push(character.to_ascii_uppercase());
+        }
+        output.push_str(&format!("    pub const {constant}: u8 = {index};\n"));
+    }
+    output.push_str("}\n\n");
+
+    // Parameter types per function, mirroring the C++
+    // TransformFunctionParameterType codes: angle 0, length 1, length-none 2,
+    // length-percentage 3, number 4, number-percentage 5.
+    let parameter_type_code = |name: &str| -> Result<u8, Box<dyn Error>> {
+        Ok(match name {
+            "angle" => 0,
+            "length" => 1,
+            "length-none" => 2,
+            "length-percentage" => 3,
+            "number" => 4,
+            "number-percentage" => 5,
+            _ => return Err(format!("unknown transform function parameter type {name}").into()),
+        })
+    };
+    output.push_str(&format!(
+        "#[allow(dead_code)]\npub(crate) static TRANSFORM_FUNCTION_PARAMETER_TYPES: [&[u8]; {}] = [\n",
+        functions.len()
+    ));
+    for (name, function) in functions {
+        let parameters = function
+            .get("parameters")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("transform function {name} has no parameters array"))?;
+        let mut codes = Vec::new();
+        for parameter in parameters {
+            let parameter_type = parameter
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("transform function {name} parameter has no type"))?;
+            codes.push(parameter_type_code(parameter_type.trim_matches(['<', '>']))?.to_string());
+        }
+        output.push_str(&format!("    &[{}],\n", codes.join(", ")));
+    }
+    output.push_str("];\n\n");
+
+    output.push_str(&format!(
+        "#[allow(dead_code)]\npub(crate) static TRANSFORM_FUNCTION_PARAMETER_REQUIRED: [&[bool]; {}] = [\n",
+        functions.len()
+    ));
+    for (name, function) in functions {
+        let parameters = function
+            .get("parameters")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("transform function {name} has no parameters array"))?;
+        let required = parameters
+            .iter()
+            .map(|parameter| {
+                parameter
+                    .get("required")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        output.push_str(&format!("    &[{}],\n", required.join(", ")));
+    }
+    output.push_str("];\n");
+    std::fs::write(out_dir.join("transform_functions_generated.rs"), output)?;
+    Ok(())
+}
+
 // Generates keyword codes for the Rust style computation core from Keywords.json.
 // Invalid is 0 and the codes follow the array order, matching the C++ Keyword enum.
 fn generate_keywords(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
@@ -705,6 +2638,40 @@ fn generate_keywords(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn 
         let constant = name.replace('-', "_").to_uppercase();
         output.push_str(&format!("    pub const {constant}: u16 = {};\n", index + 1));
     }
+    // Keyword names indexed by code, for serialization; index 0 is the invalid keyword.
+    output.push_str("    pub static NAMES: [&str; ");
+    output.push_str(&format!("{}] = [\n        \"\",\n", keywords.len() + 1));
+    for keyword in keywords {
+        let name = keyword.as_str().unwrap();
+        output.push_str(&format!("        \"{name}\",\n"));
+    }
+    output.push_str("    ];\n");
+    let mut lookup_groups = std::collections::BTreeMap::<(usize, u8), Vec<(&str, u16)>>::new();
+    for (index, keyword) in keywords.iter().enumerate() {
+        let name = keyword.as_str().unwrap();
+        lookup_groups
+            .entry((name.len(), name.as_bytes()[0]))
+            .or_default()
+            .push((name, (index + 1) as u16));
+    }
+    output.push_str(
+        "    pub(crate) fn from_ascii_case_insensitive(identifier: &[u16]) -> Option<u16> {\n\
+             let equals = |expected: &[u8]| {\n\
+                 identifier.iter().zip(expected).all(|(&left, &right)| {\n\
+                     crate::css::ffi_support::ascii_lowercase(left) == u16::from(right)\n\
+                 })\n\
+             };\n\
+             let first = crate::css::ffi_support::ascii_lowercase(*identifier.first()?);\n\
+             match (identifier.len(), first) {\n",
+    );
+    for ((length, first), candidates) in lookup_groups {
+        writeln!(output, "        ({length}, {}) => {{", u16::from(first))?;
+        for (name, code) in candidates {
+            writeln!(output, "            if equals(b\"{name}\") {{ return Some({code}); }}")?;
+        }
+        output.push_str("            None\n        }\n");
+    }
+    output.push_str("        _ => None,\n    }\n}\n");
     output.push_str("}\n");
     std::fs::write(out_dir.join("keywords_generated.rs"), output)?;
     Ok(())
@@ -735,6 +2702,17 @@ fn generate_css_enums(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn
             output.push_str(&format!("    pub const {constant}: u8 = {code};\n"));
             code = code.checked_add(1).ok_or("enum has too many values for u8")?;
         }
+        // Member names indexed by value code, for serialization; mirrors the C++
+        // string_from_<enum> generator (aliases are not members and have no name slot).
+        output.push_str(&format!("    pub static NAMES: [&str; {code}] = [\n"));
+        for value in values {
+            let value = value.as_str().ok_or("enum value is not a string")?;
+            if value.contains('=') {
+                continue;
+            }
+            output.push_str(&format!("        \"{value}\",\n"));
+        }
+        output.push_str("    ];\n");
         output.push_str("}\n\n");
 
         // The keyword-to-enum-value mapping, mirroring the C++ keyword_to_<enum> generator,
@@ -770,13 +2748,7 @@ fn generate_css_enums(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn
     Ok(())
 }
 
-fn generate_ffi_header(
-    config: cbindgen::Config,
-    sources: &[PathBuf],
-    out_dir: &Path,
-    ffi_out_dir: &Path,
-    header: &Path,
-) {
+fn generate_ffi_header(config: cbindgen::Config, sources: &[PathBuf], out_dir: &Path, header: &Path) {
     let builder = sources
         .iter()
         .fold(cbindgen::Builder::new().with_config(config), |builder, source| {
@@ -784,32 +2756,170 @@ fn generate_ffi_header(
         });
     builder.generate().map_or_else(
         |error| match error {
-            cbindgen::Error::ParseSyntaxError { .. } => {}
+            cbindgen::Error::ParseSyntaxError { .. } => {
+                // Do nothing, the build will fail later with a nicer error message when compiling with rustc
+            }
             other => panic!("{other:?}"),
         },
         |bindings| {
             let output_header = out_dir.join(header);
             std::fs::create_dir_all(output_header.parent().unwrap()).unwrap();
             bindings.write_to_file(output_header);
-            if ffi_out_dir != out_dir {
-                let ffi_header = ffi_out_dir.join(header);
-                std::fs::create_dir_all(ffi_header.parent().unwrap()).unwrap();
-                bindings.write_to_file(ffi_header);
-            }
         },
     );
 }
 
-/// Strict variant for the layout headers: dormant layout sources are parsed
-/// by cbindgen before they join the module tree, so a syntax error anywhere
-/// must fail the build instead of silently producing a stale header.
-fn generate_ffi_header_strict(
-    config: cbindgen::Config,
-    sources: &[PathBuf],
-    out_dir: &Path,
-    ffi_out_dir: &Path,
-    header: &Path,
-) {
+fn expose_css_pixel_types_as_web_types(config: &mut cbindgen::Config) {
+    for (rust_name, cpp_name) in [
+        ("CssPixels", "Web::CSSPixels"),
+        ("FfiCssPixelPoint", "Web::CSSPixelPoint"),
+        ("FfiCssPixelSize", "Web::CSSPixelSize"),
+        ("FfiCssPixelRect", "Web::CSSPixelRect"),
+    ] {
+        config.export.exclude.push(rust_name.to_string());
+        config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
+    }
+    config.includes.push("LibWebCommon/PixelUnits.h".to_string());
+    config.after_includes = Some(
+        "#if defined(__clang__)\n#pragma clang diagnostic push\n#pragma clang diagnostic ignored \"-Wreturn-type-c-linkage\"\n#endif"
+            .to_string(),
+    );
+    config.trailer = Some("#if defined(__clang__)\n#pragma clang diagnostic pop\n#endif".to_string());
+}
+
+fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
+    config.export.exclude.extend(
+        [
+            "OptionalFloatRect",
+            "OptionalColor",
+            "OptionalU32",
+            "OptionalF32",
+            "OptionalAffineTransform",
+            "OptionalCssPixels",
+            "OptionalCssPixelRect",
+            "OptionalIntRect",
+            "OptionalFloatPoint",
+            "OptionalFloatSize",
+            "OptionalI64",
+            "OptionalUsize",
+            "ClipMode",
+            "FfiChromeMetrics",
+            "SpatialNodeIndex",
+            "ClipNodeIndex",
+            "EffectNodeIndex",
+            "ContextRef",
+            "DisplayListCommandRun",
+            "ReplayClip",
+            "ReplayLayer",
+            "ReplayMask",
+            "FfiVisualViewportTransform",
+        ]
+        .map(String::from),
+    );
+    for (rust_name, cpp_name) in [
+        ("IntPoint", "Gfx::IntPoint"),
+        ("FloatPoint", "Gfx::FloatPoint"),
+        ("IntSize", "Gfx::IntSize"),
+        ("FloatSize", "Gfx::FloatSize"),
+        ("FloatVector3", "Gfx::FloatVector3"),
+        ("IntRect", "Gfx::IntRect"),
+        ("FloatRect", "Gfx::FloatRect"),
+        ("Color", "Gfx::Color"),
+        ("AffineTransform", "Gfx::AffineTransform"),
+        ("FloatMatrix4x4", "Gfx::FloatMatrix4x4"),
+        ("CornerRadius", "Gfx::CornerRadius"),
+        ("CornerRadii", "Gfx::CornerRadii"),
+        ("GradientInterpolationMethod", "Gfx::GradientInterpolationMethod"),
+        ("WindingRule", "Gfx::WindingRule"),
+        ("MaskKind", "Gfx::MaskKind"),
+        ("CompositingAndBlendingOperator", "Gfx::CompositingAndBlendingOperator"),
+        ("ColorFilterType", "Gfx::ColorFilterType"),
+        ("ScalingMode", "Gfx::ScalingMode"),
+        ("InterpolationColorSpace", "Gfx::InterpolationColorSpace"),
+        ("OptionalFloatRect", "Optional<Gfx::FloatRect>"),
+        ("OptionalColor", "Optional<Gfx::Color>"),
+        ("OptionalU32", "Optional<u32>"),
+        ("OptionalF32", "Optional<float>"),
+        ("OptionalAffineTransform", "Optional<Gfx::AffineTransform>"),
+        ("OptionalCssPixels", "Optional<Web::CSSPixels>"),
+        ("OptionalCssPixelRect", "Optional<Web::CSSPixelRect>"),
+        ("OptionalIntRect", "Optional<Gfx::IntRect>"),
+        ("OptionalFloatPoint", "Optional<Gfx::FloatPoint>"),
+        ("OptionalFloatSize", "Optional<Gfx::FloatSize>"),
+        ("OptionalI64", "Optional<i64>"),
+        ("OptionalUsize", "Optional<size_t>"),
+        ("ClipMode", "Compositing::ClipMode"),
+        ("FfiChromeMetrics", "Web::ChromeMetrics"),
+        ("SpatialNodeIndex", "Compositing::SpatialNodeIndex"),
+        ("ClipNodeIndex", "Compositing::ClipNodeIndex"),
+        ("EffectNodeIndex", "Compositing::EffectNodeIndex"),
+        ("ContextRef", "Compositing::ContextRef"),
+        ("DisplayListCommandRun", "Compositing::DisplayListCommandRun"),
+        ("ReplayClip", "Compositing::ReplayClip"),
+        ("ReplayLayer", "Compositing::ReplayLayer"),
+        ("ReplayMask", "Compositing::ReplayMask"),
+        ("FfiVisualViewportTransform", "Compositing::TransformWithOrigin"),
+    ] {
+        config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
+    }
+
+    config.includes.extend(
+        [
+            "AK/Optional.h",
+            "LibGfx/AffineTransform.h",
+            "LibGfx/Color.h",
+            "LibGfx/CompositingAndBlendingOperator.h",
+            "LibGfx/CornerRadii.h",
+            "LibGfx/Filter.h",
+            "LibGfx/GradientInterpolation.h",
+            "LibGfx/InterpolationColorSpace.h",
+            "LibGfx/Matrix4x4.h",
+            "LibGfx/Point.h",
+            "LibGfx/Rect.h",
+            "LibGfx/ScalingMode.h",
+            "LibGfx/Size.h",
+            "LibGfx/Vector3.h",
+            "LibGfx/WindingRule.h",
+            "LibWeb/Forward.h",
+            "LibCompositing/DisplayList/AccumulatedVisualContext.h",
+            "LibWeb/Painting/ChromeMetrics.h",
+            "LibCompositing/DisplayList/DisplayListCommandsGenerated.h",
+        ]
+        .map(String::from),
+    );
+}
+
+// The types the compositing crate defines, which its own header declares.
+fn expose_compositing_types_as_cpp_types(config: &mut cbindgen::Config) {
+    for name in [
+        "NodeSlotId",
+        "FfiFilterFunction",
+        "FfiFilterFunctionKind",
+        "FfiVisualContextTreeInputs",
+        "FfiVisualAnimationTargetKind",
+        "FfiVisualAnimationPlaybackDirection",
+        "FfiVisualAnimationFillMode",
+        "FfiVisualAnimationTransformOperationKind",
+        "FfiCompositorAnimationPublishOutcome",
+        "FfiVisualAnimationSummary",
+        "FfiAnimatedContentViewportEffect",
+        "FfiTestStickyConstraints",
+        "FfiRecordedDisplayList",
+        "FfiDisplayListReplayCallbacks",
+        "FfiEasingDescriptor",
+        "FfiEasingKind",
+        "FfiLinearEasingPoint",
+    ] {
+        config.export.exclude.push(name.to_string());
+        config
+            .export
+            .rename
+            .insert(name.to_string(), format!("Compositing::RustFFI::{name}"));
+    }
+    config.includes.push("LibCompositing/RustFFI.h".to_string());
+}
+
+fn generate_ffi_header_strict(config: cbindgen::Config, sources: &[PathBuf], out_dir: &Path, header: &Path) {
     let builder = sources
         .iter()
         .fold(cbindgen::Builder::new().with_config(config), |builder, source| {
@@ -821,11 +2931,6 @@ fn generate_ffi_header_strict(
             let output_header = out_dir.join(header);
             std::fs::create_dir_all(output_header.parent().unwrap()).unwrap();
             bindings.write_to_file(output_header);
-            if ffi_out_dir != out_dir {
-                let ffi_header = ffi_out_dir.join(header);
-                std::fs::create_dir_all(ffi_header.parent().unwrap()).unwrap();
-                bindings.write_to_file(ffi_header);
-            }
         },
     );
 }
@@ -836,18 +2941,21 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
-    println!("cargo:rerun-if-env-changed=FFI_OUTPUT_DIR");
     println!("cargo:rerun-if-changed=src");
 
     generate_selector_pseudo_types(&manifest_dir, &out_dir)?;
     generate_property_metadata(&manifest_dir, &out_dir)?;
+    generate_descriptor_metadata(&manifest_dir, &out_dir)?;
+    generate_math_functions(&manifest_dir, &out_dir)?;
+    generate_media_features(&manifest_dir, &out_dir)?;
+    generate_named_colors(&manifest_dir, &out_dir)?;
     generate_length_units(&manifest_dir, &out_dir)?;
+    generate_environment_variables(&manifest_dir, &out_dir)?;
     generate_keywords(&manifest_dir, &out_dir)?;
     generate_css_enums(&manifest_dir, &out_dir)?;
-
-    let ffi_out_dir = env::var("FFI_OUTPUT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| out_dir.clone());
+    generate_transform_functions(&manifest_dir, &out_dir)?;
+    generate_style_engine_event_kinds(&manifest_dir, &out_dir)?;
+    generate_style_engine_boundary(&manifest_dir, &out_dir)?;
 
     let base_config = cbindgen::Config::from_file(manifest_dir.join("cbindgen.toml"))?;
 
@@ -862,16 +2970,44 @@ fn main() -> Result<(), Box<dyn Error>> {
     css_config.export.include = vec![
         "CssHashType".to_string(),
         "CssNumberType".to_string(),
-        "CssToken".to_string(),
+        "CssSyntaxToken".to_string(),
         "CssTokenType".to_string(),
+        "FfiUtf16View".to_string(),
     ];
 
     generate_ffi_header(
         css_config,
-        &[manifest_dir.join("src/css/css_tokenizer.rs")],
+        &[
+            manifest_dir.join("src/css/css_tokenizer.rs"),
+            manifest_dir.join("src/css/ffi_support.rs"),
+        ],
         &out_dir,
-        &ffi_out_dir,
         Path::new("RustFFI.h"),
+    );
+
+    // SVG parser header - namespace Web::SVG::RustFFI.
+    let mut svg_config = base_config.clone();
+    svg_config.namespaces = Some(vec!["Web".to_string(), "SVG".to_string(), "RustFFI".to_string()]);
+    svg_config.export.include = vec![
+        "FfiSvgInput".to_string(),
+        "FfiSvgPoint".to_string(),
+        "FfiSvgTransform".to_string(),
+        "TRANSFORM_MATRIX".to_string(),
+        "TRANSFORM_ROTATE".to_string(),
+        "TRANSFORM_SCALE".to_string(),
+        "TRANSFORM_SKEW_X".to_string(),
+        "TRANSFORM_SKEW_Y".to_string(),
+        "TRANSFORM_TRANSLATE".to_string(),
+    ];
+
+    generate_ffi_header_strict(
+        svg_config,
+        &[
+            manifest_dir.join("src/svg/attribute_parser.rs"),
+            manifest_dir.join("src/svg/path_parser.rs"),
+        ],
+        &out_dir,
+        Path::new("SVG/ParserRustFFI.h"),
     );
 
     // Selector matching header - namespace Web::CSS::SelectorFFI. Generate both sides of this
@@ -879,13 +3015,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut selector_config = base_config.clone();
     selector_config.namespaces = Some(vec!["Web".to_string(), "CSS".to_string(), "SelectorFFI".to_string()]);
     for (rust_name, cxx_name) in [
-        ("FfiSimpleSelectorType", "SimpleSelectorType"),
-        ("FfiDirection", "Direction"),
-        ("FfiPseudoElementValueType", "PseudoElementValueType"),
         ("FfiStringView", "StringView"),
-        ("FfiSimpleSelector", "SimpleSelector"),
-        ("FfiCompoundSelector", "CompoundSelector"),
-        ("FfiSelector", "Selector"),
+        ("FfiParsedPseudoElement", "ParsedPseudoElement"),
         ("FfiElement", "Element"),
         ("FfiElementQualifiedName", "ElementQualifiedName"),
         ("FfiInternedStringList", "InternedStringList"),
@@ -904,11 +3035,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     generate_ffi_header(
         selector_config,
         &[
-            manifest_dir.join("src/css/selector_engine.rs"),
+            manifest_dir.join("src/css/selector.rs"),
+            manifest_dir.join("src/css/selector_parser.rs"),
+            manifest_dir.join("src/css/selector_operations.rs"),
+            manifest_dir.join("src/css/selector_serialization.rs"),
+            manifest_dir.join("src/css/dom_selector_matching.rs"),
             manifest_dir.join("src/css/ffi_support.rs"),
         ],
         &out_dir,
-        &ffi_out_dir,
         Path::new("SelectorRustFFI.h"),
     );
 
@@ -917,22 +3051,153 @@ fn main() -> Result<(), Box<dyn Error>> {
     // an FFI call.
     let mut style_value_config = base_config.clone();
     style_value_config.namespaces = Some(vec!["Web".to_string(), "CSS".to_string(), "StyleValueFFI".to_string()]);
-    style_value_config.export.include = vec!["StyleValueData".to_string()];
+    // A transition step's inputs and decisions cross through the style engine's header, which names them here.
+    style_value_config.export.include = [
+        "StyleValueData",
+        "RetainedGridTrackEntry",
+        "FfiTransitionInput",
+        "FfiTransitionPropertyInput",
+        "FfiTransitionAction",
+    ]
+    .map(String::from)
+    .to_vec();
+    expose_compositing_types_as_cpp_types(&mut style_value_config);
 
     generate_ffi_header(
         style_value_config,
         &[
             manifest_dir.join("src/css/style_value.rs"),
+            manifest_dir.join("src/css/ffi_support.rs"),
+            manifest_dir.join("src/css/css_string.rs"),
+            manifest_dir.join("src/css/css_path.rs"),
             manifest_dir.join("src/css/retained_fly_string.rs"),
             manifest_dir.join("src/css/color_interpolation.rs"),
             manifest_dir.join("src/css/animation.rs"),
             manifest_dir.join("src/css/transition.rs"),
             manifest_dir.join("src/css/calc.rs"),
+            manifest_dir.join("src/css/serialize.rs"),
+            manifest_dir.join("src/css/color_resolution.rs"),
+            manifest_dir.join("src/css/absolutize.rs"),
             manifest_dir.join("src/css/ffi_stats.rs"),
         ],
         &out_dir,
-        &ffi_out_dir,
         Path::new("StyleValueRustFFI.h"),
+    );
+
+    // CSS value parser header - namespace Web::CSS::Parser::ValueParserFFI.
+    let mut value_parser_config = base_config.clone();
+    value_parser_config.namespaces = Some(vec![
+        "Web".to_string(),
+        "CSS".to_string(),
+        "Parser".to_string(),
+        "ValueParserFFI".to_string(),
+    ]);
+    value_parser_config.export.include = vec![
+        "FfiParseStatus".to_string(),
+        "FfiSimpleColor".to_string(),
+        "FontFeatureValuesRuleKind".to_string(),
+        "FfiValueParsingContext".to_string(),
+        "FfiValueParsingContextKind".to_string(),
+        "FfiUtf16View".to_string(),
+        "FfiQueryHandle".to_string(),
+        "FfiMediaEnvironment".to_string(),
+        "FfiMediaFeatureValue".to_string(),
+        "FfiMediaFeatureValueKind".to_string(),
+        "ParseContext".to_string(),
+    ];
+
+    generate_ffi_header(
+        value_parser_config,
+        &[
+            manifest_dir.join("src/css/parser/value_parser.rs"),
+            manifest_dir.join("src/css/parser/syntax.rs"),
+            manifest_dir.join("src/css/parser/syntax_parser.rs"),
+            manifest_dir.join("src/css/parser/descriptor_parser.rs"),
+            manifest_dir.join("src/css/parser/query_parser.rs"),
+            manifest_dir.join("src/css/declaration_block.rs"),
+            manifest_dir.join("src/css/descriptor_block.rs"),
+            manifest_dir.join("src/css/layer_names.rs"),
+            manifest_dir.join("src/css/container_conditions.rs"),
+            manifest_dir.join("src/css/font_feature_values.rs"),
+            manifest_dir.join("src/css/keyframes.rs"),
+            manifest_dir.join("src/css/style_rule.rs"),
+            manifest_dir.join("src/css/scope_selectors.rs"),
+            manifest_dir.join("src/css/media_list.rs"),
+            manifest_dir.join("src/css/counter_representation.rs"),
+            manifest_dir.join("src/css/counter_style.rs"),
+            manifest_dir.join("src/css/namespace_rule.rs"),
+            manifest_dir.join("src/css/property_rule.rs"),
+            manifest_dir.join("src/css/function_signature.rs"),
+            manifest_dir.join("src/css/import_rule.rs"),
+            manifest_dir.join("src/css/rule.rs"),
+            manifest_dir.join("src/css/rule/read.rs"),
+            manifest_dir.join("src/css/rule/function.rs"),
+            manifest_dir.join("src/css/rule/compilation.rs"),
+            manifest_dir.join("src/css/rule/compilation/publication.rs"),
+            manifest_dir.join("src/css/style_sheet.rs"),
+            manifest_dir.join("src/css/ffi_support.rs"),
+        ],
+        &out_dir,
+        Path::new("ValueParserRustFFI.h"),
+    );
+
+    // StyleEngine header - namespace Web::CSS::StyleEngineFFI. The flat input transaction and the
+    // engine lifecycle entry points; no string or owning pointer appears in this ABI.
+    let mut style_engine_config = base_config.clone();
+    style_engine_config.namespaces = Some(vec!["Web".to_string(), "CSS".to_string(), "StyleEngineFFI".to_string()]);
+    style_engine_config.export.include = vec![
+        // Named by no exported signature: the host names the device class of a document's render state by its value.
+        "FfiDeviceClass".to_string(),
+        // Named by no exported signature: a replaced content input crosses as its raw values.
+        "FfiReplacedContentInputKind".to_string(),
+        "FfiReplacedContentInputPresent".to_string(),
+        "FfiStyleInvalidationField".to_string(),
+        "FfiNodeRecordReads".to_string(),
+        "FfiStyleSheetResourceContextEntry".to_string(),
+        "FfiCustomFunctionEntry".to_string(),
+        // Only the host's font resolver, which the engine reaches by name, takes these.
+        "FfiFontResolutionRequest".to_string(),
+        "FfiResolvedFont".to_string(),
+        "FontResolutionFeatureInput".to_string(),
+    ];
+    // A published keyframe's composite operation is the one the animation sampler composes with.
+    style_engine_config.export.rename.insert(
+        "FfiCompositeOperation".to_string(),
+        "Web::CSS::StyleValueFFI::FfiCompositeOperation".to_string(),
+    );
+    // A transition step's decision is asked of the engine in the style value header's terms.
+    for name in ["FfiTransitionInput", "FfiTransitionAction"] {
+        style_engine_config
+            .export
+            .rename
+            .insert(name.to_string(), format!("Web::CSS::StyleValueFFI::{name}"));
+    }
+    style_engine_config.after_includes = Some(
+        "namespace Web::CSS::StyleValueFFI { enum class FfiCompositeOperation : uint8_t; struct FfiTransitionInput; struct FfiTransitionAction; }"
+            .to_string(),
+    );
+    // The host queues the engine's changes on the document host, which the layout header declares.
+    style_engine_config.export.rename.insert(
+        "DocumentHost".to_string(),
+        "Web::Layout::RustFFI::DocumentHost".to_string(),
+    );
+    style_engine_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::Layout::RustFFI { struct DocumentHost; }");
+
+    generate_ffi_header(
+        style_engine_config,
+        &[
+            manifest_dir.join("src/css/style/bridge.rs"),
+            manifest_dir.join("src/css/style/identities.rs"),
+            manifest_dir.join("src/css/style/engine_calls.rs"),
+            manifest_dir.join("src/css/style/style_job.rs"),
+            out_dir.join("ffi_state_fact_generated.rs"),
+            out_dir.join("style_engine_boundary_generated.rs"),
+        ],
+        &out_dir,
+        Path::new("StyleEngineRustFFI.h"),
     );
 
     // Computed values header - namespace Web::CSS::ComputedValuesFFI. Exposes the style group
@@ -951,23 +3216,81 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ComputedGridTrackEntryKind".to_string(),
         "ComputedGridPlacementKind".to_string(),
         "CascadeOrigin".to_string(),
+        "TransformValues".to_string(),
+        "EffectsValues".to_string(),
+        "ComputedColorOrAuto".to_string(),
+        "ComputedCursor".to_string(),
+        "RetainedComputedCursorList".to_string(),
+        "ComputedScrollbarColor".to_string(),
+        "InheritedUIValues".to_string(),
+        "ComputedSvgPaint".to_string(),
+        "ComputedSvgDash".to_string(),
+        "RetainedComputedSvgDashList".to_string(),
+        "InheritedSVGValues".to_string(),
+        "ComputedTextIndent".to_string(),
+        "ComputedTextUnderlinePosition".to_string(),
+        "ComputedTextUnderlineOffset".to_string(),
+        "InheritedTextValues".to_string(),
+        "InheritedTableValues".to_string(),
+        "InheritedBoxValues".to_string(),
+        "SizingValues".to_string(),
+        "AlignmentValues".to_string(),
+        "SVGResetValues".to_string(),
+        "SurroundValues".to_string(),
+        "BorderLayoutFacts".to_string(),
+        "AnimationValues".to_string(),
+        "MaskValues".to_string(),
+        "BackgroundValues".to_string(),
+        "BorderValues".to_string(),
+        "InheritedListValues".to_string(),
+        "ContentValues".to_string(),
+        "ComputedOverflowClipMarginSide".to_string(),
+        "ComputedOverflowClipMargin".to_string(),
+        "MiscResetValues".to_string(),
+        "FontValues".to_string(),
+        "FontCascadeListHandle".to_string(),
+        "FrozenFontListRef".to_string(),
+        "FfiFontGroupBuildInputs".to_string(),
+        "TextResetValues".to_string(),
+        "AnchorValues".to_string(),
+        "FfiTableInheritanceDependentValue".to_string(),
+        "FfiEffectiveLonghandValue".to_string(),
+        "FfiUtf16View".to_string(),
+        "EFFECTIVE_LONGHAND_SOURCE_TABLE".to_string(),
+        "EFFECTIVE_LONGHAND_SOURCE_OVERLAY".to_string(),
+        "EFFECTIVE_LONGHAND_SOURCE_SPECIFIED".to_string(),
     ];
+    expose_css_pixel_types_as_web_types(&mut computed_values_config);
+    computed_values_config.export.rename.insert(
+        "DeclarationBlockData".to_string(),
+        "Web::CSS::Parser::ValueParserFFI::DeclarationBlockData".to_string(),
+    );
+    computed_values_config
+        .after_includes
+        .as_mut()
+        .unwrap()
+        .push_str("\nnamespace Web::CSS::Parser::ValueParserFFI { struct DeclarationBlockData; }");
 
+    let libgfx_font_source = manifest_dir.join("../../LibGfx/Rust/src/font.rs");
+    println!("cargo:rerun-if-changed={}", libgfx_font_source.display());
     generate_ffi_header(
         computed_values_config,
         &[
+            libgfx_font_source,
             manifest_dir.join("src/css/computed_values.rs"),
             manifest_dir.join("src/css/property_metadata.rs"),
             manifest_dir.join("src/css/style_compute.rs"),
             manifest_dir.join("src/css/display.rs"),
             manifest_dir.join("src/css/computed_value_types.rs"),
             manifest_dir.join("src/css/retained_fly_string.rs"),
-            manifest_dir.join("src/css/css_pixels.rs"),
+            manifest_dir.join("src/css/animated_overlay.rs"),
             manifest_dir.join("src/css/cascaded_properties.rs"),
+            manifest_dir.join("src/css/computed_longhand_table.rs"),
             manifest_dir.join("src/css/custom_properties.rs"),
+            manifest_dir.join("src/css/ffi_support.rs"),
+            manifest_dir.join("src/css/table_group_builder.rs"),
         ],
         &out_dir,
-        &ffi_out_dir,
         Path::new("ComputedValuesRustFFI.h"),
     );
 
@@ -980,79 +3303,90 @@ fn main() -> Result<(), Box<dyn Error>> {
         html_config,
         &[manifest_dir.join("src/encoding_detection.rs")],
         &out_dir,
-        &ffi_out_dir,
         Path::new("HTML/Parser/RustFFI.h"),
     );
 
-    // Layout tree-builder header - namespace Web::Layout::RustFFI. The node arena and its
-    // node records are read directly by the C++ layout tree wrappers.
+    // Layout tree-builder header - namespace Web::Layout::RustFFI. The C++ layout tree
+    // wrappers drive the node arena through slot ids.
     let mut tree_builder_config = base_config.clone();
     tree_builder_config.namespaces = Some(vec!["Web".to_string(), "Layout".to_string(), "RustFFI".to_string()]);
     tree_builder_config.export.include = vec![
+        "DomPaintFact".to_string(),
+        "FfiDomTextRange".to_string(),
+        "FfiCodePointCategoryFacts".to_string(),
+        "FfiGeneratedImage".to_string(),
         "FfiNodeKindFacts".to_string(),
+        "FfiPseudoElement".to_string(),
+        "FfiReplacedContentFacts".to_string(),
         "FfiStylePayloads".to_string(),
-        "NodeAllocation".to_string(),
-        "NodeData".to_string(),
+        "FfiUtf16View".to_string(),
         "NodeFlag".to_string(),
         "NodeKind".to_string(),
-        "NodeSlotId".to_string(),
     ];
     tree_builder_config.export.exclude = vec![
+        "ladybird_layout_code_point_category_facts".to_string(),
+        "ladybird_layout_node_shell_destroy".to_string(),
         "rust_calc_node_create_numeric_dimension".to_string(),
         "rust_calc_resolve".to_string(),
     ];
-    generate_ffi_header_strict(
+    expose_css_pixel_types_as_web_types(&mut tree_builder_config);
+    expose_compositing_types_as_cpp_types(&mut tree_builder_config);
+    generate_ffi_header(
         tree_builder_config,
         &[
             manifest_dir.join("src/layout/layout_node_arena.rs"),
+            manifest_dir.join("src/layout/layout_node_arena/main_thread_entries.rs"),
+            manifest_dir.join("src/layout/shell_reads.rs"),
+            manifest_dir.join("src/layout/trace.rs"),
+            manifest_dir.join("src/layout/rendered_text.rs"),
+            manifest_dir.join("src/layout/text_queries.rs"),
+            manifest_dir.join("src/css/ffi_support.rs"),
             manifest_dir.join("src/layout/node_data.rs"),
+            manifest_dir.join("src/layout/partial_relayout.rs"),
             manifest_dir.join("src/layout/tree_builder.rs"),
+            manifest_dir.join("src/layout/tree_builder/main_thread_entries.rs"),
+            manifest_dir.join("src/layout/tree_update_marks.rs"),
+            manifest_dir.join("src/render_state.rs"),
+            manifest_dir.join("src/render_state/devtools.rs"),
+            manifest_dir.join("src/render_state/document_host.rs"),
             manifest_dir.join("../../RustAllocator.rs"),
         ],
         &out_dir,
-        &ffi_out_dir,
         Path::new("Layout/TreeBuilderRustFFI.h"),
     );
 
     // Layout engine header - namespace Web::Layout::RustFFI, layered on the tree-builder
-    // header. CssPixels is a single i32 fixed-point value shared with the CSS module; C++
-    // already has the matching CSSPixels class, so expose its raw representation in the
-    // generated ABI rather than generating a second C++ pixel type in the RustFFI namespace.
+    // header.
     let mut layout_config = base_config;
     layout_config.namespaces = Some(vec!["Web".to_string(), "Layout".to_string(), "RustFFI".to_string()]);
     layout_config.export.exclude = vec![
         "rust_calc_node_create_numeric_dimension".to_string(),
         "rust_calc_resolve".to_string(),
-        "CssPixels".to_string(),
         "rust_calc_root_from_calculated".to_string(),
         "rust_calc_external_resolutions".to_string(),
         "rust_calc_external_resolutions_release".to_string(),
     ];
-    layout_config
-        .export
-        .rename
-        .insert("CssPixels".to_string(), "int32_t".to_string());
+    expose_css_pixel_types_as_web_types(&mut layout_config);
+    expose_shared_abi_types_as_cpp_types(&mut layout_config);
+    expose_compositing_types_as_cpp_types(&mut layout_config);
     layout_config
         .includes
         .push("LibWeb/Layout/TreeBuilderRustFFI.h".to_string());
-    layout_config.export.include = vec![
-        "FfiGridTrackType".to_string(),
-        "FfiGridTrackState".to_string(),
-        "FfiFormattingContextType".to_string(),
-        "FfiFlexLayoutClampState".to_string(),
-        "FfiFlexLayoutGrowthState".to_string(),
-    ];
-    generate_ffi_header_strict(
+    generate_ffi_header(
         layout_config,
         &[
             manifest_dir.join("src/layout/used_values.rs"),
-            manifest_dir.join("src/layout/layout_state.rs"),
+            manifest_dir.join("src/layout/commit.rs"),
             manifest_dir.join("src/layout/geometry.rs"),
-            manifest_dir.join("src/layout/style_facts.rs"),
+            manifest_dir.join("src/layout/style_values.rs"),
             manifest_dir.join("src/layout/node_facts.rs"),
             manifest_dir.join("src/css/computed_value_types.rs"),
             manifest_dir.join("src/css/display.rs"),
             manifest_dir.join("src/layout/formatting_context.rs"),
+            manifest_dir.join("src/layout/layout_changes.rs"),
+            manifest_dir.join("src/layout/viewport_propagation.rs"),
+            manifest_dir.join("src/layout/update_layout.rs"),
+            manifest_dir.join("src/layout/update_layout/main_thread_entries.rs"),
             manifest_dir.join("src/layout/flex_formatting_context.rs"),
             manifest_dir.join("src/layout/grid_formatting_context.rs"),
             manifest_dir.join("src/layout/svg_formatting_context.rs"),
@@ -1062,9 +3396,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/layout/line_builder.rs"),
             manifest_dir.join("src/layout/line_box.rs"),
             manifest_dir.join("src/layout/line_box_fragment.rs"),
+            manifest_dir.join("src/painting/paintable_data.rs"),
+            manifest_dir.join("src/painting/paintable_build.rs"),
+            manifest_dir.join("src/painting/host/mod.rs"),
+            manifest_dir.join("src/painting/host/visual_context.rs"),
+            manifest_dir.join("src/painting/host/hit_test.rs"),
+            manifest_dir.join("src/painting/host/paint.rs"),
+            manifest_dir.join("src/painting/display_list/dump.rs"),
+            manifest_dir.join("src/painting/stacking_context/dump.rs"),
+            manifest_dir.join("src/painting/layout_tree_dump.rs"),
+            manifest_dir.join("src/painting/ffi.rs"),
+            manifest_dir.join("src/layout/script_entries.rs"),
+            manifest_dir.join("src/painting/paint_changes.rs"),
+            manifest_dir.join("src/painting/ffi/main_thread_entries.rs"),
+            manifest_dir.join("src/painting/paint_passes.rs"),
         ],
         &out_dir,
-        &ffi_out_dir,
         Path::new("Layout/LayoutRustFFI.h"),
     );
 

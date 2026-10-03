@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <AK/StdLibExtras.h>
 #include <LibWeb/Forward.h>
 
@@ -26,8 +27,24 @@ enum class AccumulatedVisualContextInvalidation : u8 {
     Rebuild,
 };
 
+enum class LayoutTreeRebuildRoot : u8 {
+    // Recreate ::before and ::after while retaining the principal box when its structure permits it.
+    PseudoElements,
+    Self,
+    SelfUnlessDocumentElementOrBody,
+    // The element's principal box appears or disappears while every sibling box keeps its kind.
+    // The parent absorbs that as a child-list change where it can, and rebuilds otherwise.
+    BoxPresenceChange,
+    Parent,
+};
+
 struct RequiredInvalidationAfterStyleChange {
-    void ensure_at_least(InvalidationLevel level) { m_level = max(m_level, level); }
+    void ensure_at_least(InvalidationLevel level)
+    {
+        m_level = max(m_level, level);
+        if (level >= InvalidationLevel::RebuildLayoutTree)
+            m_layout_tree_rebuild_root = LayoutTreeRebuildRoot::Parent;
+    }
     void ensure_at_least(AccumulatedVisualContextInvalidation invalidation) { m_accumulated_visual_contexts = max(m_accumulated_visual_contexts, invalidation); }
 
     void set_needs_stacking_context_tree_rebuild()
@@ -36,47 +53,91 @@ struct RequiredInvalidationAfterStyleChange {
         ensure_at_least(InvalidationLevel::Repaint);
     }
 
-    // NB: Deliberately does not imply repaint: whether anything needs repainting is only known
-    //     after the overflow has actually been re-measured and turned out to have changed.
-    void set_needs_scrollable_overflow_recalculation() { m_needs_scrollable_overflow_recalculation = true; }
-
-    [[nodiscard]] bool needs_repaint() const { return m_level >= InvalidationLevel::Repaint; }
-    [[nodiscard]] bool needs_relayout() const { return m_level >= InvalidationLevel::Relayout; }
-    [[nodiscard]] bool needs_layout_tree_rebuild() const { return m_level >= InvalidationLevel::RebuildLayoutTree; }
-    [[nodiscard]] bool needs_stacking_context_tree_rebuild() const { return m_rebuild_stacking_context_tree; }
-    // NB: A pending relayout re-measures all scrollable overflow anyway, so this reports true only
-    //     when the recalculation has to run as a separate step.
-    [[nodiscard]] bool needs_scrollable_overflow_recalculation() const { return m_needs_scrollable_overflow_recalculation && !needs_relayout(); }
+    // What the boxes need, including a counter-style rebuild.
+    [[nodiscard]] bool needs_repaint() const { return m_level >= InvalidationLevel::Repaint || m_counter_style_rebuild_root.has_value(); }
+    [[nodiscard]] bool needs_relayout() const { return m_level >= InvalidationLevel::Relayout || m_counter_style_rebuild_root.has_value(); }
+    [[nodiscard]] bool needs_layout_tree_rebuild() const { return style_change_needs_layout_tree_rebuild() || m_counter_style_rebuild_root.has_value(); }
+    [[nodiscard]] LayoutTreeRebuildRoot layout_tree_rebuild_root() const
+    {
+        VERIFY(needs_layout_tree_rebuild());
+        if (!m_counter_style_rebuild_root.has_value())
+            return m_layout_tree_rebuild_root;
+        if (!style_change_needs_layout_tree_rebuild())
+            return *m_counter_style_rebuild_root;
+        return max(m_layout_tree_rebuild_root, *m_counter_style_rebuild_root);
+    }
+    void set_layout_tree_rebuild_root(LayoutTreeRebuildRoot rebuild_root)
+    {
+        VERIFY(style_change_needs_layout_tree_rebuild());
+        m_layout_tree_rebuild_root = rebuild_root;
+    }
+    [[nodiscard]] bool needs_stacking_context_tree_rebuild() const { return m_rebuild_stacking_context_tree || m_counter_style_rebuild_root.has_value(); }
+    // What the move of style alone needs, without a counter-style rebuild: what the element's children react to.
+    [[nodiscard]] bool style_change_needs_layout_tree_rebuild() const { return m_level >= InvalidationLevel::RebuildLayoutTree; }
     [[nodiscard]] AccumulatedVisualContextInvalidation accumulated_visual_contexts() const { return m_accumulated_visual_contexts; }
+    [[nodiscard]] bool invalidates_hit_test_display_list() const
+    {
+        return affects_hit_testing
+            || needs_relayout()
+            || needs_stacking_context_tree_rebuild()
+            || m_accumulated_visual_contexts == AccumulatedVisualContextInvalidation::Rebuild;
+    }
 
+    // A scroll snap property changed, so snap containers must re-evaluate their scroll position and re-snap.
+    bool needs_scroll_container_resnap : 1 { false };
     // The element's change affects rule matching for descendants, without necessarily changing inherited style.
     bool recompute_descendant_styles : 1 { false };
-    // At least one inherited longhand changed, so shadow-tree descendants may need inherited style recomputation.
-    bool inherited_style_changed : 1 { false };
-    // The element gained or lost a containing block for absolutely/fixed positioned
-    // descendants. Containing block pointers are only recomputed by a full layout pass, so
-    // partial relayout boundary qualification cannot be trusted until one runs.
-    bool changes_containing_block_establishment : 1 { false };
+    // Names the inherited ComputedValues groups whose identities changed. Descendants can use the
+    // exact set to avoid reading unrelated inherited groups.
+    static constexpr u8 all_inherited_style_groups = (1 << 7) - 1;
+    [[nodiscard]] bool inherited_style_changed() const { return m_inherited_style_groups_changed != 0; }
+    [[nodiscard]] u8 inherited_style_groups_changed() const { return m_inherited_style_groups_changed; }
+    void mark_inherited_style_group_changed(size_t group) { m_inherited_style_groups_changed |= 1 << group; }
+    // A property controlling decorations originated by this box changed. Descendant boxes paint
+    // the propagated decorations from these values, so their cached paint commands are stale.
+    bool repaint_propagated_text_decorations : 1 { false };
+    // Selection highlights are painted by text descendants, even when the element has no box.
+    bool repaint_selection : 1 { false };
+    bool affects_hit_testing : 1 { false };
+    // A non-inherited property changed without any other invalidation, which happens when a running
+    // animation covers the property. Descendants that explicitly inherit non-inherited properties
+    // still observe the change.
+    bool non_inherited_property_inheritance_sources_changed : 1 { false };
 
     void operator|=(RequiredInvalidationAfterStyleChange const& other)
     {
+        if (other.style_change_needs_layout_tree_rebuild()) {
+            if (style_change_needs_layout_tree_rebuild())
+                m_layout_tree_rebuild_root = max(m_layout_tree_rebuild_root, other.m_layout_tree_rebuild_root);
+            else
+                m_layout_tree_rebuild_root = other.m_layout_tree_rebuild_root;
+        }
         m_level = max(m_level, other.m_level);
         m_accumulated_visual_contexts = max(m_accumulated_visual_contexts, other.m_accumulated_visual_contexts);
         m_rebuild_stacking_context_tree |= other.m_rebuild_stacking_context_tree;
-        m_needs_scrollable_overflow_recalculation |= other.m_needs_scrollable_overflow_recalculation;
+        if (auto other_root = other.m_counter_style_rebuild_root; other_root.has_value())
+            m_counter_style_rebuild_root = m_counter_style_rebuild_root.has_value() ? max(*m_counter_style_rebuild_root, *other_root) : *other_root;
+        needs_scroll_container_resnap |= other.needs_scroll_container_resnap;
         recompute_descendant_styles |= other.recompute_descendant_styles;
-        inherited_style_changed |= other.inherited_style_changed;
-        changes_containing_block_establishment |= other.changes_containing_block_establishment;
+        m_inherited_style_groups_changed |= other.m_inherited_style_groups_changed;
+        repaint_propagated_text_decorations |= other.repaint_propagated_text_decorations;
+        repaint_selection |= other.repaint_selection;
+        affects_hit_testing |= other.affects_hit_testing;
+        non_inherited_property_inheritance_sources_changed |= other.non_inherited_property_inheritance_sources_changed;
     }
 
-    [[nodiscard]] bool is_none() const
+    [[nodiscard]] bool is_none() const { return style_change_is_none() && !m_counter_style_rebuild_root.has_value(); }
+    [[nodiscard]] bool style_change_is_none() const
     {
         return m_level == InvalidationLevel::None
             && m_accumulated_visual_contexts == AccumulatedVisualContextInvalidation::None
-            && !m_needs_scrollable_overflow_recalculation
+            && !needs_scroll_container_resnap
             && !recompute_descendant_styles
-            && !inherited_style_changed
-            && !changes_containing_block_establishment;
+            && !inherited_style_changed()
+            && !repaint_selection
+            && !affects_hit_testing
+            && !repaint_propagated_text_decorations
+            && !non_inherited_property_inheritance_sources_changed;
     }
 
     static RequiredInvalidationAfterStyleChange full()
@@ -87,13 +148,33 @@ struct RequiredInvalidationAfterStyleChange {
         return invalidation;
     }
 
+    static RequiredInvalidationAfterStyleChange rebuild_layout_tree_from(LayoutTreeRebuildRoot rebuild_root)
+    {
+        RequiredInvalidationAfterStyleChange invalidation;
+        invalidation.m_level = InvalidationLevel::RebuildLayoutTree;
+        invalidation.m_layout_tree_rebuild_root = rebuild_root;
+        invalidation.set_needs_stacking_context_tree_rebuild();
+        return invalidation;
+    }
+
+    // The counter styles the boxes were built with no longer resolve the same. Rebuilding them is layout work after
+    // style that moves no style, so it is kept apart from the move of style, which no child of the element reacts to.
+    static RequiredInvalidationAfterStyleChange rebuild_layout_tree_for_counter_styles_from(LayoutTreeRebuildRoot rebuild_root)
+    {
+        RequiredInvalidationAfterStyleChange invalidation;
+        invalidation.m_counter_style_rebuild_root = rebuild_root;
+        return invalidation;
+    }
+
 private:
     InvalidationLevel m_level { InvalidationLevel::None };
     AccumulatedVisualContextInvalidation m_accumulated_visual_contexts { AccumulatedVisualContextInvalidation::None };
+    LayoutTreeRebuildRoot m_layout_tree_rebuild_root { LayoutTreeRebuildRoot::Parent };
     bool m_rebuild_stacking_context_tree : 1 { false };
-    bool m_needs_scrollable_overflow_recalculation : 1 { false };
+    Optional<LayoutTreeRebuildRoot> m_counter_style_rebuild_root;
+    u8 m_inherited_style_groups_changed { 0 };
 };
 
-RequiredInvalidationAfterStyleChange compute_property_invalidation(CSS::PropertyID property_id, StyleValue const* old_value, StyleValue const* new_value, ComputedValues const* old_computed_values = nullptr, ComputedValues const* new_computed_values = nullptr);
+RequiredInvalidationAfterStyleChange decode_style_invalidation(u32 packed);
 
 }

@@ -66,7 +66,10 @@ pub(crate) fn verify_handler(handler: &Handler, architecture: Architecture) -> R
                 error
             })?;
             if kind == OperandKind::Label
-                && instruction.opcode.operation() != Operation::Label
+                && !matches!(
+                    instruction.opcode.operation(),
+                    Operation::Label | Operation::AssertBranch(_) | Operation::AssertFailure
+                )
                 && let Operand::Label(label) = operand
             {
                 references.push(label.clone());
@@ -325,7 +328,7 @@ mod tests {
     fn rejects_explicit_scratch_aliases() {
         let error = verify_instruction_for_architecture(
             Instruction {
-                opcode: Operation::Modulo,
+                opcode: Operation::Modulo(IntegerWidth::U32),
                 operands: vec![
                     Operand::PhysicalRegister(aarch64::X1),
                     Operand::PhysicalRegister(aarch64::X2),
@@ -439,14 +442,14 @@ mod tests {
         );
         assert_invalid_arity(
             Architecture::Aarch64,
-            Operation::Modulo,
+            Operation::Modulo(IntegerWidth::U32),
             [aarch64::X1, aarch64::X2, aarch64::X3]
                 .map(Operand::PhysicalRegister)
                 .into(),
         );
         assert_invalid_arity(
             Architecture::X86_64,
-            Operation::Modulo,
+            Operation::Modulo(IntegerWidth::U32),
             vec![
                 Operand::PhysicalRegister(x86_64::RAX),
                 Operand::PhysicalRegister(x86_64::RDX),

@@ -6,13 +6,12 @@
 
 #pragma once
 
-#include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/SVG/SVGGradientElement.h>
 
 namespace Web::SVG {
 
 class SVGLinearGradientElement : public SVGGradientElement {
-    WEB_PLATFORM_OBJECT(SVGLinearGradientElement, SVGGradientElement);
+    WEB_WRAPPABLE(SVGLinearGradientElement, SVGGradientElement);
     GC_DECLARE_ALLOCATOR(SVGLinearGradientElement);
 
 public:
@@ -20,24 +19,22 @@ public:
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    virtual Optional<Painting::PaintStyle> to_gfx_paint_style(SVGPaintContext const&) const override;
+    virtual void push_paint_server_description(void* sink) const override;
 
     // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGLinearGradientElement__x1
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x1, Horizontal, CSS::PercentageStyleValue::create(CSS::Percentage { 0 }));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x1, Horizontal, SVGLengthValue::percentage(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGLinearGradientElement__y1
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y1, Vertical, CSS::PercentageStyleValue::create(CSS::Percentage { 0 }));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y1, Vertical, SVGLengthValue::percentage(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGLinearGradientElement__x2
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x2, Horizontal, CSS::PercentageStyleValue::create(CSS::Percentage { 100 }));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x2, Horizontal, SVGLengthValue::percentage(100));
 
     // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGLinearGradientElement__y2
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y2, Vertical, CSS::PercentageStyleValue::create(CSS::Percentage { 0 }));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y2, Vertical, SVGLengthValue::percentage(0));
 
 protected:
     SVGLinearGradientElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
 
 private:
     GC::Ptr<SVGLinearGradientElement const> linked_linear_gradient(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const

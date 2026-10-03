@@ -118,6 +118,7 @@ impl VarFlags {
     const BOUND: Self = Self(1 << 6);
     const PARAMETER_CANDIDATE: Self = Self(1 << 7);
     const REFERENCED_IN_FORMAL_PARAMETERS: Self = Self(1 << 8);
+    const IMPORT: Self = Self(1 << 9);
 
     const fn intersects(self, other: Self) -> bool {
         self.0 & other.0 != 0
@@ -665,6 +666,13 @@ impl ScopeCollector {
         }
     }
 
+    // https://tc39.es/ecma262/#sec-imports
+    // Imported bindings live in the module environment, next to the module's own declarations.
+    pub fn add_import_binding(&mut self, name: &[u16]) {
+        let index = self.current.expect("no current scope");
+        self.records[index].variable(name).flags |= VarFlags::IMPORT;
+    }
+
     pub fn add_catch_parameter_identifier(&mut self, name: &[u16], identifier: IdentifierId) {
         let index = self.current.expect("no current scope");
         let var = self.records[index].variable(name);
@@ -1144,7 +1152,14 @@ impl ScopeCollector {
             }
 
             if records[index].scope_type == ScopeType::Program {
-                let can_use_global = !(suppress_globals || group.used_inside_with_statement || initiated_by_eval);
+                // Declarations and imports of a module live in its module environment, whose layout the bytecode
+                // generator knows, so they must not be looked up as globals.
+                let is_module_declaration = records[index].scope_level == ScopeLevel::ModuleTopLevel
+                    && var_flags.intersects(VarFlags::VAR | VarFlags::LEXICAL | VarFlags::FUNCTION | VarFlags::IMPORT);
+                let can_use_global = !(suppress_globals
+                    || group.used_inside_with_statement
+                    || initiated_by_eval
+                    || is_module_declaration);
                 if can_use_global {
                     for id in &group.identifiers {
                         let identifier = &mut identifiers[*id];
@@ -1196,6 +1211,9 @@ impl ScopeCollector {
                     if let Some(ls) = local_scope
                         && let Some(scope_id) = records[ls].scope_data
                     {
+                        let local_scope_range = records[index]
+                            .scope_data
+                            .and_then(|scope_id| scopes[scope_id].source_range);
                         let sd = &mut scopes[scope_id];
 
                         if is_function_parameter {
@@ -1211,6 +1229,8 @@ impl ScopeCollector {
                                 sd.local_variables.push(LocalVariable {
                                     name: name.clone(),
                                     kind: LocalVarKind::Var,
+                                    is_mutable: true,
+                                    scope_range: None,
                                 });
                                 for id in &group.identifiers {
                                     let identifier = &mut identifiers[*id];
@@ -1224,6 +1244,8 @@ impl ScopeCollector {
                             sd.local_variables.push(LocalVariable {
                                 name: name.clone(),
                                 kind,
+                                is_mutable: group.declaration_kind != Some(DeclarationKind::Const),
+                                scope_range: local_scope_range,
                             });
                             for id in &group.identifiers {
                                 let identifier = &mut identifiers[*id];

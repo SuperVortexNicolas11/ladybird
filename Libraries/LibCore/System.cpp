@@ -41,6 +41,7 @@ static int memfd_create(char const* name, unsigned int flags)
 
 #if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 #    include <mach-o/dyld.h>
+#    include <mach/vm_statistics.h>
 #    include <sys/mman.h>
 #else
 extern char** environ;
@@ -144,27 +145,53 @@ ErrorOr<void> munmap(void* address, size_t size)
     return {};
 }
 
-ErrorOr<void*> reserve_address_space(size_t size)
+static int mmap_anonymous_fd([[maybe_unused]] MemoryTag tag)
+{
+#ifdef AK_OS_MACOS
+    if (tag == MemoryTag::GarbageCollector)
+        return VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_2);
+#endif
+    return -1;
+}
+
+ErrorOr<void*> reserve_address_space(size_t size, MemoryTag tag)
 {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
     flags |= MAP_NORESERVE;
 #endif
-    auto* ptr = ::mmap(nullptr, size, PROT_NONE, flags, -1, 0);
+    auto* ptr = ::mmap(nullptr, size, PROT_NONE, flags, mmap_anonymous_fd(tag), 0);
     if (ptr == MAP_FAILED)
         return Error::from_syscall("mmap"sv, errno);
     return ptr;
 }
 
-ErrorOr<void> commit_memory(void* address, size_t size)
+ErrorOr<void*> allocate_anonymous_memory(size_t size, MemoryTag tag)
 {
-    auto* ptr = ::mmap(address, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    auto* ptr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, mmap_anonymous_fd(tag), 0);
+    if (ptr == MAP_FAILED)
+        return Error::from_syscall("mmap"sv, errno);
+    return ptr;
+}
+
+ErrorOr<void> commit_memory(void* address, size_t size, MemoryTag tag)
+{
+    auto* ptr = ::mmap(address, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, mmap_anonymous_fd(tag), 0);
     if (ptr == MAP_FAILED)
         return Error::from_syscall("mmap"sv, errno);
     return {};
 }
 
-ErrorOr<void> decommit_memory(void* address, size_t size)
+ErrorOr<void> protect_memory_readonly(void* address, size_t size)
+{
+    if (size == 0)
+        return {};
+    if (::mprotect(address, size, PROT_READ) < 0)
+        return Error::from_syscall("mprotect"sv, errno);
+    return {};
+}
+
+ErrorOr<void> decommit_memory(void* address, size_t size, MemoryTag tag)
 {
     if (size == 0)
         return {};
@@ -173,7 +200,16 @@ ErrorOr<void> decommit_memory(void* address, size_t size)
 #ifdef MAP_NORESERVE
     flags |= MAP_NORESERVE;
 #endif
-    auto* ptr = ::mmap(address, size, PROT_NONE, flags, -1, 0);
+    auto* ptr = ::mmap(address, size, PROT_NONE, flags, mmap_anonymous_fd(tag), 0);
+    if (ptr == MAP_FAILED)
+        return Error::from_syscall("mmap"sv, errno);
+    VERIFY(ptr == address);
+    return {};
+}
+
+ErrorOr<void> map_shared_memory_fixed(void* address, size_t size, int fd)
+{
+    auto* ptr = ::mmap(address, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
     if (ptr == MAP_FAILED)
         return Error::from_syscall("mmap"sv, errno);
     VERIFY(ptr == address);
@@ -187,12 +223,15 @@ ErrorOr<void> release_address_space(void* address, size_t size)
     return {};
 }
 
-ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int options)
+ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int options, [[maybe_unused]] AllowSealing allow_sealing)
 {
     int fd = -1;
 #if defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)
-    // FIXME: Support more options on Linux.
     auto linux_options = ((options & O_CLOEXEC) > 0) ? MFD_CLOEXEC : 0;
+#    ifdef MFD_ALLOW_SEALING
+    if (allow_sealing == AllowSealing::Yes)
+        linux_options |= MFD_ALLOW_SEALING;
+#    endif
     fd = memfd_create("", linux_options);
 #elif defined(SHM_ANON)
     fd = shm_open(SHM_ANON, O_RDWR | O_CREAT | options, 0600);
@@ -224,11 +263,34 @@ ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int opti
     if (fd < 0)
         return Error::from_errno(errno);
 
-    if (::ftruncate(fd, size) < 0) {
+    int truncate_result;
+    do {
+        truncate_result = ::ftruncate(fd, size);
+    } while (truncate_result < 0 && errno == EINTR);
+    if (truncate_result < 0) {
         auto saved_errno = errno;
         TRY(close(fd));
         return Error::from_errno(saved_errno);
     }
+
+    // FIXME: Sealing is enforced only on Linux, via the memfd F_SEAL_* seals below. On macOS, the flag is
+    //        accepted, but the fd stays resizable (ftruncate remains possible). SAB backing relies on this seal to stop
+    //        a transferred fd from being shrunk under a peer. POSIX shared memory has no equivalent seal — so a macOS
+    //        equivalent would require implementing backing of the block with a Mach memory entry instead of an shm fd.
+#if defined(AK_OS_LINUX)
+    // Seal a fixed-size shared fd against resizing: A peer process holding the transferred fd must not be able to
+    // ftruncate it smaller, and SIGBUS siblings that touch the now-missing pages. Writes stay allowed on purpose (no
+    // F_SEAL_WRITE); the shared memory must remain writable. F_SEAL_SEAL is deliberately NOT set: it would block any
+    // later F_ADD_SEALS, and AllowSealing::Yes promises callers that the fd stays sealable. Leaving it off costs
+    // nothing, because a seal can never be removed once applied.
+    if (allow_sealing == AllowSealing::Yes) {
+        if (::fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) < 0) {
+            auto saved_errno = errno;
+            TRY(close(fd));
+            return Error::from_errno(saved_errno);
+        }
+    }
+#endif
 
     return fd;
 }
@@ -316,7 +378,9 @@ ErrorOr<void> kill(pid_t pid, int signal)
 
 ErrorOr<int> dup(int source_fd)
 {
-    int fd = ::dup(source_fd);
+    // A plain dup() clears close-on-exec, so a process that another thread spawns in the meantime would inherit the
+    // duplicate. Descriptors that a child should have are passed with explicit file actions instead.
+    int fd = ::fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
     if (fd < 0)
         return Error::from_syscall("dup"sv, errno);
     return fd;
@@ -516,6 +580,15 @@ ErrorOr<void> rename(StringView old_path, StringView new_path)
     ByteString new_path_string = new_path;
     if (::rename(old_path_string.characters(), new_path_string.characters()) < 0)
         return Error::from_syscall("rename"sv, errno);
+    return {};
+}
+
+ErrorOr<void> renameat(int old_directory_fd, StringView old_path, int new_directory_fd, StringView new_path)
+{
+    ByteString old_path_string = old_path;
+    ByteString new_path_string = new_path;
+    if (::renameat(old_directory_fd, old_path_string.characters(), new_directory_fd, new_path_string.characters()) < 0)
+        return Error::from_syscall("renameat"sv, errno);
     return {};
 }
 

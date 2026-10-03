@@ -9,14 +9,15 @@
 #include <AK/Function.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
+#include <AK/ThreadSafeWeakable.h>
 #include <AK/Time.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/Producers/VideoProducer.h>
+#include <LibMedia/SynchronizedWakeHandler.h>
 #include <LibMedia/VideoEdgeQueue.h>
 #include <LibMedia/VideoFrameHandle.h>
 #include <LibMedia/VideoFramePool.h>
-#include <LibSync/Weakable.h>
 
 namespace Media {
 
@@ -26,7 +27,7 @@ namespace Media {
 // through delegates that relay messages over IPC.
 class MEDIA_API RemoteVideoProducer final
     : public VideoProducer
-    , public Sync::Weakable<RemoteVideoProducer> {
+    , public ThreadSafeWeakable<RemoteVideoProducer> {
 public:
     struct Delegates {
         Function<void()> request_start;
@@ -52,6 +53,8 @@ private:
     void release_lent_slot(VideoFramePoolID, u32 slot_index) const;
     bool can_satisfy_seek_locally(AK::Duration timestamp) const;
     void release_ring_contents_if_suspended();
+    void discard_ring_head(VideoEdgeItem const&);
+    void discard_stale_ring_heads();
     void release_all_ring_frames();
 
     VideoEdgeQueue m_edge;
@@ -60,7 +63,7 @@ private:
 
     u32 m_expected_seek_id { 0 };
     RefPtr<VideoFrame> m_current_frame;
-    PipelineWakeHandler m_wake_handler;
+    SynchronizedWakeHandler m_wake_handler;
 };
 
 }

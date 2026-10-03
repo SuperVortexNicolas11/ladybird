@@ -8,9 +8,12 @@
 #include <AK/Endian.h>
 #include <AK/Format.h>
 #include <AK/LexicalPath.h>
+#include <LibCore/MappedFile.h>
 #include <LibCore/Resource.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/PathFontProvider.h>
+#include <LibGfx/Font/TypefaceSkia.h>
 #include <LibGfx/Font/WOFF/Loader.h>
 
 namespace Gfx {
@@ -41,6 +44,16 @@ static u32 number_of_fonts_in_ttc(ReadonlyBytes bytes)
 
 void PathFontProvider::load_all_fonts_from_uri(StringView uri)
 {
+    for_each_typeface_in_uri(uri, m_loaded_paths, [this](String const&, u32, FontFileFormat, NonnullRefPtr<Typeface> font) {
+        auto& family = m_typeface_by_family.ensure(font->family(), [] {
+            return Vector<NonnullRefPtr<Typeface>> {};
+        });
+        family.append(move(font));
+    });
+}
+
+void PathFontProvider::for_each_typeface_in_uri(StringView uri, HashTable<String>& loaded_paths, Function<void(String const&, u32, FontFileFormat, NonnullRefPtr<Typeface>)> callback, FontDataSource font_data_source)
+{
     auto root_or_error = Core::Resource::load_from_uri(uri);
     if (root_or_error.is_error()) {
         if (root_or_error.error().is_errno() && root_or_error.error().code() == ENOENT) {
@@ -51,7 +64,7 @@ void PathFontProvider::load_all_fonts_from_uri(StringView uri)
     }
     auto root = root_or_error.release_value();
 
-    root->for_each_descendant_file([this](Core::Resource const& resource) -> IterationDecision {
+    root->for_each_descendant_file([&](Core::Resource const& resource) -> IterationDecision {
         auto uri = resource.uri();
         auto path = LexicalPath(uri.bytes_as_string_view());
         auto is_truetype = path.has_extension(".ttf"sv) || path.has_extension(".ttc"sv) || path.has_extension(".otf"sv);
@@ -59,27 +72,42 @@ void PathFontProvider::load_all_fonts_from_uri(StringView uri)
         if (!is_truetype && !is_woff)
             return IterationDecision::Continue;
 
-        if (m_loaded_paths.set(resource.filesystem_path(), AK::HashSetExistingEntryBehavior::Keep) != AK::HashSetResult::InsertedNewEntry)
+        auto filesystem_path = resource.filesystem_path();
+        auto canonical_path = FileSystem::real_path(filesystem_path.bytes_as_string_view());
+        if (canonical_path.is_error()) {
+            dbgln("PathFontProvider: Unable to canonicalize '{}': {}", filesystem_path, canonical_path.error());
+            return IterationDecision::Continue;
+        }
+        filesystem_path = MUST(String::from_byte_string(canonical_path.release_value()));
+        if (loaded_paths.set(filesystem_path, AK::HashSetExistingEntryBehavior::Keep) != AK::HashSetResult::InsertedNewEntry)
             return IterationDecision::Continue;
 
         if (is_truetype) {
+            RefPtr<Typeface::FontDataBacking> backing;
+            // NB: Catalog discovery shares one mapping across all collection faces instead of copying the file
+            //     for each face. Resource-backed fonts retain their URI for serialization through IPC.
+            if (font_data_source == FontDataSource::SharedMapping) {
+                auto mapping = Core::MappedFile::map(filesystem_path);
+                if (mapping.is_error())
+                    return IterationDecision::Continue;
+                backing = make_ref_counted<Typeface::FontDataBacking>(make_ref_counted<Core::SharedMappedFile>(mapping.release_value()));
+            }
             auto font_count = number_of_fonts_in_ttc(resource.data());
             for (u32 ttc_index = 0; ttc_index < font_count; ++ttc_index) {
-                if (auto font_or_error = Typeface::try_load_from_resource(resource, ttc_index); !font_or_error.is_error()) {
-                    auto font = font_or_error.release_value();
-                    auto& family = m_typeface_by_family.ensure(font->family(), [] {
-                        return Vector<NonnullRefPtr<Typeface>> {};
-                    });
-                    family.append(font);
+                ErrorOr<NonnullRefPtr<Typeface>> font_or_error = [&]() -> ErrorOr<NonnullRefPtr<Typeface>> {
+                    if (backing) {
+                        auto const& mapping = backing->storage.get<NonnullRefPtr<Core::SharedMappedFile>>();
+                        return TRY(TypefaceSkia::load_from_buffer(mapping->operator->().bytes(), ttc_index, backing));
+                    }
+                    return Typeface::try_load_from_resource(resource, ttc_index);
+                }();
+                if (!font_or_error.is_error()) {
+                    callback(filesystem_path, ttc_index, FontFileFormat::OpenType, font_or_error.release_value());
                 }
             }
         } else {
             if (auto font_or_error = WOFF::try_load_from_resource(resource); !font_or_error.is_error()) {
-                auto font = font_or_error.release_value();
-                auto& family = m_typeface_by_family.ensure(font->family(), [] {
-                    return Vector<NonnullRefPtr<Typeface>> {};
-                });
-                family.append(font);
+                callback(filesystem_path, 0, FontFileFormat::WOFF, font_or_error.release_value());
             }
         }
         return IterationDecision::Continue;

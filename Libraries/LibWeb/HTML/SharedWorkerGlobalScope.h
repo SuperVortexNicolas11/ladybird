@@ -8,7 +8,6 @@
 
 #include <AK/HashTable.h>
 #include <LibJS/Forward.h>
-#include <LibWeb/Bindings/SharedWorkerGlobalScope.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
 
@@ -18,14 +17,11 @@ namespace Web::HTML {
     E(onconnect, HTML::EventNames::connect)
 
 class WEB_API SharedWorkerGlobalScope
-    : public WorkerGlobalScope
-    , public Bindings::SharedWorkerGlobalScopeGlobalMixin {
-    WEB_PLATFORM_OBJECT(SharedWorkerGlobalScope, WorkerGlobalScope);
+    : public WorkerGlobalScope {
+    WEB_WRAPPABLE(SharedWorkerGlobalScope, WorkerGlobalScope);
     GC_DECLARE_ALLOCATOR(SharedWorkerGlobalScope);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     virtual ~SharedWorkerGlobalScope() override;
 
     void set_constructor_origin(URL::Origin origin) { m_constructor_origin = move(origin); }
@@ -46,7 +42,7 @@ public:
 #undef __ENUMERATE
 
 private:
-    SharedWorkerGlobalScope(JS::Realm&, GC::Ref<Web::Page>);
+    explicit SharedWorkerGlobalScope(GC::Ref<Web::Page>);
 
     virtual void initialize_web_interfaces_impl() override;
     virtual void finalize() override;

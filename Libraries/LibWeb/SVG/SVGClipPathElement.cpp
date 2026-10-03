@@ -4,9 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGClipPathElement.h>
-#include <LibWeb/Layout/Node.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 
@@ -23,24 +21,20 @@ SVGClipPathElement::~SVGClipPathElement()
 {
 }
 
-void SVGClipPathElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGClipPathElement);
-    Base::initialize(realm);
-}
-
 void SVGClipPathElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
-    if (name == AttributeNames::clipPathUnits)
-        m_clip_path_units = AttributeParser::parse_units(value.value_or({}));
+    if (name == AttributeNames::clipPathUnits) {
+        m_clip_path_units = parse_units(value.value_or({}));
+        mark_resource_box_referencing_elements_for_layout_update();
+    }
 }
 
-RefPtr<Layout::Node> SVGClipPathElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const>)
+CSS::ElementBoxKind SVGClipPathElement::box_kind() const
 {
     // Clip paths are handled as a special case in the TreeBuilder.
-    return nullptr;
+    return CSS::ElementBoxKind::NoBox;
 }
 
 }

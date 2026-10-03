@@ -5,22 +5,27 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLIFrameElement.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/EmbeddedContentInvalidator.h>
+#include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
+#include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Infra/SerializedURL.h>
-#include <LibWeb/Layout/NavigableContainerViewport.h>
 #include <LibWeb/ResourceTiming/PerformanceResourceTiming.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
@@ -36,22 +41,9 @@ HTMLIFrameElement::HTMLIFrameElement(DOM::Document& document, DOM::QualifiedName
 
 HTMLIFrameElement::~HTMLIFrameElement() = default;
 
-void HTMLIFrameElement::initialize(JS::Realm& realm)
+CSS::ElementBoxKind HTMLIFrameElement::box_kind() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLIFrameElement);
-    Base::initialize(realm);
-}
-
-RefPtr<Layout::Node> HTMLIFrameElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
-{
-    return make_ref_counted<Layout::NavigableContainerViewport>(document(), *this, style);
-}
-
-void HTMLIFrameElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
-{
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
+    return CSS::ElementBoxKind::NavigableContainerViewport;
 }
 
 void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -87,6 +79,11 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
                 m_iframe_sandboxing_flag_set = {};
             }
         }
+
+        // A content navigable whose document another process hosts reads the sandbox and referrerpolicy attributes
+        // through its replicated state, which the UI process keeps current from these reports.
+        if (name == AttributeNames::sandbox || name == AttributeNames::referrerpolicy)
+            document().page().client().page_did_change_navigable_container_state(m_content_navigable->id(), replicated_container_state());
     }
 
     if (name == HTML::AttributeNames::width || name == HTML::AttributeNames::height)
@@ -94,8 +91,9 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
 
     if (name == HTML::AttributeNames::marginwidth || name == HTML::AttributeNames::marginheight) {
         if (auto* document = this->content_document_without_origin_check()) {
+            // The body's margins are hints mapped from these.
             if (auto* body_element = document->body())
-                const_cast<HTMLElement*>(body_element)->set_needs_style_update(true);
+                CSS::republish_presentational_hints(const_cast<HTMLElement&>(*body_element));
         }
     }
 }
@@ -103,21 +101,23 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-post-connection-steps
 void HTMLIFrameElement::post_connection()
 {
-    DOM::Document& document = as<DOM::Document>(shadow_including_root());
-
-    // NOTE: The check for "not fully active" is to prevent a crash on the dom/nodes/node-appendchild-crash.html WPT test.
-    if (!document.browsing_context() || !document.is_fully_active())
+    // 1. If insertedNode's node document's browsing context is null, then return.
+    if (document().browsing_context() == nullptr)
         return;
 
-    // 1. If insertedNode has a sandbox attribute, then parse the sandboxing directive given the attribute's
+    // AD-HOC: The check for "not fully active" is to prevent a crash on the dom/nodes/node-appendchild-crash.html WPT test.
+    if (!document().is_fully_active())
+        return;
+
+    // 2. If insertedNode has a sandbox attribute, then parse the sandboxing directive given the attribute's
     //    value and insertedNode's iframe sandboxing flag set.
     if (auto sandbox = attribute(AttributeNames::sandbox); sandbox.has_value())
         m_iframe_sandboxing_flag_set = parse_a_sandboxing_directive(sandbox->utf16_view());
 
-    // 2. Create a new child navigable for insertedNode.
+    // 3. Create a new child navigable for insertedNode.
     create_new_child_navigable();
 
-    // 3. Process the iframe attributes for insertedNode, with initialInsertion set to true.
+    // 4. Process the iframe attributes for insertedNode, with initialInsertion set to true.
     process_the_iframe_attributes(InitialInsertion::Yes);
 }
 
@@ -128,7 +128,7 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
         return;
 
     // 1. If element's srcdoc attribute is specified, then:
-    if (has_attribute(HTML::AttributeNames::srcdoc)) {
+    if (has_attribute_ns({}, HTML::AttributeNames::srcdoc)) {
         // 1. Set element's current navigation was lazy loaded boolean to false.
         set_current_navigation_was_lazy_loaded(false);
 
@@ -137,7 +137,7 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
             // 1. Set element's lazy load resumption steps to the rest of this algorithm starting with the step labeled navigate to the srcdoc resource.
             set_lazy_load_resumption_steps([this]() {
                 // 3. Navigate to the srcdoc resource: navigate an iframe or frame given element, about:srcdoc, the empty string, and the value of element's srcdoc attribute.
-                navigate_an_iframe_or_frame(URL::about_srcdoc(), ReferrerPolicy::ReferrerPolicy::EmptyString, get_attribute(HTML::AttributeNames::srcdoc));
+                navigate_an_iframe_or_frame(URL::about_srcdoc(), ReferrerPolicy::ReferrerPolicy::EmptyString, get_attribute_ns({}, HTML::AttributeNames::srcdoc));
 
                 // FIXME: The resulting Document must be considered an iframe srcdoc document.
             });
@@ -153,7 +153,7 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
         }
 
         // 3. Navigate to the srcdoc resource: navigate an iframe or frame given element, about:srcdoc, the empty string, and the value of element's srcdoc attribute.
-        navigate_an_iframe_or_frame(URL::about_srcdoc(), ReferrerPolicy::ReferrerPolicy::EmptyString, get_attribute(HTML::AttributeNames::srcdoc));
+        navigate_an_iframe_or_frame(URL::about_srcdoc(), ReferrerPolicy::ReferrerPolicy::EmptyString, get_attribute_ns({}, HTML::AttributeNames::srcdoc));
 
         // FIXME: The resulting Document must be considered an iframe srcdoc document.
 
@@ -178,7 +178,7 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
     }
 
     // 4. Let referrerPolicy be the current state of element's referrerpolicy content attribute.
-    auto referrer_policy = ReferrerPolicy::from_string(get_attribute_value_view(HTML::AttributeNames::referrerpolicy).value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
+    auto referrer_policy = ReferrerPolicy::from_string(get_attribute_ns({}, HTML::AttributeNames::referrerpolicy).value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
 
     // 5. Set element's current navigation was lazy loaded boolean to false.
     set_current_navigation_was_lazy_loaded(false);
@@ -186,9 +186,9 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
     // 6. If the will lazy load element steps given element return true, then:
     if (will_lazy_load_element()) {
         // 1. Set element's lazy load resumption steps to the rest of this algorithm starting with the step labeled navigate.
-        set_lazy_load_resumption_steps([this, url, referrer_policy]() {
-            // 7. Navigate: navigate an iframe or frame given element, url, and referrerPolicy.
-            navigate_an_iframe_or_frame(*url, referrer_policy);
+        set_lazy_load_resumption_steps([this, url, referrer_policy, initial_insertion]() {
+            // 7. Navigate: Navigate an iframe or frame given element, url, referrerPolicy, null, and initialInsertion.
+            navigate_an_iframe_or_frame(*url, referrer_policy, {}, initial_insertion);
         });
 
         // 2. Set element's current navigation was lazy loaded boolean to true.
@@ -201,8 +201,8 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
         return;
     }
 
-    // 7. Navigate: navigate an iframe or frame given element, url, and referrerPolicy.
-    navigate_an_iframe_or_frame(*url, referrer_policy);
+    // 7. Navigate: Navigate an iframe or frame given element, url, referrerPolicy, null, and initialInsertion.
+    navigate_an_iframe_or_frame(*url, referrer_policy, {}, initial_insertion);
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:the-iframe-element-7
@@ -224,6 +224,23 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
         return;
     }
 
+    // The iframe load event is queued by the child document's completely-finish-loading
+    // steps, but the parent's load event must continue to wait while anything in the
+    // child document (including a replacement parser created by document.open()) delays
+    // that document's load event. The task may already be queued when a descendant is
+    // reopened, so check again when the task runs and try again after the child unblocks.
+    // NB: The steps for a navigable hosted by another process run once its replicated state says its document is
+    //     completely loaded, which is after anything delaying that document's load event.
+    if (auto* local_navigable = as_if<LocalNavigable>(*element.content_navigable())) {
+        if (auto active_document = local_navigable->active_document(); active_document && active_document->anything_is_delaying_the_load_event()) {
+            auto element_ref = GC::Ref(element);
+            element.queue_an_element_task(HTML::Task::Source::DOMManipulation, [element_ref] {
+                run_iframe_load_event_steps(element_ref);
+            });
+            return;
+        }
+    }
+
     // FIXME: 2. Let childDocument be element's content navigable's active document.
     // FIXME: 3. If childDocument has its mute iframe load flag set, then return.
 
@@ -237,7 +254,7 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
 
         // 3. Let fallbackTimingInfo be a new fetch timing info whose start time is element's pending resource-timing
         //    start time and whose response end time is the current high resolution time given global.
-        auto fallback_timing_info = Fetch::Infrastructure::FetchTimingInfo::create(element.vm());
+        auto fallback_timing_info = Fetch::Infrastructure::FetchTimingInfo::create();
         fallback_timing_info->set_start_time(element.pending_resource_start_time().value());
         fallback_timing_info->set_end_time(HighResolutionTime::current_high_resolution_time(global));
 
@@ -260,10 +277,10 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
         element.set_pending_resource_timing_url({});
     }
 
-    // FIXME: 5. Set childDocument's iframe load in progress flag.
-
-    // 6. Fire an event named load at element.
-    element.dispatch_event(DOM::Event::create(element.realm(), HTML::EventNames::load));
+    // 5. Fire an event named load at element.
+    element.dispatch_event(DOM::Event::create(
+        HTML::EventNames::load,
+        HighResolutionTime::current_high_resolution_time(relevant_global_object(element))));
 
     // FIXME: 7. Unset childDocument's iframe load in progress flag.
 }
@@ -361,7 +378,7 @@ ReferrerPolicy::ReferrerPolicy determine_iframe_element_referrer_policy(GC::Ptr<
     // 1. If embedder is an iframe element, then return embedder's referrerpolicy attribute's state's corresponding
     //    keyword.
     if (auto* iframe = as_if<HTMLIFrameElement>(embedder.ptr())) {
-        return ReferrerPolicy::from_string(iframe->get_attribute_value_view(HTML::AttributeNames::referrerpolicy).value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
+        return ReferrerPolicy::from_string(iframe->get_attribute_ns({}, HTML::AttributeNames::referrerpolicy).value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
     }
 
     // 2. Return the empty string.

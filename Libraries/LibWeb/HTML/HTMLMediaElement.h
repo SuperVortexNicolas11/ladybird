@@ -14,21 +14,37 @@
 #include <AK/Time.h>
 #include <AK/Utf16View.h>
 #include <AK/Variant.h>
+#include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibCore/Forward.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Rect.h>
+#include <LibJS/Forward.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/VideoSinkHandle.h>
+#include <LibMediaClient/Forward.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/HTML/CORSSettingAttribute.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/MediaControls.h>
+#include <LibWeb/HTML/TextTrack.h>
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
-#include <LibWeb/Painting/DisplayListResourceIds.h>
-#include <LibWeb/PixelUnits.h>
 #include <LibWeb/WebIDL/DOMException.h>
+#include <LibWebCommon/PixelUnits.h>
+
+namespace Web::Bindings {
+
+enum class CanPlayTypeResult : u8;
+
+}
+
+namespace Web::Internals {
+
+class Internals;
+
+}
 
 namespace Web::HTML {
 
@@ -39,13 +55,15 @@ enum class MediaSeekMode : u8 {
 
 class SourceElementSelector;
 
-using OptionalMediaProvider = Variant<Empty, GC::Ref<MediaSourceExtensions::MediaSource>, GC::Ref<FileAPI::Blob>>;
+using MediaProvider = Variant<Empty, GC::Ref<MediaCapture::MediaStream>, GC::Ref<MediaSourceExtensions::MediaSource>, GC::Ref<FileAPI::Blob>>;
 
 class HTMLMediaElement : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLMediaElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLMediaElement, HTMLElement);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
+    static constexpr size_t audio_tracks_offset() { return offsetof(HTMLMediaElement, m_audio_tracks); }
+    static constexpr size_t video_tracks_offset() { return offsetof(HTMLMediaElement, m_video_tracks); }
+    static constexpr size_t text_tracks_offset() { return offsetof(HTMLMediaElement, m_text_tracks); }
 
     virtual ~HTMLMediaElement() override;
 
@@ -54,8 +72,6 @@ public:
         return meets_focusable_area_rendering_requirements();
     }
 
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder& style) override;
-
     // NOTE: The function is wrapped in a GC::HeapFunction immediately.
     void queue_a_media_element_task(Function<void(HTMLMediaElement&)>);
 
@@ -63,13 +79,14 @@ public:
     bool is_fetching() const;
 
     GC::Ptr<MediaError> error() const { return m_error; }
+    static constexpr size_t error_offset() { return offsetof(HTMLMediaElement, m_error); }
     void set_decoder_error(Utf16String error_message);
 
     Utf16String const& current_src() const { return m_current_src; }
     void select_resource();
 
-    OptionalMediaProvider src_object() const;
-    WebIDL::ExceptionOr<void> set_src_object(OptionalMediaProvider);
+    MediaProvider src_object() const;
+    WebIDL::ExceptionOr<void> set_src_object(MediaProvider);
 
     enum class NetworkState : u8 {
         Empty,
@@ -83,20 +100,6 @@ public:
     [[nodiscard]] GC::Ref<TimeRanges> played() const;
     [[nodiscard]] GC::Ref<TimeRanges> seekable() const;
 
-    static constexpr auto supported_video_subtypes = Array {
-        "webm"sv,
-        "mp4"sv,
-        "mpeg"sv,
-        "ogg"sv,
-    };
-    static constexpr auto supported_audio_subtypes = Array {
-        "flac"sv,
-        "mp3"sv,
-        "mpeg"sv,
-        "ogg"sv,
-        "wav"sv,
-        "webm"sv,
-    };
     Bindings::CanPlayTypeResult can_play_type(Utf16View type) const;
 
     enum class ReadyState : u8 {
@@ -123,12 +126,13 @@ public:
     void set_official_playback_position(double);
 
     double duration() const;
-    JS::Object* get_start_date();
+    JS::Object* get_start_date(JS::Object& relevant_global_object) const;
     bool show_poster() const { return m_show_poster; }
     bool paused() const { return m_paused; }
     bool ended() const;
     bool potentially_playing() const;
-    GC::Ref<WebIDL::Promise> play();
+    void play(GC::Ref<WebIDL::Promise>);
+    void play_from_user_interaction();
     void pause();
 
     double volume() const { return m_volume; }
@@ -159,7 +163,8 @@ public:
     void set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML::VideoTrack> video_track);
 
     void add_current_video_sink();
-    void detach_video_sink_after_compositor_lost();
+    void sync_video_sink_ticking() const;
+    void detach_video_sink_edge();
 
     GC::Ref<TextTrack> add_text_track(Bindings::TextTrackKind kind, Utf16View label, Utf16View language);
 
@@ -167,7 +172,7 @@ public:
 
     void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration) { set_duration(duration); }
 
-    Media::PlaybackManager& playback_manager()
+    MediaClient::RemotePlaybackManager& playback_manager()
     {
         VERIFY(m_playback_manager);
         return *m_playback_manager;
@@ -181,14 +186,14 @@ public:
     Optional<Media::VideoSinkHandle> video_sink_handle() const;
     RefPtr<Media::VideoFrame> current_presented_frame() const;
 
-    Optional<Painting::VideoSinkResourceId> video_sink_resource_id() const;
+    Optional<Compositing::VideoSinkResourceId> video_sink_resource_id() const;
 
     virtual void update_natural_dimensions() { }
 
 protected:
     HTMLMediaElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void initialize_element() override;
     virtual void finalize() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
@@ -199,6 +204,7 @@ protected:
 
 private:
     friend SourceElementSelector;
+    friend class Web::Internals::Internals;
 
     class ActiveVideoSink;
     struct RemoteFetchData;
@@ -212,16 +218,13 @@ private:
 
     Task::Source media_element_event_task_source() const { return m_media_element_event_task_source.source; }
 
-    using MediaProviderObject = Variant<Empty, GC::Ref<MediaSourceExtensions::MediaSource>, GC::Ref<FileAPI::Blob>>;
-    MediaProviderObject const& assigned_media_provider_object() const;
-    MediaProviderObject& assigned_media_provider_object();
-    void set_assigned_media_provider_object(MediaProviderObject const&);
-
     WebIDL::ExceptionOr<void> load_element();
+    void select_resource_for_current_load();
+    void promote_current_resource_selection_to_explicit();
 
     void load_url_resource(URL::URL const&, ESCAPING Function<void(Utf16String)> failure_callback);
     void load_remote_resource(ByteRange const&);
-    void load_local_resource(MediaProviderObject const&, ESCAPING Function<void(Utf16String)> failure_callback);
+    void load_local_resource(MediaProvider const&, ESCAPING Function<void(Utf16String)> failure_callback);
     bool preload_attribute_is_in_none_state() const;
     bool should_wait_for_an_implementation_defined_event_before_fetching_the_resource() const;
     void wait_for_an_implementation_defined_event_before_fetching_the_resource(u32 fetch_generation);
@@ -235,10 +238,11 @@ private:
     bool should_hold_screen_wake_lock() const;
     void update_screen_wake_lock();
 
-    void restart_fetch_at_offset(u64 offset);
+    void handle_data_request(Optional<u64> offset);
 
     void set_up_playback_manager_for_remote();
-    void set_up_playback_manager_for_local();
+    void set_up_playback_manager_for_local(Function<void(Utf16String)> failure_callback);
+    void set_up_playback_manager_error_handler(Function<void(Utf16String)> failure_callback);
     enum class FetchingStatus : u8 {
         Ongoing,
         Complete,
@@ -246,13 +250,19 @@ private:
     };
     void process_media_data(FetchingStatus);
 
+    enum class SourceType : u8 {
+        Remote,
+        Local,
+    };
+
     void handle_media_source_failure(Span<GC::Ref<WebIDL::Promise>> promises, Utf16String error_message);
     void forget_media_resource_specific_tracks();
+    void detach_attached_media_source();
     void set_ready_state(ReadyState);
 
     void on_audio_track_added(Media::Track const&);
     void on_video_track_added(Media::Track const&);
-    void on_metadata_parsed();
+    void on_metadata_parsed(SourceType);
     void on_playback_manager_state_change();
     void upon_current_playback_position_possibly_changed();
     void start_or_stop_playback_position_update_timer();
@@ -270,7 +280,11 @@ private:
     void volume_or_muted_attribute_changed();
     void update_volume();
     void attach_selected_video_track_sink(Media::Track const&);
-    void sync_video_update_flags() const;
+
+    bool video_sink_should_tick() const;
+
+    // Mirrors what PlaybackManager and the compositor were last told; a freshly reserved sink is assumed to tick.
+    mutable bool m_video_sink_is_ticking { true };
     void note_frame_captured() const;
 
     bool is_eligible_for_autoplay() const;
@@ -302,7 +316,7 @@ private:
     template<typename ErrorType>
     void reject_pending_play_promises(ReadonlySpan<GC::Ref<WebIDL::Promise>> promises, Utf16String message)
     {
-        auto& realm = this->realm();
+        auto& realm = document().relevant_settings_object().realm();
 
         auto error = ErrorType::create(realm, move(message));
         reject_pending_play_promises(promises, error);
@@ -318,7 +332,12 @@ private:
     CORSSettingAttribute m_crossorigin { CORSSettingAttribute::NoCORS };
 
     // https://html.spec.whatwg.org/multipage/media.html#assigned-media-provider-object
-    MediaProviderObject m_assigned_media_provider_object;
+    MediaProvider m_assigned_media_provider_object;
+
+    // https://w3c.github.io/media-source/#mediasource-attach
+    // NB: Unlike the assigned media provider object, this is also set when a MediaSource is attached through a blob
+    //     URL — so that the media element load algorithm can detach it.
+    GC::Ptr<MediaSourceExtensions::MediaSource> m_attached_media_source;
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-currentsrc
     Utf16String m_current_src;
@@ -404,8 +423,9 @@ private:
     OwnPtr<RemoteFetchData> m_remote_fetch_data;
     u32 m_current_fetch_generation { 0 };
     bool m_waiting_for_an_implementation_defined_event_to_fetch_the_resource { false };
+    bool m_current_resource_selection_is_explicit { false };
 
-    OwnPtr<Media::PlaybackManager> m_playback_manager;
+    OwnPtr<MediaClient::RemotePlaybackManager> m_playback_manager;
 
     RefPtr<Core::Timer> m_playback_position_update_timer;
     GC::Ptr<VideoTrack> m_selected_video_track;

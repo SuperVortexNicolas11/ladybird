@@ -9,22 +9,23 @@
 
 #include <LibWeb/HTML/LazyLoadingElement.h>
 #include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/TrustedTypes/TrustedHTML.h>
+#include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::HTML {
 
-class HTMLIFrameElement final
+class WEB_API HTMLIFrameElement final
     : public NavigableContainer
     , public LazyLoadingElement<HTMLIFrameElement> {
 
-    WEB_PLATFORM_OBJECT(HTMLIFrameElement, NavigableContainer);
+    WEB_WRAPPABLE(HTMLIFrameElement, NavigableContainer);
     LAZY_LOADING_ELEMENT(HTMLIFrameElement);
     GC_DECLARE_ALLOCATOR(HTMLIFrameElement);
 
 public:
     virtual ~HTMLIFrameElement() override;
 
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     // ^EventTarget
     virtual bool is_focusable() const override
@@ -54,8 +55,6 @@ public:
 
 private:
     HTMLIFrameElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
 
     // ^DOM::Node
     virtual bool is_html_iframe_element() const override { return true; }

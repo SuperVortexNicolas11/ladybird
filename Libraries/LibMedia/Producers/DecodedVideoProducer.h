@@ -7,26 +7,28 @@
 #pragma once
 
 #include <AK/Atomic.h>
+#include <AK/ConditionVariable.h>
 #include <AK/Forward.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/Queue.h>
 #include <AK/ThreadID.h>
 #include <AK/Time.h>
 #include <LibCore/Forward.h>
+#include <LibMedia/CodedFrame.h>
 #include <LibMedia/DecoderError.h>
+#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibMedia/Producers/VideoProducer.h>
 #include <LibMedia/SeekMode.h>
+#include <LibMedia/SynchronizedWakeHandler.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
 #include <LibMedia/VideoDecoder.h>
-#include <LibMedia/VideoFramePool.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 
 namespace Media {
 
@@ -72,7 +74,12 @@ private:
         void set_wake_handler(PipelineWakeHandler);
 
         void start();
-        DecoderErrorOr<void> create_decoder();
+        VideoDecoderSelection select_decoder_for_frame(CodedFrame const&, VideoDecoderSelection after = {}) const;
+        void replace_decoder_once_drained(CodedFrame const&, DecodeIntent);
+        DecoderErrorOr<void> receive_into_decoder(CodedFrame const&, DecodeIntent);
+        DecoderErrorOr<void> create_decoder_for_frame(CodedFrame const&);
+        DecoderErrorOr<void> receive_coded_frame(CodedFrame const&, DecodeIntent);
+        DecoderErrorOr<bool> replace_drained_decoder();
         void release_decoder();
         void exit();
 
@@ -95,16 +102,16 @@ private:
         void queue_frame(NonnullRefPtr<VideoFrame> const&);
         void dispatch_error(DecoderError&&);
         bool handle_seek();
-        void resolve_seek(u32 seek_id, bool moved_position);
-        DecoderErrorOr<void> ensure_frame_pool();
-        DecoderErrorOr<NonnullRefPtr<VideoFrame>> take_frame_into_acquired_slot(VideoFrameMetadata const&, VideoFramePool::AcquiredSlot const&);
+        void resolve_seek(u32 seek_id);
+        bool is_within_available_range_while_locked(AK::Duration) const;
+        void re_emit_last_frame_if_at_end_of_stream_while_locked();
         void push_data_and_decode_some_frames();
 
         void enter_halting_state(PipelineStatus, Optional<DecoderError>);
 
         void dispatch_wake_if_needed_while_locked();
 
-        [[nodiscard]] Sync::MutexLocker<Sync::Mutex> take_lock() const { return Sync::MutexLocker(m_wait_state->mutex); }
+        [[nodiscard]] MutexLocker<Mutex> take_lock() const { return MutexLocker(m_wait_state->mutex); }
         void wake() const { m_wait_state->condition.broadcast(); }
 
     private:
@@ -120,11 +127,13 @@ private:
 
         Core::EventLoop& m_main_thread_event_loop;
 
-        // Shared with the frame pools' slot-freed callbacks, which can outlive this ThreadData
-        // through frames still held downstream.
+        // Shared with the decoder's storage-freed callback, which can outlive this ThreadData through frames still
+        // held downstream. The flag records a wake that arrived while the decode thread was outside the mutex,
+        // between an unsuccessful attempt to take output and the wait that follows it.
         struct WaitState : public AtomicRefCounted<WaitState> {
-            Sync::Mutex mutex;
-            Sync::ConditionVariable condition { mutex };
+            Mutex mutex;
+            ConditionVariable condition { mutex };
+            bool frame_storage_was_freed { false };
         };
         NonnullRefPtr<WaitState> m_wait_state { make_ref_counted<WaitState>() };
         RequestedState m_requested_state { RequestedState::None };
@@ -132,22 +141,28 @@ private:
         AK::ThreadID m_decode_thread_id;
         NonnullRefPtr<Demuxer> m_demuxer;
         Track m_track;
+        CodecID m_decoder_codec_id { CodecID::Unknown };
+        VideoDecoderSelection m_decoder_selection;
+        VideoDecoderSelection m_decoder_that_failed_due_to_missing_features;
+        Optional<CodedFrame> m_frame_awaiting_decoder_replacement;
+        DecodeIntent m_intent_awaiting_decoder_replacement { DecodeIntent::Output };
         OwnPtr<VideoDecoder> m_decoder;
-        RefPtr<VideoFramePool> m_frame_pool;
         bool m_decoder_needs_keyframe_next_seek { false };
+        bool m_decoder_needs_codec_configuration_next_seek { true };
 
         FrameQueue m_queue;
+        RefPtr<VideoFrame> m_last_queued_frame;
         AK::Duration m_earliest_available_timestamp;
         AK::Duration m_latest_available_timestamp;
         ErrorHandler m_error_handler;
         ReadBlockedChangeHandler m_read_blocked_change_handler;
         PipelineStatus m_current_halting_status { PipelineStatus::Pending };
 
-        u32 m_last_processed_seek_id { 0 };
+        Atomic<u32> m_last_processed_seek_id { 0 };
         Atomic<u32> m_seek_id { 0 };
         AK::Duration m_seek_timestamp;
 
-        PipelineWakeHandler m_wake_handler;
+        SynchronizedWakeHandler m_wake_handler;
         mutable bool m_downstream_needs_wake { true };
 
         AK::Duration const m_auto_suspend_idle_timeout;

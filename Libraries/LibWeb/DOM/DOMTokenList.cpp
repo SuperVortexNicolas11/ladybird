@@ -6,15 +6,16 @@
  */
 
 #include <AK/NeverDestroyed.h>
-#include <AK/Utf16StringBuilder.h>
+#include <AK/StringBuilder.h>
+#include <AK/TemporaryChange.h>
+#include <LibGC/Heap.h>
 #include <LibJS/Runtime/ExternalMemory.h>
-#include <LibWeb/Bindings/DOMTokenList.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/HTMLLinkElement.h>
-#include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/WebIDL/DOMException.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
 
 namespace {
 
@@ -63,35 +64,25 @@ GC_DEFINE_ALLOCATOR(DOMTokenList);
 
 GC::Ref<DOMTokenList> DOMTokenList::create(Element& associated_element, Utf16FlyString associated_attribute)
 {
-    auto& realm = associated_element.realm();
-    return realm.create<DOMTokenList>(associated_element, move(associated_attribute));
+    return GC::Heap::the().allocate<DOMTokenList>(associated_element, move(associated_attribute));
 }
 
 // https://dom.spec.whatwg.org/#ref-for-domtokenlist%E2%91%A0%E2%91%A2
 DOMTokenList::DOMTokenList(Element& associated_element, Utf16FlyString associated_attribute)
-    : Bindings::PlatformObject(associated_element.realm())
-    , m_associated_element(associated_element)
+    : m_associated_element(associated_element)
     , m_associated_attribute(move(associated_attribute))
 {
-    m_legacy_platform_object_flags = LegacyPlatformObjectFlags { .supports_indexed_properties = 1 };
-
     // When a DOMTokenList object set is created:
     // 1. Let element be set’s element.
     // 2. Let attributeName be set’s attribute name.
     // 3. Let value be the result of getting an attribute value given element and attributeName.
-    auto value = m_associated_element->get_attribute_value_view(m_associated_attribute).value_or({});
+    auto value = m_associated_element->attribute(m_associated_attribute).value_or({});
 
     // 4. Run the attribute change steps for element, attributeName, value, value, and null.
     associated_attribute_changed(value);
 }
 
-void DOMTokenList::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(DOMTokenList);
-    Base::initialize(realm);
-}
-
-void DOMTokenList::visit_edges(Cell::Visitor& visitor)
+void DOMTokenList::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_associated_element);
@@ -113,6 +104,9 @@ void DOMTokenList::associated_attribute_changed(Utf16View value)
     // 2. Otherwise, if localName is set’s attribute name and namespace is null, then set set’s token set to value,
     //    parsed.
     // AD-HOC: The caller is responsible for checking the name and namespace.
+    // OPTIMIZATION: The update steps just wrote this value from the token set, so there is nothing new to parse.
+    if (m_is_running_update_steps)
+        return;
     m_token_set.clear();
     if (value.is_empty())
         return;
@@ -356,16 +350,14 @@ WebIDL::ExceptionOr<void> DOMTokenList::validate_token(Utf16View token) const
 WebIDL::ExceptionOr<void> DOMTokenList::validate_token_not_empty(Utf16View token) const
 {
     if (token.is_empty())
-        return WebIDL::SyntaxError::create(realm(), "Non-empty DOM tokens are not allowed"_utf16);
+        return WebIDL::SyntaxError::create("Non-empty DOM tokens are not allowed"_utf16);
     return {};
 }
 
 WebIDL::ExceptionOr<void> DOMTokenList::validate_token_not_whitespace(Utf16View token) const
 {
-    for (size_t i = 0; i < token.length_in_code_units(); ++i) {
-        if (Infra::is_ascii_whitespace(token.code_unit_at(i)))
-            return WebIDL::InvalidCharacterError::create(realm(), "DOM tokens containing ASCII whitespace are not allowed"_utf16);
-    }
+    if (any_of(token, Infra::is_ascii_whitespace))
+        return WebIDL::InvalidCharacterError::create("DOM tokens containing ASCII whitespace are not allowed"_utf16);
     return {};
 }
 
@@ -383,15 +375,8 @@ void DOMTokenList::run_update_steps()
 
     // 2. Set an attribute value given set’s element, set’s attribute name, and the result of running the ordered set
     //    serializer for set’s token set.
+    TemporaryChange running_update_steps { m_is_running_update_steps, true };
     associated_element->set_attribute_value(m_associated_attribute, serialize_ordered_set());
-}
-
-Optional<JS::Value> DOMTokenList::item_value(size_t index) const
-{
-    auto string = item(index);
-    if (!string.has_value())
-        return {};
-    return JS::PrimitiveString::create(vm(), string.release_value());
 }
 
 }

@@ -12,27 +12,24 @@
 namespace Web::CSS {
 
 class CSSNamespaceRule final : public CSSRule {
-    WEB_PLATFORM_OBJECT(CSSNamespaceRule, CSSRule);
+    WEB_WRAPPABLE(CSSNamespaceRule, CSSRule);
     GC_DECLARE_ALLOCATOR(CSSNamespaceRule);
 
 public:
-    [[nodiscard]] static GC::Ref<CSSNamespaceRule> create(JS::Realm&, Optional<Utf16FlyString> prefix, Utf16FlyString namespace_uri);
+    [[nodiscard]] static GC::Ref<CSSNamespaceRule> create(RustRule);
 
     virtual ~CSSNamespaceRule() = default;
 
-    Utf16FlyString const& namespace_uri() const { return m_namespace_uri; }
-    void set_prefix(Utf16FlyString value) { m_prefix = move(value); }
-    Utf16FlyString const& prefix() const { return m_prefix; }
+    Utf16View namespace_uri() const;
+    Utf16View prefix() const;
 
 private:
-    CSSNamespaceRule(JS::Realm&, Optional<Utf16FlyString> prefix, Utf16FlyString namespace_uri);
+    explicit CSSNamespaceRule(RustRule);
 
-    virtual void initialize(JS::Realm&) override;
     virtual Utf16String serialized() const override;
     virtual void dump(StringBuilder&, int indent_levels) const override;
 
-    Utf16FlyString m_namespace_uri;
-    Utf16FlyString m_prefix;
+    Parser::ValueParserFFI::NamespaceRuleData const& m_rule;
 };
 
 }

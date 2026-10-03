@@ -1,14 +1,14 @@
 [GenerateToValue]
 dictionary CookieListItem {
-    Utf16USVString name;
-    Utf16USVString value;
+    USVString name;
+    USVString value;
 };
 
 typedef sequence<CookieListItem> CookieList;
 
 dictionary CookieStoreGetOptions {
-    Utf16USVString name;
-    Utf16USVString url;
+    USVString name;
+    USVString url;
 };
 
 enum CookieSameSite {
@@ -18,35 +18,35 @@ enum CookieSameSite {
 };
 
 dictionary CookieInit {
-    required Utf16USVString name;
-    required Utf16USVString value;
+    required USVString name;
+    required USVString value;
     DOMHighResTimeStamp? expires = null;
-    Utf16USVString? domain = null;
-    Utf16USVString path = "/";
+    USVString? domain = null;
+    USVString path = "/";
     CookieSameSite sameSite = "strict";
     boolean partitioned = false;
 };
 
 dictionary CookieStoreDeleteOptions {
-    required Utf16USVString name;
-    Utf16USVString? domain = null;
-    Utf16USVString path = "/";
+    required USVString name;
+    USVString? domain = null;
+    USVString path = "/";
     boolean partitioned = false;
 };
 
 // https://cookiestore.spec.whatwg.org/#cookiestore
 [Exposed=(ServiceWorker,Window), SecureContext]
 interface CookieStore : EventTarget {
-    Promise<CookieListItem?> get(Utf16USVString name);
+    Promise<CookieListItem?> get(USVString name);
     Promise<CookieListItem?> get(optional CookieStoreGetOptions options = {});
 
-    Promise<CookieList> getAll(Utf16USVString name);
+    Promise<CookieList> getAll(USVString name);
     Promise<CookieList> getAll(optional CookieStoreGetOptions options = {});
 
-    Promise<undefined> set(Utf16USVString name, Utf16USVString value);
+    Promise<undefined> set(USVString name, USVString value);
     Promise<undefined> set(CookieInit options);
 
-    Promise<undefined> delete(Utf16USVString name);
+    Promise<undefined> delete(USVString name);
     Promise<undefined> delete(CookieStoreDeleteOptions options);
 
     [Exposed=Window] attribute EventHandler onchange;

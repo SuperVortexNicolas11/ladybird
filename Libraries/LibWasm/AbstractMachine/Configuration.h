@@ -30,6 +30,8 @@ class Configuration {
     AK_MAKE_NONMOVABLE(Configuration);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit Configuration(Store& store)
         : m_store(store)
     {
@@ -60,10 +62,8 @@ public:
         frame.label_index() = m_label_stack.size();
         if (auto hint = frame.expression().stack_usage_hint(); hint.has_value())
             m_value_stack.ensure_capacity(*hint + m_value_stack.size());
-        if (is_tailcall == IsTailcall::No) {
-            if (auto hint = frame.expression().frame_usage_hint(); hint.has_value())
-                m_label_stack.ensure_capacity(*hint + m_label_stack.size());
-        }
+        if (auto depth = frame.expression().compiled_instructions.max_label_depth; depth > 0)
+            m_label_stack.ensure_capacity(depth + m_label_stack.size());
         m_label_stack.append(label);
 
         // A tail call replaces the current frame, so release its record first; otherwise a
@@ -172,6 +172,8 @@ public:
 
     void enable_instruction_count_limit() { m_should_limit_instruction_count = true; }
     bool should_limit_instruction_count() const { return m_should_limit_instruction_count; }
+
+    void reset_after_invoke(Badge<AbstractMachine>);
 
     void dump_stack();
 

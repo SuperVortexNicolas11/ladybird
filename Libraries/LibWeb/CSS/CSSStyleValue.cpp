@@ -5,8 +5,7 @@
  */
 
 #include "CSSStyleValue.h"
-#include <LibWeb/Bindings/CSSStyleValue.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
@@ -17,33 +16,31 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSStyleValue);
 
-GC::Ref<CSSStyleValue> CSSStyleValue::create(JS::Realm& realm, Utf16FlyString associated_property, NonnullRefPtr<StyleValue const> source_value)
+GC::Ref<CSSStyleValue> CSSStyleValue::create(Utf16FlyString associated_property, StyleValue const& source_value)
 {
-    return realm.create<CSSStyleValue>(realm, move(associated_property), move(source_value));
+    return GC::Heap::the().allocate<CSSStyleValue>(move(associated_property), source_value);
 }
 
-CSSStyleValue::CSSStyleValue(JS::Realm& realm)
-    : PlatformObject(realm)
-{
-}
-
-CSSStyleValue::CSSStyleValue(JS::Realm& realm, NonnullRefPtr<StyleValue const> source_value)
-    : PlatformObject(realm)
-    , m_source_value(move(source_value))
+CSSStyleValue::CSSStyleValue()
 {
 }
 
-CSSStyleValue::CSSStyleValue(JS::Realm& realm, Utf16FlyString associated_property, NonnullRefPtr<StyleValue const> source_value)
-    : PlatformObject(realm)
-    , m_associated_property(move(associated_property))
-    , m_source_value(move(source_value))
+CSSStyleValue::CSSStyleValue(StyleValue const& source_value)
+    : m_source_value(RustStyleValueHandle::retained(source_value.rust_style_value_data()))
 {
 }
 
-void CSSStyleValue::initialize(JS::Realm& realm)
+CSSStyleValue::CSSStyleValue(Utf16FlyString associated_property, StyleValue const& source_value)
+    : m_associated_property(move(associated_property))
+    , m_source_value(RustStyleValueHandle::retained(source_value.rust_style_value_data()))
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSStyleValue);
-    Base::initialize(realm);
+}
+
+RefPtr<StyleValue const> CSSStyleValue::source_style_value() const
+{
+    if (!m_source_value)
+        return nullptr;
+    return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(m_source_value.data()));
 }
 
 CSSStyleValue::~CSSStyleValue() = default;
@@ -73,6 +70,7 @@ WebIDL::ExceptionOr<GC::RootVector<GC::Ref<CSSStyleValue>>> CSSStyleValue::parse
 // https://drafts.css-houdini.org/css-typed-om-1/#parse-a-cssstylevalue
 WebIDL::ExceptionOr<Variant<GC::Ref<CSSStyleValue>, GC::RootVector<GC::Ref<CSSStyleValue>>>> CSSStyleValue::parse_a_css_style_value(JS::VM& vm, Utf16FlyString property_name, Utf16View css_text, ParseMultiple parse_multiple)
 {
+    (void)vm;
     // 1. If property is not a custom property name string, set property to property ASCII lowercased.
     // 2. If property is not a valid CSS property, throw a TypeError.
     auto property = PropertyNameAndID::from_name(property_name);
@@ -92,7 +90,7 @@ WebIDL::ExceptionOr<Variant<GC::Ref<CSSStyleValue>, GC::RootVector<GC::Ref<CSSSt
     // 5. For each value in values, replace it with the result of reifying value for property.
     GC::RootVector<GC::Ref<CSSStyleValue>> reified_values;
     for (auto const& value : values) {
-        reified_values.append(value->reify(*vm.current_realm(), property->name()));
+        reified_values.append(value->reify(property->name()));
     }
 
     // 6. If parseMultiple is false, return values[0]. Otherwise, return values.
@@ -118,8 +116,8 @@ WebIDL::ExceptionOr<Utf16String> CSSStyleValue::to_string() const
     }
     // FIXME: otherwise, if the value was extracted from the CSSOM
     // NB: For CSSStyleValue itself, we use the source value we were created from.
-    if (m_source_value)
-        return m_source_value->to_utf16_string(SerializationMode::Normal);
+    if (auto source_value = source_style_value())
+        return source_value->to_utf16_string(SerializationMode::Normal);
     {
         // the serialization is specified in §6.7 Serialization from CSSOM Values below.
     }
@@ -131,9 +129,10 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleValue const>> CSSStyleValue::create_an_in
 {
     // If value is a direct CSSStyleValue,
     //     Return value’s associated value.
-    if (!m_source_value)
+    auto source_value = source_style_value();
+    if (!source_value)
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, Utf16String::formatted("Missing {}::create_an_internal_representation() overload", class_name()) };
-    return NonnullRefPtr { *m_source_value };
+    return source_value.release_nonnull();
 }
 
 }

@@ -6,15 +6,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/SVGTextPositioningElement.h>
 #include <LibWeb/CSS/Parser/Parser.h>
-#include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
-#include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
-#include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/Layout/Node.h>
 #include <LibWeb/SVG/AttributeNames.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGAnimatedLengthList.h>
 #include <LibWeb/SVG/SVGAnimatedNumberList.h>
 #include <LibWeb/SVG/SVGLength.h>
@@ -28,12 +23,6 @@ namespace Web::SVG {
 SVGTextPositioningElement::SVGTextPositioningElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGTextContentElement(document, move(qualified_name))
 {
-}
-
-void SVGTextPositioningElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGTextPositioningElement);
-    Base::initialize(realm);
 }
 
 void SVGTextPositioningElement::visit_edges(Visitor& visitor)
@@ -62,44 +51,37 @@ void SVGTextPositioningElement::attribute_changed(Utf16FlyString const& name, Op
         m_rotate = {};
 }
 
-TextPositioning SVGTextPositioningElement::text_positioning() const
+SVGTextPositioningElement::ParsedTextPositioning SVGTextPositioningElement::parsed_text_positioning() const
 {
     CSS::Parser::ParsingParams const parsing_params { document() };
 
     // https://svgwg.org/svg2-draft/text.html#TSpanAttributes
     // FIXME: This only handles single values, not lists.
-    auto resolve_value = [&](Utf16FlyString const& attribute) -> Vector<TextPositioning::Position> {
+    auto parse_value = [&](Utf16FlyString const& attribute) -> Optional<SVGLengthValue> {
         auto raw_value = get_attribute_value(attribute);
 
-        CSS::ComputationContext computation_context {
-            .length_resolution_context = CSS::Length::ResolutionContext::for_element(*this),
-            .abstract_element = *this,
-            // NB: color_scheme is irrelevant for resolving text positioning attribute values so isn't set.
-        };
-
         // FIXME: Should we support tree-counting and/or calculated values here?
+        if (auto style_value = parse_css_type(parsing_params, raw_value, CSS::ValueType::LengthPercentage)) {
+            if (auto value = SVGLengthValue::from_style_value(*style_value);
+                value.has_value() && value->kind() != SVGLengthValue::Kind::Number)
+                return value;
+        }
 
-        auto style_value = parse_css_type(parsing_params, raw_value, CSS::ValueType::LengthPercentage);
-        if (auto const* length_style_value = as_if<CSS::LengthStyleValue>(style_value.ptr()))
-            return { CSS::LengthPercentage::from_style_value(*length_style_value->absolutized(computation_context)) };
-
-        if (auto const* percentage_style_value = as_if<CSS::PercentageStyleValue>(style_value.ptr()))
-            return { CSS::LengthPercentage::from_style_value(*percentage_style_value) };
-
-        style_value = parse_css_type(parsing_params, raw_value, CSS::ValueType::Number);
-        if (auto const* number_style_value = as_if<CSS::NumberStyleValue>(style_value.ptr()))
-            return { CSS::Number { CSS::Number::Type::Number, number_style_value->number() } };
+        if (auto style_value = parse_css_type(parsing_params, raw_value, CSS::ValueType::Number)) {
+            if (auto value = SVGLengthValue::from_style_value(*style_value);
+                value.has_value() && value->kind() == SVGLengthValue::Kind::Number)
+                return value;
+        }
 
         return {};
     };
 
     // FIXME: Implement support for the rotate attribute.
     return {
-        .x = resolve_value(AttributeNames::x),
-        .y = resolve_value(AttributeNames::y),
-        .dx = resolve_value(AttributeNames::dx),
-        .dy = resolve_value(AttributeNames::dy),
-        .rotate = Vector<float> {},
+        .x = parse_value(AttributeNames::x),
+        .y = parse_value(AttributeNames::y),
+        .dx = parse_value(AttributeNames::dx),
+        .dy = parse_value(AttributeNames::dy),
     };
 }
 
@@ -109,14 +91,19 @@ GC::Ref<SVGAnimatedLengthList> SVGTextPositioningElement::ensure_length_list(GC:
     if (!list) {
         // FIXME: This only handles single values, not lists.
         float value = 0.f;
-        auto maybe_number_percentage = AttributeParser::parse_number_percentage(get_attribute_value(attribute_name));
+        auto maybe_number_percentage = parse_number_percentage(get_attribute_value(attribute_name));
         if (maybe_number_percentage.has_value())
             value = maybe_number_percentage.release_value().value();
 
-        auto length = SVGLength::create_detached(realm(), CSS::NumberStyleValue::create(value), SVGLength::ReadOnly::Yes);
-        auto length_list = SVGLengthList::create(realm(), { length }, ReadOnlyList::Yes);
-        list = SVGAnimatedLengthList::create(realm(), length_list);
+        auto length = SVGLength::create_detached(document().relevant_settings_object().realm(), SVGLengthValue::number(value), SVGLength::ReadOnly::Yes);
+
+        auto items = GC::Heap::the().allocate<SVGLengthList::List>();
+        items->elements().append(length);
+
+        auto length_list = SVGLengthList::create(items, ReadOnlyList::Yes);
+        list = SVGAnimatedLengthList::create(length_list);
     }
+
     return *list;
 }
 
@@ -150,14 +137,19 @@ GC::Ref<SVGAnimatedNumberList> SVGTextPositioningElement::rotate()
     if (!m_rotate) {
         // FIXME: This only handles single values, not lists.
         float value = 0.f;
-        auto maybe_number_percentage = AttributeParser::parse_number_percentage(get_attribute_value(AttributeNames::rotate));
+        auto maybe_number_percentage = parse_number_percentage(get_attribute_value(AttributeNames::rotate));
         if (maybe_number_percentage.has_value() && !maybe_number_percentage.value().is_percentage())
             value = maybe_number_percentage.release_value().value();
 
-        auto number = SVGNumber::create(realm(), value, SVGNumber::ReadOnly::Yes);
-        auto number_list = SVGNumberList::create(realm(), { number }, ReadOnlyList::Yes);
-        m_rotate = SVGAnimatedNumberList::create(realm(), number_list);
+        auto number = SVGNumber::create(value, SVGNumber::ReadOnly::Yes);
+
+        auto items = GC::Heap::the().allocate<SVGNumberList::List>();
+        items->elements().append(number);
+
+        auto number_list = SVGNumberList::create(items, ReadOnlyList::Yes);
+        m_rotate = SVGAnimatedNumberList::create(number_list);
     }
+
     return *m_rotate;
 }
 

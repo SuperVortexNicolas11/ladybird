@@ -9,7 +9,9 @@
 #pragma once
 
 #include <AK/TypeCasts.h>
+#include <AK/kmalloc.h>
 #include <LibWebView/Settings.h>
+#include <UI/Qt/Tab.h>
 
 #include <QPointer>
 #include <QPushButton>
@@ -37,7 +39,6 @@ class QWheelEvent;
 
 namespace Ladybird {
 
-class Tab;
 class TabPreviewPopup;
 class TabWidget;
 
@@ -51,6 +52,8 @@ class TabBar final : public QTabBar {
     Q_OBJECT
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit TabBar(TabWidget*);
 
     void set_available_width(int width);
@@ -126,12 +129,16 @@ private:
     QTimer* m_tab_preview_timer { nullptr };
     TabPreviewPopup* m_tab_preview_popup { nullptr };
     int m_tab_preview_index { -1 };
+    QPointer<Tab> m_previewed_tab;
+    QMetaObject::Connection m_tab_preview_paint_connection;
 };
 
 class TabWidget final : public QWidget {
     Q_OBJECT
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit TabWidget(QWidget* parent = nullptr);
 
     TabBar* tab_bar() const { return m_tab_bar; }
@@ -221,6 +228,8 @@ private:
     void accept_tab_drop(QDropEvent*, int index);
 
     TabBar* m_tab_bar { nullptr };
+    void size_hidden_pages_like_the_current_one();
+
     QStackedWidget* m_stacked_widget { nullptr };
     QToolButton* m_new_tab_button { nullptr };
     QToolButton* m_minimize_window_button { nullptr };
@@ -259,11 +268,14 @@ class TabBarButton final : public QPushButton {
     Q_OBJECT
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit TabBarButton(QIcon const& icon, QWidget* parent = nullptr);
     void set_collapsed_vertical_overlay(bool);
 
 protected:
     virtual bool event(QEvent* event) override;
+    virtual void paintEvent(QPaintEvent*) override;
 };
 
 }

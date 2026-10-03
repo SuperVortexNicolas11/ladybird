@@ -5,7 +5,10 @@
  */
 
 #include <AK/Atomic.h>
+#include <AK/ConditionVariable.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/ThreadSafeWeakable.h>
 #include <AK/Vector.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
@@ -28,9 +31,6 @@
 #include <LibMedia/VideoPresentation/PresentedFramePage.h>
 #include <LibMedia/VideoPresentation/VideoPresentationClientConnection.h>
 #include <LibMedia/VideoPresentation/VideoPresentationServerConnection.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
-#include <LibSync/Weakable.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 
@@ -105,25 +105,26 @@ Vector<AK::Duration> decode_reference_timestamps(StringView path)
 // announcements and signal the draining thread, which is where the consumer is touched.
 struct VideoEdgeTestHarness
     : public AtomicRefCounted<VideoEdgeTestHarness>
-    , public Sync::Weakable<VideoEdgeTestHarness> {
+    , public ThreadSafeWeakable<VideoEdgeTestHarness> {
     struct SlotAnnouncement {
         VideoFramePoolID pool_id;
         u32 slot_index { 0 };
         Core::AnonymousBuffer slot_buffer;
+        RefPtr<VideoSurface> surface;
     };
 
     RefPtr<RemoteVideoSink> sink;
     NonnullRefPtr<VideoFrameSlotDirectory> slot_directory { VideoFrameSlotDirectory::create() };
     RefPtr<RemoteVideoProducer> consumer;
 
-    Sync::Mutex mutex;
-    Sync::ConditionVariable signal { mutex };
+    Mutex mutex;
+    ConditionVariable signal { mutex };
     Vector<SlotAnnouncement> pending_announces;
     bool signaled { false };
 
     void wake()
     {
-        Sync::MutexLocker locker { mutex };
+        MutexLocker locker { mutex };
         signaled = true;
         signal.broadcast();
     }
@@ -132,11 +133,11 @@ struct VideoEdgeTestHarness
     {
         Vector<SlotAnnouncement> announces;
         {
-            Sync::MutexLocker locker { mutex };
+            MutexLocker locker { mutex };
             announces = move(pending_announces);
         }
         for (auto& announcement : announces)
-            slot_directory->notify_slot_announced(announcement.pool_id, announcement.slot_index, move(announcement.slot_buffer));
+            slot_directory->notify_slot_announced(announcement.pool_id, announcement.slot_index, move(announcement.slot_buffer), move(announcement.surface));
         // The pump's delegates only wake this thread; the consumer is single-threaded, so it is notified here.
         consumer->notify_data_available();
     }
@@ -153,13 +154,13 @@ void wire_full_node(VideoEdgeTestHarness& harness, NonnullRefPtr<VideoProducer> 
     };
     sink_delegates.transmit_seek = [] { };
     sink_delegates.transmit_time_reader = [](MediaTimeReader const&) { };
-    sink_delegates.announce_slot = [weak = harness.make_weak_ref()](VideoFramePoolID pool_id, u32 slot_index, Core::AnonymousBuffer slot_buffer) {
+    sink_delegates.announce_slot = [weak = harness.make_weak_ref()](VideoFramePoolID pool_id, u32 slot_index, Core::AnonymousBuffer slot_buffer, RefPtr<VideoSurface> surface) {
         auto harness = weak.strong_ref();
         if (!harness)
             return;
         {
-            Sync::MutexLocker locker { harness->mutex };
-            harness->pending_announces.append({ pool_id, slot_index, move(slot_buffer) });
+            MutexLocker locker { harness->mutex };
+            harness->pending_announces.append({ pool_id, slot_index, move(slot_buffer), move(surface) });
         }
         harness->wake();
     };
@@ -183,7 +184,7 @@ void wire_full_node(VideoEdgeTestHarness& harness, NonnullRefPtr<VideoProducer> 
 }
 
 // Builds a consumer over a controlled edge pre-filled with four frames at 1.0s..1.3s under seek_id 0,
-// with the lookahead upper bound published, to exercise the seek fast path deterministically.
+// to exercise the seek fast path deterministically.
 NonnullRefPtr<RemoteVideoProducer> make_lookahead_consumer(VideoEdgeQueue& producer_edge, size_t& upstream_seeks)
 {
     auto ring_fd = MUST(Core::System::dup(producer_edge.ring_fd()));
@@ -195,16 +196,12 @@ NonnullRefPtr<RemoteVideoProducer> make_lookahead_consumer(VideoEdgeQueue& produ
     delegates.notify_space_available = [] { };
     auto consumer = RemoteVideoProducer::create(move(consumer_edge), VideoFrameSlotDirectory::create(), move(delegates));
 
-    auto const frame_duration = AK::Duration::from_milliseconds(100);
-    AK::Duration available_end;
     for (int i = 0; i < 4; i++) {
         VideoFrameHandle handle;
         handle.timestamp = AK::Duration::from_milliseconds(1000 + (i * 100));
-        handle.duration = frame_duration;
+        handle.duration = AK::Duration::from_milliseconds(100);
         MUST(producer_edge.enqueue(handle, 0));
-        available_end = handle.timestamp + frame_duration.scaled_by(3, 2);
     }
-    producer_edge.set_available_upper_bound(available_end, 0);
     return consumer;
 }
 
@@ -307,7 +304,7 @@ TEST_CASE(remote_video_node_streams_and_seeks_under_concurrency)
             if (output.status == PipelineStatus::EndOfStream && have_consumed)
                 seek_to(AK::Duration::zero());
 
-            Sync::MutexLocker locker { harness->mutex };
+            MutexLocker locker { harness->mutex };
             while (!harness->signaled && !stop.load(AK::MemoryOrder::memory_order_relaxed) && harness->pending_announces.is_empty())
                 harness->signal.wait();
             harness->signaled = false;
@@ -464,15 +461,88 @@ NonnullRefPtr<VideoFrame> create_pooled_frame(VideoFramePool& pool, AK::Duration
 
     auto layout = MUST(frame_plane_layout(frame_size, bit_depth, subsampling));
     auto acquired = pool.try_acquire(layout.total_byte_count).release_value();
-    auto yuv_data = MUST(Gfx::YUVData::create(frame_size, bit_depth, subsampling, CodingIndependentCodePoints {},
-        acquired.bytes.slice(0, layout.y_size),
-        acquired.bytes.slice(layout.u_offset, layout.u_size),
-        acquired.bytes.slice(layout.v_offset, layout.v_size)));
     auto slot = MUST(pool.try_adopt_acquired_slot(acquired));
 
-    return make_ref_counted<VideoFrame>(timestamp, AK::Duration::from_milliseconds(33), Gfx::Size<u32>(frame_size), bit_depth, yuv_data, move(slot));
+    return make_ref_counted<VideoFrame>(timestamp, AK::Duration::from_milliseconds(33), Gfx::Size<u32>(frame_size), bit_depth, subsampling, CodingIndependentCodePoints {}, move(slot));
 }
 
+}
+
+// While a seek request is in flight, the pump must leave the producer's frames where the seek can still find
+// them, instead of moving them into the ring under a stamp the consumer has already superseded.
+TEST_CASE(pump_holds_off_while_a_seek_request_is_in_flight)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    RemoteVideoSink::Delegates delegates;
+    delegates.ring_data_available = [] { };
+    delegates.transmit_seek = [] { };
+    delegates.transmit_time_reader = [](MediaTimeReader const&) { };
+    delegates.announce_slot = [](VideoFramePoolID, u32, Core::AnonymousBuffer, RefPtr<VideoSurface>) { };
+    delegates.retire_pool = [](VideoFramePoolID) { };
+    auto sink = MUST(RemoteVideoSink::create(move(delegates)));
+
+    auto pool = MUST(VideoFramePool::create());
+    auto producer = ScriptedVideoProducer::create();
+    producer->append_frame(create_pooled_frame(*pool, AK::Duration::zero()));
+    producer->append_frame(create_pooled_frame(*pool, AK::Duration::from_milliseconds(33)));
+
+    auto ring_fd = MUST(Core::System::dup(sink->edge().ring_fd()));
+    auto consumer_edge = MUST(VideoEdgeQueue::create(ring_fd, sink->edge().header_buffer()));
+
+    // The consumer has requested a seek the pump has not applied yet.
+    consumer_edge.set_requested_seek_id(1);
+    MUST(sink->connect_input(producer));
+    sink->start_input();
+
+    auto hold_off_deadline = MonotonicTime::now_coarse() + AK::Duration::from_milliseconds(100);
+    while (MonotonicTime::now_coarse() < hold_off_deadline) {
+        EXPECT(!consumer_edge.peek().has_value());
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    }
+
+    // Applying the seek lets pumping resume, with the frames stamped for the request.
+    sink->seek_upstream(AK::Duration::zero());
+    EXPECT(spin_until(loop, [&] { return consumer_edge.peek().has_value(); }));
+    EXPECT_EQ(consumer_edge.peek()->seek_id, 1u);
+}
+
+// A request the consumer withdraws, having resolved the seek locally after all, must let pumping resume under the
+// unchanged stamp once the consumer's next consume wakes the pump.
+TEST_CASE(pump_resumes_after_a_withdrawn_seek_request)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    RemoteVideoSink::Delegates delegates;
+    delegates.ring_data_available = [] { };
+    delegates.transmit_seek = [] { };
+    delegates.transmit_time_reader = [](MediaTimeReader const&) { };
+    delegates.announce_slot = [](VideoFramePoolID, u32, Core::AnonymousBuffer, RefPtr<VideoSurface>) { };
+    delegates.retire_pool = [](VideoFramePoolID) { };
+    auto sink = MUST(RemoteVideoSink::create(move(delegates)));
+
+    auto pool = MUST(VideoFramePool::create());
+    auto producer = ScriptedVideoProducer::create();
+    producer->append_frame(create_pooled_frame(*pool, AK::Duration::zero()));
+    producer->append_frame(create_pooled_frame(*pool, AK::Duration::from_milliseconds(33)));
+
+    auto ring_fd = MUST(Core::System::dup(sink->edge().ring_fd()));
+    auto consumer_edge = MUST(VideoEdgeQueue::create(ring_fd, sink->edge().header_buffer()));
+
+    consumer_edge.set_requested_seek_id(1);
+    MUST(sink->connect_input(producer));
+    sink->start_input();
+
+    auto hold_off_deadline = MonotonicTime::now_coarse() + AK::Duration::from_milliseconds(100);
+    while (MonotonicTime::now_coarse() < hold_off_deadline) {
+        EXPECT(!consumer_edge.peek().has_value());
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    }
+
+    consumer_edge.set_requested_seek_id(0);
+    sink->notify_space_available();
+    EXPECT(spin_until(loop, [&] { return consumer_edge.peek().has_value(); }));
+    EXPECT_EQ(consumer_edge.peek()->seek_id, 0u);
 }
 
 // A presented-frame handle can outlive its lend when a newer frame's release is processed before the
@@ -485,7 +555,7 @@ TEST_CASE(current_frame_ignores_handles_whose_lend_was_released)
     delegates.ring_data_available = [] { };
     delegates.transmit_seek = [] { };
     delegates.transmit_time_reader = [](MediaTimeReader const&) { };
-    delegates.announce_slot = [](VideoFramePoolID, u32, Core::AnonymousBuffer) { };
+    delegates.announce_slot = [](VideoFramePoolID, u32, Core::AnonymousBuffer, RefPtr<VideoSurface>) { };
     delegates.retire_pool = [](VideoFramePoolID) { };
     auto sink = MUST(RemoteVideoSink::create(move(delegates)));
 
@@ -523,4 +593,36 @@ TEST_CASE(current_frame_ignores_handles_whose_lend_was_released)
     page.store(handles[1]);
     sink->release_slot(handles[1].pool_id, handles[1].slot_index);
     EXPECT(sink->current_frame() == nullptr);
+}
+
+TEST_CASE(consumer_forgets_announced_slots_on_suspension)
+{
+    auto producer_edge = MUST(VideoEdgeQueue::create());
+    auto ring_fd = MUST(Core::System::dup(producer_edge.ring_fd()));
+    auto consumer_edge = MUST(VideoEdgeQueue::create(ring_fd, producer_edge.header_buffer()));
+
+    auto pool = MUST(VideoFramePool::create());
+    auto frame = create_pooled_frame(*pool, AK::Duration::from_milliseconds(1000));
+    auto handle = VideoFrameHandle::for_frame(*frame);
+
+    auto directory = VideoFrameSlotDirectory::create();
+    directory->notify_slot_announced(pool->id(), handle.slot_index, pool->slot_buffer(handle.slot_index), nullptr);
+
+    RemoteVideoProducer::Delegates delegates;
+    delegates.request_start = [] { };
+    delegates.request_seek = [](AK::Duration) { };
+    delegates.release_slot = [](VideoFramePoolID, u32) { };
+    delegates.notify_space_available = [] { };
+    auto consumer = RemoteVideoProducer::create(move(consumer_edge), directory, move(delegates));
+
+    auto resolved_before_suspension = directory->resolve_frame(handle, [] { });
+    EXPECT(resolved_before_suspension != nullptr);
+
+    producer_edge.set_status(PipelineStatus::Suspended, 0);
+    consumer->notify_data_available();
+
+    // The decoder that announced this slot is gone, so nothing more resolves against it, while the frame that
+    // already did keeps reading what it holds.
+    EXPECT(directory->resolve_frame(handle, [] { }) == nullptr);
+    EXPECT(resolved_before_suspension->revalidate_backing());
 }

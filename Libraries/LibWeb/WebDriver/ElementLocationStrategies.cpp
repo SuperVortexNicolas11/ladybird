@@ -31,8 +31,6 @@ static ErrorOr<GC::Ref<DOM::NodeList>, Error> locate_element_by_css_selector(DOM
 // https://w3c.github.io/webdriver/#link-text
 static ErrorOr<GC::Ref<DOM::NodeList>, Error> locate_element_by_link_text(DOM::ParentNode& start_node, StringView selector)
 {
-    auto& realm = start_node.realm();
-
     // 1. Let elements be the result of calling querySelectorAll() with start node as this and "a" as the argument. If
     //    this throws an exception, return error with error code unknown error.
     auto elements = start_node.query_selector_all("a"sv);
@@ -40,7 +38,7 @@ static ErrorOr<GC::Ref<DOM::NodeList>, Error> locate_element_by_link_text(DOM::P
         return Error::from_code(ErrorCode::UnknownError, "querySelectorAll() failed"sv);
 
     // 2. Let result be an empty NodeList.
-    Vector<GC::Root<DOM::Node>> result;
+    GC::RootVector<GC::Ref<DOM::Node>> result;
 
     // 3. For each element in elements:
     for (size_t i = 0; i < elements.value()->length(); ++i) {
@@ -58,14 +56,12 @@ static ErrorOr<GC::Ref<DOM::NodeList>, Error> locate_element_by_link_text(DOM::P
     }
 
     // 4. Return success with data result.
-    return DOM::StaticNodeList::create(realm, move(result));
+    return DOM::StaticNodeList::create(result);
 }
 
 // https://w3c.github.io/webdriver/#partial-link-text
 static ErrorOr<GC::Ref<DOM::NodeList>, Error> locate_element_by_partial_link_text(DOM::ParentNode& start_node, StringView selector)
 {
-    auto& realm = start_node.realm();
-
     // 1. Let elements be the result of calling querySelectorAll() with start node as this and "a" as the argument. If
     //    this throws an exception, return error with error code unknown error.
     auto elements = start_node.query_selector_all("a"sv);
@@ -73,7 +69,7 @@ static ErrorOr<GC::Ref<DOM::NodeList>, Error> locate_element_by_partial_link_tex
         return Error::from_code(ErrorCode::UnknownError, "querySelectorAll() failed"sv);
 
     // 2. Let result be an empty NodeList.
-    Vector<GC::Root<DOM::Node>> result;
+    GC::RootVector<GC::Ref<DOM::Node>> result;
 
     // 3. For each element in elements:
     for (size_t i = 0; i < elements.value()->length(); ++i) {
@@ -88,27 +84,25 @@ static ErrorOr<GC::Ref<DOM::NodeList>, Error> locate_element_by_partial_link_tex
     }
 
     // 4. Return success with data result.
-    return DOM::StaticNodeList::create(realm, move(result));
+    return DOM::StaticNodeList::create(result);
 }
 
 // https://w3c.github.io/webdriver/#tag-name
 static GC::Ref<DOM::NodeList> locate_element_by_tag_name(DOM::ParentNode& start_node, Utf16FlyString const& selector)
 {
-    auto& realm = start_node.realm();
-
     // To find a web element with the Tag Name strategy return success with data set to the result of calling
     // getElementsByTagName() with start node as this and selector as the argument.
     auto elements = start_node.get_elements_by_tag_name(selector);
 
     // FIXME: Having to convert this to a NodeList is a bit awkward.
-    Vector<GC::Root<DOM::Node>> result;
+    GC::RootVector<GC::Ref<DOM::Node>> result;
 
     for (size_t i = 0; i < elements->length(); ++i) {
         auto* element = elements->item(i);
         result.append(*element);
     }
 
-    return DOM::StaticNodeList::create(realm, move(result));
+    return DOM::StaticNodeList::create(result);
 }
 
 // https://w3c.github.io/webdriver/#xpath

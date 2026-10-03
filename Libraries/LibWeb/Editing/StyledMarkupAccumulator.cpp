@@ -6,6 +6,7 @@
 
 #include <AK/CharacterTypes.h>
 #include <AK/TypeCasts.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
@@ -23,11 +24,12 @@ namespace Web::Editing {
 
 static bool should_serialize_node(DOM::Node const& node)
 {
-    if (node.layout_node())
+    if (node.has_layout_box())
         return true;
 
     auto const* element = as_if<DOM::Element>(node);
-    return element && element->computed_values() && element->computed_values()->display().is_contents();
+    auto const* box_values = element ? element->style_group<CSS::ComputedValues::BoxValues>() : nullptr;
+    return box_values && CSS::display_from_ffi_display(box_values->display).is_contents();
 }
 
 StyledMarkupAccumulator::StyledMarkupAccumulator(StyledMarkupSelection const& selection)

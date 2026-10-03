@@ -2,14 +2,14 @@
 <script src="../include.js"></script>
 <div id="editor" contenteditable="true">ab</div>
 <script>
-    asyncTest(async done => {
+    promiseTest(async () => {
         const platformControl = internals.MOD_CTRL | internals.MOD_SUPER;
         const platformControlShift = platformControl | internals.MOD_SHIFT;
         const selection = getSelection();
 
         editor.addEventListener("copy", event => {
             event.clipboardData.setData("text/plain", "plain fallback");
-            event.clipboardData.setData("text/html", `<b id="safe" style="color: red" onclick="globalThis.executed = true">safe</b><script>globalThis.executed = true;<\/script><iframe srcdoc="<script>parent.executed = true;<\/script>"></iframe><a id="link" href="javascript:globalThis.executed = true">link</a><img id="image" src="../Screenshot/data/smiley.png" onerror="globalThis.executed = true"><style>#editor { display: none; }</style>`);
+            event.clipboardData.setData("text/html", `<b id="safe" style="color: red" onclick="globalThis.executed = true">safe</b><script>globalThis.executed = true;<\/script><iframe srcdoc="<script>parent.executed = true;<\/script>"></iframe><a id="link" href="javascript:globalThis.executed = true">link</a><img id="image" src="../../../Screenshot/data/smiley.png" onerror="globalThis.executed = true"><style>#editor { display: none; }</style>`);
             event.preventDefault();
         }, { once: true });
 
@@ -36,6 +36,5 @@
         println(`undo DOM: ${editor.innerHTML}`);
         internals.sendKey(editor, "Z", platformControlShift);
         println(`redo active content: ${editor.querySelectorAll("script, iframe, object, embed, style, link, meta, template, [onclick], [onerror], [href^='javascript:']").length}`);
-        done();
     });
 </script>

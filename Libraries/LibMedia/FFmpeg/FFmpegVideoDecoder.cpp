@@ -6,125 +6,128 @@
 
 #include <LibCore/System.h>
 #include <LibGfx/YUVData.h>
+#include <LibMedia/CodedFrame.h>
+#include <LibMedia/VideoFrame.h>
 
+#include "FFmpegFunctions.h"
 #include "FFmpegHelpers.h"
 #include "FFmpegVideoDecoder.h"
 
 namespace Media::FFmpeg {
 
-static AVPixelFormat negotiate_output_format(AVCodecContext*, AVPixelFormat const* formats)
+static constexpr size_t MAXIMUM_FRAMES_IN_FLIGHT = 256;
+
+Optional<DecoderCapabilities> FFmpegVideoDecoder::capabilities(FFmpegFunctions const& functions, ParsedCodec const& codec)
 {
-    while (*formats >= 0) {
-        switch (*formats) {
-        case AV_PIX_FMT_YUV420P:
-        case AV_PIX_FMT_YUV420P10:
-        case AV_PIX_FMT_YUV420P12:
-        case AV_PIX_FMT_YUV422P:
-        case AV_PIX_FMT_YUV422P10:
-        case AV_PIX_FMT_YUV422P12:
-        case AV_PIX_FMT_YUV444P:
-        case AV_PIX_FMT_YUV444P10:
-        case AV_PIX_FMT_YUV444P12:
-        case AV_PIX_FMT_YUVJ420P:
-        case AV_PIX_FMT_YUVJ422P:
-        case AV_PIX_FMT_YUVJ444P:
-            return *formats;
-        default:
-            break;
-        }
-        formats++;
-    }
-    return AV_PIX_FMT_NONE;
+    if (track_type_from_codec_id(codec.codec_id()) != TrackType::Video)
+        return {};
+    if (!functions.avcodec_find_decoder(ffmpeg_codec_id_from_media_codec_id(codec.codec_id())))
+        return {};
+    return DecoderCapabilities { .smooth = true, .power_efficient = false };
 }
 
-DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> FFmpegVideoDecoder::try_create(CodecID codec_id, ReadonlyBytes codec_initialization_data)
+DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> FFmpegVideoDecoder::try_create(FFmpegFunctions const& functions, CodecID codec_id, ReadonlyBytes codec_initialization_data)
 {
     AVCodecContext* codec_context = nullptr;
     AVPacket* packet = nullptr;
     AVFrame* frame = nullptr;
     ArmedScopeGuard memory_guard {
         [&] {
-            avcodec_free_context(&codec_context);
-            av_packet_free(&packet);
-            av_frame_free(&frame);
+            functions.avcodec_free_context(&codec_context);
+            functions.av_packet_free(&packet);
+            functions.av_frame_free(&frame);
         }
     };
 
     auto ff_codec_id = ffmpeg_codec_id_from_media_codec_id(codec_id);
-    auto const* codec = avcodec_find_decoder(ff_codec_id);
+    auto const* codec = functions.avcodec_find_decoder(ff_codec_id);
     if (!codec)
         return DecoderError::format(DecoderErrorCategory::NotImplemented, "Could not find FFmpeg decoder for codec {}", codec_id);
 
-    codec_context = avcodec_alloc_context3(codec);
+    codec_context = functions.avcodec_alloc_context3(codec);
     if (!codec_context)
         return DecoderError::format(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg codec context for codec {}", codec_id);
 
-    codec_context->get_format = negotiate_output_format;
-    codec_context->time_base = { 1, 1'000'000 };
-    codec_context->thread_count = static_cast<int>(min(Core::System::hardware_concurrency(), 4));
+    TRY(set_codec_initialization_data(functions, *codec_context, codec_id, codec_initialization_data));
+    VERIFY(functions.av_opt_set_int(codec_context, "threads", min(Core::System::hardware_concurrency(), 4u), 0) == 0);
 
-    if (!codec_initialization_data.is_empty()) {
-        if (codec_initialization_data.size() > NumericLimits<int>::max())
-            return DecoderError::corrupted("Codec initialization data is too large"sv);
-
-        codec_context->extradata = static_cast<u8*>(av_malloc(codec_initialization_data.size() + AV_INPUT_BUFFER_PADDING_SIZE));
-        if (!codec_context->extradata)
-            return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate codec initialization data buffer for FFmpeg codec"sv);
-
-        memcpy(codec_context->extradata, codec_initialization_data.data(), codec_initialization_data.size());
-        codec_context->extradata_size = static_cast<int>(codec_initialization_data.size());
-    }
-
-    if (avcodec_open2(codec_context, codec, nullptr) < 0)
+    if (functions.avcodec_open2(codec_context, codec, nullptr) < 0)
         return DecoderError::format(DecoderErrorCategory::Unknown, "Unknown error occurred when opening FFmpeg codec {}", codec_id);
 
-    packet = av_packet_alloc();
+    packet = functions.av_packet_alloc();
     if (!packet)
         return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg packet"sv);
 
-    frame = av_frame_alloc();
+    frame = functions.av_frame_alloc();
     if (!frame)
         return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg frame"sv);
 
+    auto frame_pool_result = VideoFramePool::create();
+    if (frame_pool_result.is_error())
+        return DecoderError::format(DecoderErrorCategory::Memory, "Failed to create a video frame pool: {}", frame_pool_result.release_error());
+
     memory_guard.disarm();
-    return DECODER_TRY_ALLOC(try_make<FFmpegVideoDecoder>(codec_context, packet, frame));
+    return DECODER_TRY_ALLOC(try_make<FFmpegVideoDecoder>(functions, codec_context, packet, frame, frame_pool_result.release_value()));
 }
 
-FFmpegVideoDecoder::FFmpegVideoDecoder(AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame)
-    : m_codec_context(codec_context)
+Optional<DecoderCapabilities> FFmpegVideoDecoder::capabilities(ParsedCodec const& codec)
+{
+    return capabilities(FFmpegFunctions::bundled(), codec);
+}
+
+DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> FFmpegVideoDecoder::try_create(CodecID codec_id, ReadonlyBytes codec_initialization_data)
+{
+    return try_create(FFmpegFunctions::bundled(), codec_id, codec_initialization_data);
+}
+
+FFmpegVideoDecoder::FFmpegVideoDecoder(FFmpegFunctions const& functions, AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame, NonnullRefPtr<VideoFramePool> frame_pool)
+    : m_functions(functions)
+    , m_codec_context(codec_context)
     , m_packet(packet)
     , m_frame(frame)
+    , m_frame_pool(move(frame_pool))
 {
 }
 
 FFmpegVideoDecoder::~FFmpegVideoDecoder()
 {
-    av_packet_free(&m_packet);
-    av_frame_free(&m_frame);
-    avcodec_free_context(&m_codec_context);
+    m_frame_pool->shed_storage();
+    m_functions.av_packet_free(&m_packet);
+    m_functions.av_frame_free(&m_frame);
+    m_functions.avcodec_free_context(&m_codec_context);
 }
 
-DecoderErrorOr<void> FFmpegVideoDecoder::receive_coded_data(AK::Duration timestamp, AK::Duration duration, ReadonlyBytes coded_data, Optional<AK::Duration> decode_timestamp)
+DecoderErrorOr<void> FFmpegVideoDecoder::receive_coded_data(CodedFrame const& coded_frame, DecodeIntent intent)
 {
+    auto coded_data = coded_frame.data();
     VERIFY(coded_data.size() < NumericLimits<int>::max());
 
+    auto key = m_next_frame_key++;
     m_packet->data = const_cast<u8*>(coded_data.data());
     m_packet->size = static_cast<int>(coded_data.size());
-    m_packet->pts = timestamp.to_microseconds();
-    m_packet->dts = decode_timestamp.value_or(timestamp).to_microseconds();
-    m_packet->duration = duration.to_microseconds();
-    auto packet_pts = m_packet->pts;
+    m_packet->pts = static_cast<i64>(key);
+    m_packet->dts = AV_NOPTS_VALUE;
 
-    auto result = avcodec_send_packet(m_codec_context, m_packet);
+    if (m_frames_in_flight.size() >= MAXIMUM_FRAMES_IN_FLIGHT) {
+        auto stale_frame_count = m_frames_in_flight.size();
+        m_frames_in_flight.remove_all_matching([&](u64 in_flight_key, auto const&) { return in_flight_key + MAXIMUM_FRAMES_IN_FLIGHT <= key; });
+        stale_frame_count -= m_frames_in_flight.size();
+        if (stale_frame_count > 0)
+            dbgln("FFmpegVideoDecoder: {} frames were never output", stale_frame_count);
+    }
+    DECODER_TRY_ALLOC(m_frames_in_flight.try_set(key, { coded_frame.presentation_timestamp(), coded_frame.duration(), intent }));
+
+    ScopeGuard clear_packet_side_data { [&] { m_functions.av_packet_free_side_data(m_packet); } };
+    auto new_codec_configuration = coded_frame.new_codec_configuration();
+    if (new_codec_configuration.has_value() && !new_codec_configuration->is_empty())
+        TRY(add_new_extradata_to_packet(m_functions, *m_packet, *new_codec_configuration));
+
+    auto result = m_functions.avcodec_send_packet(m_codec_context, m_packet);
     switch (result) {
     case 0:
-        // Some FFmpeg decoders do not propagate packet duration to decoded frames, so
-        // remember the accepted packet duration by PTS and consume it on output.
-        if (!duration.is_zero())
-            m_frame_durations.set(packet_pts, duration);
         return {};
     case AVERROR(EAGAIN):
-        return DecoderError::with_description(DecoderErrorCategory::NeedsMoreInput, "FFmpeg decoder cannot decode any more data until frames have been retrieved"sv);
+        return DecoderError::with_description(DecoderErrorCategory::TryAgain, "FFmpeg decoder cannot decode any more data until frames have been retrieved"sv);
     case AVERROR_EOF:
         return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "FFmpeg decoder has been flushed"sv);
     case AVERROR(EINVAL):
@@ -143,27 +146,27 @@ void FFmpegVideoDecoder::signal_end_of_stream()
     m_packet->pts = 0;
     m_packet->dts = 0;
 
-    auto result = avcodec_send_packet(m_codec_context, m_packet);
+    auto result = m_functions.avcodec_send_packet(m_codec_context, m_packet);
     VERIFY(result == 0 || result == AVERROR_EOF);
 }
 
-DecoderErrorOr<VideoFrameMetadata> FFmpegVideoDecoder::peek_next_output(CodingIndependentCodePoints const& container_cicp)
+DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVideoDecoder::take_next_output(CodingIndependentCodePoints const& container_cicp, [[maybe_unused]] Optional<AK::Duration> target)
 {
-    if (!m_has_pending_frame) {
-        auto result = avcodec_receive_frame(m_codec_context, m_frame);
+    while (!m_pending_frame.has_value()) {
+        auto result = m_functions.avcodec_receive_frame(m_codec_context, m_frame);
 
         switch (result) {
-        case 0:
-            m_has_pending_frame = true;
-            // Some FFmpeg decoders do not propagate packet duration to decoded frames, so fill the
-            // frame's duration from the map once here, keeping repeated peeks of this frame stable.
-            if (m_frame->duration == 0) {
-                if (auto packet_duration = m_frame_durations.take(m_frame->pts); packet_duration.has_value())
-                    m_frame->duration = packet_duration->to_microseconds();
-            } else {
-                m_frame_durations.remove(m_frame->pts);
+        case 0: {
+            auto in_flight_frame = m_frames_in_flight.take(static_cast<u64>(m_frame->pts));
+            if (!in_flight_frame.has_value()) {
+                dbgln("FFmpegVideoDecoder: Dropping a frame whose timing was forgotten");
+                continue;
             }
+            if (in_flight_frame->intent == DecodeIntent::Reference)
+                continue;
+            m_pending_frame = in_flight_frame.release_value();
             break;
+        }
         case AVERROR(EAGAIN):
             return DecoderError::with_description(DecoderErrorCategory::NeedsMoreInput, "FFmpeg decoder has no frames available, send more input"sv);
         case AVERROR_EOF:
@@ -175,11 +178,11 @@ DecoderErrorOr<VideoFrameMetadata> FFmpegVideoDecoder::peek_next_output(CodingIn
         }
     }
 
-    auto color_primaries = static_cast<ColorPrimaries>(m_frame->color_primaries);
-    auto transfer_characteristics = static_cast<TransferCharacteristics>(m_frame->color_trc);
-    auto matrix_coefficients = static_cast<MatrixCoefficients>(m_frame->colorspace);
+    auto color_primaries = static_cast<ColorPrimaries>(codec_context_option("color_primaries"));
+    auto transfer_characteristics = static_cast<TransferCharacteristics>(codec_context_option("color_trc"));
+    auto matrix_coefficients = static_cast<MatrixCoefficients>(codec_context_option("colorspace"));
     auto color_range = [&] {
-        switch (m_frame->color_range) {
+        switch (codec_context_option("color_range")) {
         case AVColorRange::AVCOL_RANGE_MPEG:
             return VideoFullRangeFlag::Studio;
         case AVColorRange::AVCOL_RANGE_JPEG:
@@ -188,11 +191,12 @@ DecoderErrorOr<VideoFrameMetadata> FFmpegVideoDecoder::peek_next_output(CodingIn
             return VideoFullRangeFlag::Unspecified;
         }
     }();
-    auto cicp = CodingIndependentCodePoints { color_primaries, transfer_characteristics, matrix_coefficients, color_range };
-    cicp.adopt_specified_values(container_cicp);
+    auto cicp = container_cicp;
+    cicp.adopt_specified_values({ color_primaries, transfer_characteristics, matrix_coefficients, color_range });
 
-    auto bit_depth = [&] {
-        switch (m_frame->format) {
+    auto pixel_format = static_cast<AVPixelFormat>(m_frame->format);
+    auto bit_depth = [&]() -> Optional<u8> {
+        switch (pixel_format) {
         case AV_PIX_FMT_YUV420P:
         case AV_PIX_FMT_YUV422P:
         case AV_PIX_FMT_YUV444P:
@@ -209,47 +213,57 @@ DecoderErrorOr<VideoFrameMetadata> FFmpegVideoDecoder::peek_next_output(CodingIn
         case AV_PIX_FMT_YUV444P12:
             return 12;
         default:
-            VERIFY_NOT_REACHED();
+            return {};
         }
     }();
+    if (!bit_depth.has_value())
+        return DecoderError::format(DecoderErrorCategory::NotImplemented, "FFmpeg decoder produced an unsupported pixel format {}", to_underlying(pixel_format));
 
-    auto subsampling = [&]() -> Subsampling {
-        switch (m_frame->format) {
+    auto subsampling = [&] {
+        switch (pixel_format) {
         case AV_PIX_FMT_YUV420P:
         case AV_PIX_FMT_YUV420P10:
         case AV_PIX_FMT_YUV420P12:
         case AV_PIX_FMT_YUVJ420P:
-            return { true, true };
+            return Subsampling::yuv420();
         case AV_PIX_FMT_YUV422P:
         case AV_PIX_FMT_YUV422P10:
         case AV_PIX_FMT_YUV422P12:
         case AV_PIX_FMT_YUVJ422P:
-            return { true, false };
-        case AV_PIX_FMT_YUV444P:
-        case AV_PIX_FMT_YUV444P10:
-        case AV_PIX_FMT_YUV444P12:
-        case AV_PIX_FMT_YUVJ444P:
-            return { false, false };
+            return Subsampling::yuv422();
         default:
-            VERIFY_NOT_REACHED();
+            return Subsampling::yuv444();
         }
     }();
 
-    return VideoFrameMetadata {
-        .timestamp = AK::Duration::from_microseconds(m_frame->pts),
-        .duration = AK::Duration::from_microseconds(m_frame->duration),
-        .size = { m_frame->width, m_frame->height },
-        .bit_depth = static_cast<u8>(bit_depth),
-        .subsampling = subsampling,
-        .cicp = cicp,
-    };
+    Gfx::IntSize size { m_frame->width, m_frame->height };
+    auto layout_result = frame_plane_layout(size, *bit_depth, subsampling);
+    if (layout_result.is_error())
+        return DecoderError::format(DecoderErrorCategory::Invalid, "Failed to compute video frame plane layout: {}", layout_result.release_error());
+    auto layout = layout_result.release_value();
+
+    auto acquired_slot = m_frame_pool->try_acquire(layout.total_byte_count);
+    if (!acquired_slot.has_value())
+        return DecoderError::with_description(DecoderErrorCategory::TryAgain, "Every video frame slot is held elsewhere"sv);
+
+    auto pool_slot_result = m_frame_pool->try_adopt_acquired_slot(*acquired_slot);
+    if (pool_slot_result.is_error())
+        return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate a pooled frame slot reference"sv);
+    auto pool_slot = pool_slot_result.release_value();
+
+    auto yuv_data = DECODER_TRY_ALLOC(Gfx::YUVData::create(size, *bit_depth, subsampling, cicp,
+        acquired_slot->bytes.slice(0, layout.y_size),
+        acquired_slot->bytes.slice(layout.u_offset, layout.u_size),
+        acquired_slot->bytes.slice(layout.v_offset, layout.v_size)));
+    TRY(copy_pending_frame_into(yuv_data));
+
+    auto frame = DECODER_TRY_ALLOC(try_make_ref_counted<VideoFrame>(m_pending_frame->timestamp, m_pending_frame->duration, size.to_type<u32>(), *bit_depth, subsampling, cicp, move(pool_slot)));
+    m_pending_frame.clear();
+    return frame;
 }
 
-DecoderErrorOr<void> FFmpegVideoDecoder::take_next_output_into(Gfx::YUVData& yuv_data)
+DecoderErrorOr<void> FFmpegVideoDecoder::copy_pending_frame_into(Gfx::YUVData& yuv_data)
 {
-    VERIFY(m_has_pending_frame);
-    m_has_pending_frame = false;
-
     auto size = Gfx::Size<u32> { m_frame->width, m_frame->height };
     auto y_plane_size = size.to_type<size_t>();
     auto uv_plane_size = yuv_data.subsampling().subsampled_size(size).to_type<size_t>();
@@ -284,11 +298,18 @@ DecoderErrorOr<void> FFmpegVideoDecoder::take_next_output_into(Gfx::YUVData& yuv
     return {};
 }
 
+i64 FFmpegVideoDecoder::codec_context_option(char const* name) const
+{
+    i64 value = 0;
+    VERIFY(m_functions.av_opt_get_int(m_codec_context, name, 0, &value) == 0);
+    return value;
+}
+
 void FFmpegVideoDecoder::flush()
 {
-    m_frame_durations.clear();
-    avcodec_flush_buffers(m_codec_context);
-    m_has_pending_frame = false;
+    m_functions.avcodec_flush_buffers(m_codec_context);
+    m_pending_frame.clear();
+    m_frames_in_flight.clear();
 }
 
 }

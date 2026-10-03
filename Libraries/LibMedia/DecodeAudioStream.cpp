@@ -5,12 +5,15 @@
  */
 
 #include <AK/Checked.h>
+#include <AK/OwnPtr.h>
 #include <LibMedia/AudioBlock.h>
+#include <LibMedia/AudioDecoder.h>
+#include <LibMedia/CodedFrame.h>
 #include <LibMedia/DecodeAudioStream.h>
+#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Demuxer.h>
+#include <LibMedia/DemuxerRegistry.h>
 #include <LibMedia/FFmpeg/FFmpegAudioConverter.h>
-#include <LibMedia/FFmpeg/FFmpegAudioDecoder.h>
-#include <LibMedia/PlaybackManager.h>
 #include <LibMedia/Track.h>
 
 namespace Media {
@@ -48,7 +51,7 @@ static DecoderErrorOr<void> append_block_samples(AudioBlock const& block, Decode
 // changes mid-stream come out uniform.
 DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaStream> const& stream, Optional<u32> output_sample_rate)
 {
-    auto demuxer = TRY(PlaybackManager::create_demuxer_for_stream(stream));
+    auto demuxer = TRY(create_demuxer(stream));
     auto track = TRY(demuxer->get_preferred_track_for_type(TrackType::Audio));
     if (!track.has_value()) {
         // NB: Not all containers mark a default track; fall back to the first audio track in that case.
@@ -59,9 +62,7 @@ DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaS
     }
     TRY(demuxer->create_context_for_track(*track));
 
-    auto codec_id = TRY(demuxer->get_codec_id_for_track(*track));
-    auto codec_initialization_data = TRY(demuxer->get_codec_initialization_data_for_track(*track));
-    auto decoder = TRY(FFmpeg::FFmpegAudioDecoder::try_create(codec_id, track->audio_data().sample_specification, codec_initialization_data));
+    OwnPtr<AudioDecoder> decoder;
     auto converter = DECODER_TRY_ALLOC(FFmpeg::FFmpegAudioConverter::try_create());
 
     DecodedAudioData data;
@@ -101,17 +102,40 @@ DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaS
         }
     };
 
+    // Streams often carry stray bytes after their last frame: container padding, an encoder's alignment, or whatever
+    // a producer left behind when it sized a buffer generously. The decoder reports those as corrupt data, but the
+    // audio ahead of them is perfectly good, so once a stream has produced samples we treat undecodable data as the
+    // end of the audio rather than discarding everything decoded so far.
+    auto is_trailing_data = [&data](DecoderError const& error) {
+        return error.category() == DecoderErrorCategory::Corrupted && data.sample_specification.is_valid();
+    };
+
     AudioBlock block;
     auto end_of_stream_reached = false;
     while (!end_of_stream_reached) {
         auto sample_result = demuxer->get_next_sample_for_track(*track);
         if (sample_result.is_error()) {
-            if (sample_result.error().category() != DecoderErrorCategory::EndOfStream)
+            if (sample_result.error().category() != DecoderErrorCategory::EndOfStream && !is_trailing_data(sample_result.error()))
                 return sample_result.release_error();
+            if (!decoder)
+                break;
             decoder->signal_end_of_stream();
         } else {
             auto sample = sample_result.release_value();
-            TRY(decoder->receive_coded_data(sample.timestamp(), sample.data()));
+            if (!decoder) {
+                auto codec_initialization_data = sample.new_codec_configuration();
+                if (!codec_initialization_data.has_value())
+                    return DecoderError::with_description(DecoderErrorCategory::Corrupted, "Coded frame starting a decode sequence carries no codec configuration"sv);
+                auto selection = select_audio_decoder(parsed_codec_for_coded_frame(sample, track->parsed_codec()));
+                if (!selection.has_value())
+                    return DecoderError::format(DecoderErrorCategory::NotImplemented, "Could not find an audio decoder for codec {}", sample.codec_id());
+                decoder = TRY(create_audio_decoder(selection, sample.codec_id(), track->audio_data().sample_specification, *codec_initialization_data));
+            }
+            if (auto result = decoder->receive_coded_data(sample); result.is_error()) {
+                if (!is_trailing_data(result.error()))
+                    return result.release_error();
+                decoder->signal_end_of_stream();
+            }
         }
 
         while (true) {
@@ -119,7 +143,7 @@ DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaS
             if (block_result.is_error()) {
                 if (block_result.error().category() == DecoderErrorCategory::NeedsMoreInput)
                     break;
-                if (block_result.error().category() == DecoderErrorCategory::EndOfStream) {
+                if (block_result.error().category() == DecoderErrorCategory::EndOfStream || is_trailing_data(block_result.error())) {
                     end_of_stream_reached = true;
                     break;
                 }

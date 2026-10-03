@@ -23,10 +23,7 @@ class AnimatedBitmapDecodedImageData final : public AnimatedDecodedImageData {
     friend class Web::Internals::Internals;
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     static GC::Ref<AnimatedBitmapDecodedImageData> create(
-        JS::Realm&,
         DOM::Document&,
         i64 session_id,
         u32 frame_count,
@@ -47,7 +44,9 @@ public:
     virtual Optional<CSSPixels> intrinsic_height() const override;
     virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override;
 
-    virtual void paint(DisplayListRecordingContext&, Gfx::IntRect dst_rect, CSS::ImageRendering) const override;
+    virtual Optional<Gfx::Color> color_if_single_pixel_bitmap() const override;
+
+    virtual Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&) const override;
 
     void receive_frames(Vector<NonnullRefPtr<Gfx::Bitmap>>, u32 start_frame_index);
 

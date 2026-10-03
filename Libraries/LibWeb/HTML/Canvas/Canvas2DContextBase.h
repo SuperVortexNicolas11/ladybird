@@ -11,11 +11,11 @@
 #include <AK/Optional.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
+#include <LibCompositing/Types.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Path.h>
 #include <LibGfx/TextLayout.h>
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/Compositor/Types.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/HTML/Canvas/CanvasCompositing.h>
 #include <LibWeb/HTML/Canvas/CanvasDrawImage.h>
 #include <LibWeb/HTML/Canvas/CanvasDrawPath.h>
@@ -36,7 +36,7 @@
 namespace Web::HTML {
 
 class Canvas2DContextBase
-    : public Bindings::PlatformObject
+    : public Bindings::GCAllocatedWrappable
     , public CanvasPath
     , public CanvasState
     , public CanvasTransform
@@ -53,11 +53,9 @@ class Canvas2DContextBase
     , public CanvasSettings
     , public CanvasPathDrawingStyles {
 
-    WEB_NON_IDL_PLATFORM_OBJECT(Canvas2DContextBase, Bindings::PlatformObject);
+    WEB_NON_IDL_WRAPPABLE(Canvas2DContextBase, Bindings::GCAllocatedWrappable);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     virtual ~Canvas2DContextBase() override;
 
     // https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-origin-clean
@@ -76,8 +74,8 @@ public:
     virtual void fill_text(Utf16View, float x, float y, Optional<double> max_width) override;
     virtual void stroke_text(Utf16View, float x, float y, Optional<double> max_width) override;
 
-    virtual void fill(Utf16FlyString const& fill_rule) override;
-    virtual void fill(Path2D& path, Utf16FlyString const& fill_rule) override;
+    virtual void fill(Bindings::CanvasFillRule) override;
+    virtual void fill(Path2D& path, Bindings::CanvasFillRule) override;
 
     virtual WebIDL::ExceptionOr<GC::Ref<ImageData>> create_image_data(int width, int height, Optional<Bindings::ImageDataSettings> const& settings = {}) const override;
     virtual WebIDL::ExceptionOr<GC::Ref<ImageData>> create_image_data(ImageData const& image_data) const override;
@@ -92,11 +90,11 @@ public:
 
     virtual GC::Ref<TextMetrics> measure_text(Utf16View) override;
 
-    virtual void clip(Utf16FlyString const& fill_rule) override;
-    virtual void clip(Path2D& path, Utf16FlyString const& fill_rule) override;
+    virtual void clip(Bindings::CanvasFillRule) override;
+    virtual void clip(Path2D& path, Bindings::CanvasFillRule) override;
 
-    virtual bool is_point_in_path(double x, double y, Utf16FlyString const& fill_rule) override;
-    virtual bool is_point_in_path(Path2D const& path, double x, double y, Utf16FlyString const& fill_rule) override;
+    virtual bool is_point_in_path(double x, double y, Bindings::CanvasFillRule) override;
+    virtual bool is_point_in_path(Path2D const& path, double x, double y, Bindings::CanvasFillRule) override;
 
     virtual bool image_smoothing_enabled() const override;
     virtual void set_image_smoothing_enabled(bool) override;
@@ -130,7 +128,7 @@ public:
 
     void notify_backing_storage_lost();
 
-    Optional<Painting::CanvasId> canvas_id() const;
+    Optional<Compositing::CanvasId> canvas_id() const;
 
     RefPtr<Gfx::Bitmap> read_pixels(Gfx::IntRect const&);
 
@@ -140,9 +138,11 @@ protected:
     virtual void finalize() override;
     virtual void visit_edges(Cell::Visitor&) override;
     virtual size_t external_memory_size() const override;
+    virtual GC::Ptr<Bindings::Wrappable> relevant_global_impl() const override;
 
     [[nodiscard]] Gfx::CanvasCommandList* canvas_command_list() override;
     JS::Realm& my_realm() override { return realm(); }
+    JS::Realm& realm() const { return *m_realm; }
     Gfx::Path& mutable_path() override { return path(); }
 
     struct PreparedText {
@@ -158,6 +158,7 @@ protected:
     PreparedText prepare_text(Utf16View, float max_width = INFINITY);
 
     [[nodiscard]] Gfx::Path rect_path(float x, float y, float width, float height);
+    Gfx::AffineTransform text_transform(float text_width, Optional<double> max_width);
     [[nodiscard]] Gfx::Path text_path(Utf16View, float x, float y, Optional<double> max_width);
 
     Gfx::Color clear_color() const;
@@ -172,29 +173,16 @@ protected:
 
     bool has_backing_storage() const { return m_transport != nullptr; }
 
-    // Marks the owning canvas as needing repaint/commit after a draw was recorded.
-    virtual void did_draw_hook() = 0;
-
-    // Page whose compositor host provides the remote canvas transport; null when unavailable.
-    virtual Page* page_for_compositor() = 0;
-
-    // Invoked right after the remote context is (re)created.
-    virtual void backing_storage_created_hook() { }
-
-    // Target for contextlost/contextrestored events.
-    virtual DOM::EventTarget& context_event_target() = 0;
-
-    // Style-resolved color for a drop-shadow() canvas filter; element canvases resolve
-    // against their computed style, offscreen canvases have no style context.
-    virtual Gfx::Color resolve_drop_shadow_color(CSS::DropShadowFilterStyleValue const&) const = 0;
-
     RefPtr<RemoteCanvas2DTransport> m_transport;
+    RefPtr<Gfx::Bitmap> m_cached_readback;
+    Gfx::IntRect m_cached_readback_rect;
 
     // https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-origin-clean
     bool m_origin_clean { true };
 
     Gfx::IntSize m_size;
     Bindings::CanvasRenderingContext2DSettings m_context_attributes;
+    GC::Ref<JS::Realm> m_realm;
 };
 
 enum class CanvasImageSourceUsability {

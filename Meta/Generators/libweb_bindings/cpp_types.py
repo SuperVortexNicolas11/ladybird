@@ -96,6 +96,11 @@ def idl_implementation_cpp_name(identifier: IDLNamed) -> str:
     return identifier.extended_attributes.get("ImplementedAs", idl_identifier_cpp_name(identifier))
 
 
+def static_utf16_fly_string(variable_name: str, string: str) -> str:
+    # Names longer than a short string would otherwise be interned again every time the generated code runs.
+    return f'static auto const& {variable_name} = *new Utf16FlyString("{string}"_utf16_fly_string);'
+
+
 def is_optional_without_default(member: DictionaryMemberOrAttribute) -> bool:
     return isinstance(member, DictionaryMember) and not member.required and member.default_value is None
 
@@ -118,16 +123,20 @@ def is_numeric_type(type_name: str) -> bool:
 
 
 def is_string_type(type_name: str) -> bool:
-    return type_name in ("DOMString", "USVString", "ByteString", "Utf16DOMString", "Utf16USVString")
+    return type_name in (
+        "CSSOMString",
+        "DOMString",
+        "USVString",
+        "ByteString",
+    )
 
 
 def cpp_type_name_for_string(type_name: str, extended_attributes: Optional[dict[str, str]] = None) -> str:
-    is_fly_string = extended_attributes is not None and (
-        "FlyString" in extended_attributes or "Utf16FlyString" in extended_attributes
-    )
-    if type_name in ("DOMString", "USVString", "Utf16DOMString", "Utf16USVString"):
-        return "Utf16FlyString" if is_fly_string else "Utf16String"
-    return "FlyString" if is_fly_string else "String"
+    if type_name == "ByteString":
+        return "String"
+
+    is_fly_string = extended_attributes is not None and "FlyString" in extended_attributes
+    return "Utf16FlyString" if is_fly_string else "Utf16String"
 
 
 def add_include_for_string_cpp_type(cpp_type_name: str, includes: GeneratedIncludes) -> None:
@@ -491,7 +500,7 @@ def add_header_includes_for_idl_type(
         "long long",
         "unsigned long long",
     ):
-        includes.add("LibWeb/WebIDL/Types.h")
+        includes.add("LibWebCommon/WebIDL/Types.h")
         return
     if is_string_type(type_name):
         add_include_for_string_cpp_type(cpp_type_name_for_string(type_name), includes)
@@ -564,6 +573,9 @@ def add_binding_include_for_type(idl_type: IDLType, includes: GeneratedIncludes,
 
     dictionary = context.dictionary(idl_type)
     if dictionary is not None:
+        if dictionary.name == "StructuredSerializeOptions":
+            includes.add("LibWeb/Bindings/MessagePort.h")
+            return
         includes.add_binding(dictionary.path.stem)
         return
 

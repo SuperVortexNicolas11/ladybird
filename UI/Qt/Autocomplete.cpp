@@ -6,8 +6,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Base64.h>
 #include <AK/Platform.h>
+#include <AK/kmalloc.h>
 #include <LibWebView/Autocomplete.h>
 #include <UI/Qt/Autocomplete.h>
 #include <UI/Qt/ChromeStyle.h>
@@ -32,6 +32,7 @@
 #include <QTextLayout>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QWindow>
 
 namespace Ladybird {
 
@@ -43,6 +44,7 @@ static constexpr int CELL_ICON_TEXT_SPACING = 10;
 static constexpr int CELL_LABEL_VERTICAL_SPACING = 4;
 static constexpr int MINIMUM_POPUP_WIDTH = 100;
 static constexpr size_t MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS = 6;
+static constexpr u32 WAYLAND_POPUP_CONSTRAINT_ADJUSTMENT_NONE = 0;
 
 enum AutocompleteRole {
     TitleRole = Qt::UserRole + 1,
@@ -123,6 +125,8 @@ static QColor autocomplete_selection_fill(QPalette const& palette)
 
 class AutocompleteModel final : public QAbstractListModel {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit AutocompleteModel(QObject* parent)
         : QAbstractListModel(parent)
     {
@@ -136,14 +140,10 @@ public:
 
         for (size_t index = 0; index < m_suggestions.size(); ++index) {
             auto const& suggestion = m_suggestions[index];
-            if (!suggestion.favicon_base64_png.has_value())
+            if (!suggestion.favicon_png.has_value())
                 continue;
-            auto decoded = decode_base64(*suggestion.favicon_base64_png);
-            if (decoded.is_error())
-                continue;
-            auto bytes = decoded.release_value();
             QPixmap pixmap;
-            if (!pixmap.loadFromData(reinterpret_cast<uchar const*>(bytes.data()), static_cast<uint>(bytes.size())))
+            if (!pixmap.loadFromData(suggestion.favicon_png->data(), static_cast<uint>(suggestion.favicon_png->size())))
                 continue;
             m_favicon_cache.append({ index, QIcon(pixmap) });
         }
@@ -226,6 +226,8 @@ private:
 
 class AutocompleteDelegate final : public QStyledItemDelegate {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     using QStyledItemDelegate::QStyledItemDelegate;
 
     QSize sizeHint(QStyleOptionViewItem const&, QModelIndex const& index) const override
@@ -519,6 +521,12 @@ void Autocomplete::position_popup()
         m_popup->setParent(top_window, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
         m_popup->setAttribute(Qt::WA_ShowWithoutActivating);
         m_popup->setAttribute(Qt::WA_X11DoNotAcceptFocus);
+    }
+
+    if (QGuiApplication::platformName() == "wayland") {
+        // FIXME: Replace this with a public popup positioning API once Qt provides one.
+        (void)m_popup->winId();
+        m_popup->windowHandle()->setProperty("_q_waylandPopupConstraintAdjustment", WAYLAND_POPUP_CONSTRAINT_ADJUSTMENT_NONE);
     }
 
     int width = std::max(m_anchor->width(), MINIMUM_POPUP_WIDTH);

@@ -256,7 +256,8 @@ static void install_compiled_fault_handlers()
     s_installed = true;
     struct sigaction action {};
     action.sa_sigaction = compiled_fault_signal_handler;
-    action.sa_flags = SA_SIGINFO;
+    // Preserve alternate-stack crash handling when forwarding non-Wasm faults.
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&action.sa_mask);
     sigaction(SIGSEGV, &action, &s_old_sigsegv);
     sigaction(SIGBUS, &action, &s_old_sigbus);
@@ -415,7 +416,9 @@ void BytecodeInterpreter::interpret(Configuration& configuration)
     bool const may_run_native = native_entry != 0 || expression.compiled_instructions.has_tier_up_checkpoints;
     CompiledFaultRecoveryContext compiled_fault_recovery;
     bool did_install_compiled_fault_recovery = false;
-    if (may_run_native && !s_compiled_fault_recovery) {
+    if (may_run_native) {
+        // A host function can reenter Wasm with a different configuration (and therefore a different memory).
+        // Keep the innermost configuration active so its compiled faults are classified and recovered correctly.
         install_compiled_fault_handlers();
         compiled_fault_recovery.interpreter = this;
         compiled_fault_recovery.configuration = &configuration;
@@ -2893,6 +2896,219 @@ HANDLE_INSTRUCTION(memory_grow)
         entry = is_address32 ? Value(static_cast<i32>(old_pages)) : Value(static_cast<i64>(old_pages));
     else
         entry = is_address32 ? Value(static_cast<i32>(-1)) : Value(static_cast<i64>(-1));
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// Proposal "threads"
+struct AtomicAccess {
+    MemoryInstance* memory;
+    u64 address;
+};
+
+static ALWAYS_INLINE Optional<AtomicAccess> resolve_atomic_access(BytecodeInterpreter& interpreter, Configuration& configuration, Instruction::MemoryArgument const& arg, Value const& base_value, size_t access_size)
+{
+    auto const& memory_address = configuration.frame().module().memories().data()[arg.memory_index.value()];
+    auto* memory = configuration.store().unsafe_get(memory_address);
+    Checked<u64> address { memory_base_address(*memory, base_value) };
+    address += arg.offset;
+    Checked<u64> end_address { address };
+    end_address += access_size;
+    if (end_address.has_overflow() || end_address.value() > memory->size()) [[unlikely]] {
+        interpreter.set_trap("Memory access out of bounds"sv);
+        return {};
+    }
+    if (address.value() % access_size != 0) [[unlikely]] {
+        interpreter.set_trap("Unaligned atomic memory access"sv);
+        return {};
+    }
+    return AtomicAccess { memory, address.value() };
+}
+
+template<typename Callback>
+static ALWAYS_INLINE bool dispatch_atomic_width(Instruction::AtomicMemoryArgument::Width width, Callback&& callback)
+{
+    using Width = Instruction::AtomicMemoryArgument::Width;
+    switch (width) {
+    case Width::I32:
+        return callback.template operator()<u32, u32>();
+    case Width::I64:
+        return callback.template operator()<u64, u64>();
+    case Width::I8As32:
+        return callback.template operator()<u8, u32>();
+    case Width::I16As32:
+        return callback.template operator()<u16, u32>();
+    case Width::I8As64:
+        return callback.template operator()<u8, u64>();
+    case Width::I16As64:
+        return callback.template operator()<u16, u64>();
+    case Width::I32As64:
+        return callback.template operator()<u32, u64>();
+    }
+    VERIFY_NOT_REACHED();
+}
+
+HANDLE_INSTRUCTION(atomic_load)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto const& arg = instruction->arguments().unsafe_get<Instruction::AtomicMemoryArgument>();
+    auto& entry = configuration.source_value<SourceAddressMix::Any>(0, addresses.sources); // bounds checked by verifier.
+    auto trapped = dispatch_atomic_width(arg.width, [&]<typename MemoryType, typename StackType>() {
+        auto access = resolve_atomic_access(interpreter, configuration, arg.memory, entry, sizeof(MemoryType));
+        if (!access.has_value())
+            return true;
+        auto value = interpreter.read_value<MemoryType>({ access->memory->data().offset_pointer(access->address), sizeof(MemoryType) });
+        entry = Value(static_cast<StackType>(value));
+        return false;
+    });
+    if (trapped)
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(atomic_store)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto const& arg = instruction->arguments().unsafe_get<Instruction::AtomicMemoryArgument>();
+    auto value = configuration.take_source<SourceAddressMix::Any>(0, addresses.sources); // bounds checked by verifier.
+    auto base = configuration.take_source<SourceAddressMix::Any>(1, addresses.sources);  // bounds checked by verifier.
+    auto trapped = dispatch_atomic_width(arg.width, [&]<typename MemoryType, typename StackType>() {
+        auto access = resolve_atomic_access(interpreter, configuration, arg.memory, base, sizeof(MemoryType));
+        if (!access.has_value())
+            return true;
+        auto stored_value = static_cast<MemoryType>(value.to<StackType>());
+        access->memory->data().overwrite(access->address, &stored_value, sizeof(MemoryType));
+        return false;
+    });
+    if (trapped)
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(atomic_rmw)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    using Op = Instruction::AtomicMemoryArgument::Op;
+    auto const& arg = instruction->arguments().unsafe_get<Instruction::AtomicMemoryArgument>();
+    auto operand = configuration.take_source<SourceAddressMix::Any>(0, addresses.sources); // bounds checked by verifier.
+    auto& entry = configuration.source_value<SourceAddressMix::Any>(1, addresses.sources); // bounds checked by verifier.
+    auto trapped = dispatch_atomic_width(arg.width, [&]<typename MemoryType, typename StackType>() {
+        auto access = resolve_atomic_access(interpreter, configuration, arg.memory, entry, sizeof(MemoryType));
+        if (!access.has_value())
+            return true;
+        auto old_value = interpreter.read_value<MemoryType>({ access->memory->data().offset_pointer(access->address), sizeof(MemoryType) });
+        auto rhs = static_cast<MemoryType>(operand.to<StackType>());
+        MemoryType new_value;
+        switch (arg.op) {
+        case Op::Add:
+            new_value = old_value + rhs;
+            break;
+        case Op::Sub:
+            new_value = old_value - rhs;
+            break;
+        case Op::And:
+            new_value = old_value & rhs;
+            break;
+        case Op::Or:
+            new_value = old_value | rhs;
+            break;
+        case Op::Xor:
+            new_value = old_value ^ rhs;
+            break;
+        case Op::Xchg:
+            new_value = rhs;
+            break;
+        case Op::None:
+            VERIFY_NOT_REACHED();
+        }
+        access->memory->data().overwrite(access->address, &new_value, sizeof(MemoryType));
+        entry = Value(static_cast<StackType>(old_value));
+        return false;
+    });
+    if (trapped)
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(atomic_rmw_cmpxchg)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto const& arg = instruction->arguments().unsafe_get<Instruction::AtomicMemoryArgument>();
+    auto replacement = configuration.take_source<SourceAddressMix::Any>(0, addresses.sources); // bounds checked by verifier.
+    auto expected = configuration.take_source<SourceAddressMix::Any>(1, addresses.sources);    // bounds checked by verifier.
+    auto& entry = configuration.source_value<SourceAddressMix::Any>(2, addresses.sources);     // bounds checked by verifier.
+    auto trapped = dispatch_atomic_width(arg.width, [&]<typename MemoryType, typename StackType>() {
+        auto access = resolve_atomic_access(interpreter, configuration, arg.memory, entry, sizeof(MemoryType));
+        if (!access.has_value())
+            return true;
+        auto old_value = interpreter.read_value<MemoryType>({ access->memory->data().offset_pointer(access->address), sizeof(MemoryType) });
+        // The comparison is done at the width of the memory access, so the expected value is wrapped.
+        if (old_value == static_cast<MemoryType>(expected.to<StackType>())) {
+            auto new_value = static_cast<MemoryType>(replacement.to<StackType>());
+            access->memory->data().overwrite(access->address, &new_value, sizeof(MemoryType));
+        }
+        entry = Value(static_cast<StackType>(old_value));
+        return false;
+    });
+    if (trapped)
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(memory_atomic_notify)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto const& arg = instruction->arguments().unsafe_get<Instruction::MemoryArgument>();
+    (void)configuration.take_source<SourceAddressMix::Any>(0, addresses.sources);          // count, bounds checked by verifier.
+    auto& entry = configuration.source_value<SourceAddressMix::Any>(1, addresses.sources); // bounds checked by verifier.
+    auto access = resolve_atomic_access(interpreter, configuration, arg, entry, sizeof(i32));
+    if (!access.has_value())
+        return Outcome::Return;
+    // Nothing can be waiting on a non-shared memory, so there is never anything to wake up.
+    entry = Value(static_cast<i32>(0));
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(memory_atomic_wait32)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto const& arg = instruction->arguments().unsafe_get<Instruction::MemoryArgument>();
+    (void)configuration.take_source<SourceAddressMix::Any>(0, addresses.sources);          // timeout, bounds checked by verifier.
+    (void)configuration.take_source<SourceAddressMix::Any>(1, addresses.sources);          // expected, bounds checked by verifier.
+    auto& entry = configuration.source_value<SourceAddressMix::Any>(2, addresses.sources); // bounds checked by verifier.
+    auto access = resolve_atomic_access(interpreter, configuration, arg, entry, sizeof(i32));
+    if (!access.has_value())
+        return Outcome::Return;
+    // Waiting on a non-shared memory always traps.
+    interpreter.set_trap("Expected shared memory"sv);
+    return Outcome::Return;
+}
+
+HANDLE_INSTRUCTION(memory_atomic_wait64)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto const& arg = instruction->arguments().unsafe_get<Instruction::MemoryArgument>();
+    (void)configuration.take_source<SourceAddressMix::Any>(0, addresses.sources);          // timeout, bounds checked by verifier.
+    (void)configuration.take_source<SourceAddressMix::Any>(1, addresses.sources);          // expected, bounds checked by verifier.
+    auto& entry = configuration.source_value<SourceAddressMix::Any>(2, addresses.sources); // bounds checked by verifier.
+    auto access = resolve_atomic_access(interpreter, configuration, arg, entry, sizeof(i64));
+    if (!access.has_value())
+        return Outcome::Return;
+    // Waiting on a non-shared memory always traps.
+    interpreter.set_trap("Expected shared memory"sv);
+    return Outcome::Return;
+}
+
+HANDLE_INSTRUCTION(atomic_fence)
+{
+    LOG_INSN;
+    // There is nothing to synchronize with in a single-threaded store.
     TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
 }
 
@@ -7127,6 +7343,19 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
         }
     }
 
+    {
+        size_t depth = 0;
+        size_t max_depth = 0;
+        for (auto const* instruction_ptr : expanded) {
+            auto op = instruction_ptr->opcode();
+            if (first_is_one_of(op, Instructions::block, Instructions::loop, Instructions::if_, Instructions::try_table))
+                max_depth = max(max_depth, ++depth);
+            else if (op == Instructions::structured_end && depth > 0)
+                --depth;
+        }
+        result.max_label_depth = static_cast<u32>(max_depth + 1);
+    }
+
     for (auto const* instruction_ptr : expanded) {
         auto& instruction = *instruction_ptr;
         if (instruction.opcode() == Instructions::call) {
@@ -7669,7 +7898,6 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
     struct Value {
         ValueID id;
         IP definition_index;
-        Vector<IP> uses;
         IP last_use = 0;
         bool was_created_as_a_result_of_polymorphic_stack = false;
     };
@@ -7685,11 +7913,9 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
     ValueID next_value_id = 0;
     HashMap<IP, ValueID> instr_to_output_value;
     HashMap<IP, Vector<ValueID>> instr_to_input_values;
-    HashMap<IP, Vector<ValueID>> instr_to_dependent_values;
 
     instr_to_output_value.ensure_capacity(result.dispatches.size());
     instr_to_input_values.ensure_capacity(result.dispatches.size());
-    instr_to_dependent_values.ensure_capacity(result.dispatches.size());
 
     Vector<ValueID> forced_stack_values;
 
@@ -7697,17 +7923,11 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
     Vector<ValueID> rank;        // rank[id] -> rank of the tree rooted at id
     Vector<ValueID> final_roots; // final_roots[id] -> the final root parent of id
 
+    // OPTIMIZATION: Append alias entries so the tables grow geometrically as values are introduced.
     auto ensure_id_space = [&](ValueID id) {
-        if (id >= parent.size()) {
-            size_t old_size = parent.size();
-            parent.resize_with_default_value(id.value() + 1, {});
-            rank.resize_with_default_value(id.value() + 1, {});
-            final_roots.resize_with_default_value(id.value() + 1, {});
-            for (size_t i = old_size; i <= id; ++i) {
-                parent[i] = i;
-                rank[i] = 0;
-                final_roots[i] = i;
-            }
+        while (parent.size() <= id.value()) {
+            parent.append(parent.size());
+            rank.append(0);
         }
     };
 
@@ -7738,9 +7958,6 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
 
     HashTable<ValueID> stack_forced_roots;
 
-    Vector<Vector<ValueID>> live_at_instr;
-    live_at_instr.resize(result.dispatches.size());
-
     // Track call record constraints
     HashMap<ValueID, u8> value_to_callrec_slot;
 
@@ -7760,7 +7977,6 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
         auto opcode = dispatch.instruction->opcode();
         size_t inputs = 0;
         size_t outputs = 0;
-        Vector<ValueID> dependent_ids;
 
         bool variadic_or_unknown = false;
         bool requires_aliased_destination = true;
@@ -7809,17 +8025,14 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
                     }
 
                     input_ids.append(input_value);
-                    dependent_ids.append(input_value);
-                    value.uses.append(i);
                     value.last_use = max(value.last_use, i);
                     forced_stack_values.append(input_value);
                 }
                 instr_to_input_values.set(i, input_ids);
-                instr_to_dependent_values.set(i, dependent_ids);
 
                 for (size_t j = 0; j < outputs; ++j) {
                     auto id = next_value_id++;
-                    values.set(id, Value { id, i, {}, i });
+                    values.set(id, Value { id, i, i });
                     value_stack.append(id);
                     instr_to_output_value.set(i, id);
                     ensure_id_space(id);
@@ -7879,9 +8092,7 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
         for (; j < inputs && !value_stack.is_empty(); ++j) {
             auto input_value = value_stack.take_last();
             input_ids.append(input_value);
-            dependent_ids.append(input_value);
             auto& value = values.get(input_value).value();
-            value.uses.append(i);
             value.last_use = max(value.last_use, i);
         }
 
@@ -7890,11 +8101,8 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
         if (variadic_or_unknown) {
             for (auto val : value_stack) {
                 auto& value = values.get(val).value();
-                value.uses.append(i);
                 value.last_use = max(value.last_use, i);
-                dependent_ids.append(val);
                 forced_stack_values.append(val);
-                live_at_instr[i].append(val);
             }
             value_stack.clear_with_capacity();
         }
@@ -7904,15 +8112,13 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
             for (; j < inputs && !value_stack.is_empty(); ++j) {
                 auto input_value = value_stack.take_last();
                 input_ids.append(input_value);
-                dependent_ids.append(input_value);
                 auto& value = values.get(input_value).value();
-                value.uses.append(i);
                 value.last_use = max(value.last_use, i);
             }
 
             for (; j < inputs; ++j) {
                 auto val_id = next_value_id++;
-                values.set(val_id, Value { val_id, i, {}, i, true });
+                values.set(val_id, Value { val_id, i, i, true });
                 input_ids.append(val_id);
                 forced_stack_values.append(val_id);
                 ensure_id_space(val_id);
@@ -7924,18 +8130,15 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
         for (size_t j = 0; j < inputs; ++j) {
             auto input_value = value_stack.take_last();
             input_ids.append(input_value);
-            dependent_ids.append(input_value);
             auto& value = values.get(input_value).value();
-            value.uses.append(i);
             value.last_use = max(value.last_use, i);
         }
         instr_to_input_values.set(i, input_ids);
-        instr_to_dependent_values.set(i, dependent_ids);
 
         ValueID output_id = NumericLimits<size_t>::max();
         for (size_t j = 0; j < outputs; ++j) {
             auto id = next_value_id++;
-            values.set(id, Value { id, i, {}, i });
+            values.set(id, Value { id, i, i });
             value_stack.append(id);
             instr_to_output_value.set(i, id);
             output_id = id;
@@ -7996,7 +8199,6 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
 
     // Greedily select non-conflicting calls in priority order
     Vector<CallInfo*> valid_calls;
-    HashTable<size_t> selected_indices;
     size_t max_call_record_size = 0;
 
     for (auto const& score : scored_calls) {
@@ -8019,7 +8221,6 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
 
         if (!conflicts) {
             valid_calls.append(&call_info);
-            selected_indices.set(score.index);
             max_call_record_size = max(max_call_record_size, call_info.param_count);
         }
     }
@@ -8049,6 +8250,7 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
 
     result.max_call_rec_size = max_call_record_size;
 
+    final_roots.resize(parent.size());
     for (size_t i = 0; i < final_roots.size(); ++i)
         final_roots[i] = find_root(i);
 

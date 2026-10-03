@@ -6,27 +6,20 @@
 
 #pragma once
 
-#include <AK/HashMap.h>
-#include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
 #include <AK/Vector.h>
+#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibGC/Cell.h>
 #include <LibGC/Ptr.h>
-#include <LibGfx/Path.h>
-#include <LibGfx/WindingRule.h>
-#include <LibWeb/Painting/AccumulatedVisualContext.h>
-#include <LibWeb/Painting/BorderRadiiData.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Forward.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Layout/NodeArena.h>
+#include <LibWeb/Painting/ChromeMetrics.h>
+#include <LibWeb/Painting/ChromeWidget.h>
+#include <LibWeb/Painting/HitTestResult.h>
+#include <LibWeb/Painting/Scrolling.h>
 
-namespace Web {
-
-struct ChromeMetrics;
-
-namespace Painting {
-
-class PaintableFragment;
-class PaintableWithLines;
-class ViewportPaintable;
+namespace Web::Painting {
 
 enum class CaretPositionMode : u8 {
     Normal,
@@ -45,36 +38,52 @@ enum class CaretLineDirection : u8 {
     Next,
 };
 
+class HitTestDisplayList;
+
+// A query of a document's hit test list, with what it reads besides the list: the visual context tree and the scroll
+// state its points and rects convert through, as the document prepared them for the query. Only the document makes
+// one, once it has prepared them and found the list current against that tree, so every item a query looks at reads
+// the same preparation, and nothing in a query prepares the document again.
+class HitTestQuery {
+public:
+    HitTestDisplayList const& list() const { return m_list; }
+    Compositing::AccumulatedVisualContextTree const& visual_context_tree() const { return m_visual_context_tree; }
+    Compositing::ScrollStateSnapshot const& scroll_state() const { return m_scroll_state; }
+    double device_pixels_per_css_pixel() const { return m_device_pixels_per_css_pixel; }
+    ChromeMetrics const& chrome_metrics() const { return m_chrome_metrics; }
+    ViewportWheelOverflow viewport_wheel_overflow() const { return m_viewport_wheel_overflow; }
+
+private:
+    friend class DOM::Document;
+
+    HitTestQuery(HitTestDisplayList const& list, Compositing::AccumulatedVisualContextTree visual_context_tree, Compositing::ScrollStateSnapshot const& scroll_state, double device_pixels_per_css_pixel, ChromeMetrics chrome_metrics, ViewportWheelOverflow viewport_wheel_overflow)
+        : m_list(list)
+        , m_visual_context_tree(move(visual_context_tree))
+        , m_scroll_state(scroll_state)
+        , m_device_pixels_per_css_pixel(device_pixels_per_css_pixel)
+        , m_chrome_metrics(chrome_metrics)
+        , m_viewport_wheel_overflow(viewport_wheel_overflow)
+    {
+    }
+
+    HitTestDisplayList const& m_list;
+    Compositing::AccumulatedVisualContextTree m_visual_context_tree;
+    Compositing::ScrollStateSnapshot const& m_scroll_state;
+    double m_device_pixels_per_css_pixel { 1 };
+    ChromeMetrics m_chrome_metrics;
+    ViewportWheelOverflow m_viewport_wheel_overflow;
+};
+
 class WEB_API HitTestDisplayList : public RefCounted<HitTestDisplayList> {
 public:
-    static NonnullRefPtr<HitTestDisplayList> create(u64 visual_context_tree_version);
+    static NonnullRefPtr<HitTestDisplayList> create_from_rust_recording(u64 visual_context_tree_structural_epoch, Layout::NodeArena&, ChromeWidgetRegistry&);
 
-    u64 id() const { return m_id; }
-    size_t item_count() const { return m_items.size(); }
-    void ensure_item_capacity(size_t capacity) { m_items.ensure_capacity(capacity); }
-
-    // Copies a validated range of items recorded by one (paintable, phase) from the retained previous
-    // list into this one, returning where it landed. Items are copied, never inspected: source ranges
-    // belonging to relaid-out paintables may hold dangling fragment pointers, but only ranges whose
-    // owners kept a valid cache entry (and therefore were not relaid out) are ever passed here.
-    Paintable::HitTestItemRange append_cached_items(HitTestDisplayList const& source, Paintable::HitTestItemRange);
-
-    void verify_cached_items_match_fresh_recording(Paintable::HitTestItemRange spliced_range, HitTestDisplayList const& fresh_recording, Paintable const&, PaintPhase) const;
-
-    void append_box(Paintable const&, Paintable& target, CSSPixelRect, VisualContextIndex, BorderRadiiData);
-    void append_svg_path(Paintable& target, Gfx::Path, Gfx::WindingRule, CSSPixelRect bounding_box, VisualContextIndex);
-    void append_text_fragment(PaintableFragment const&, VisualContextIndex);
-    void append_empty_line(PaintableFragment const& sibling_fragment, size_t caret_offset, size_t line_box_index, CSSPixelRect line_rect, VisualContextIndex);
-    void append_empty_line(PaintableWithLines const&, DOM::Node const&, size_t caret_offset, CSSPixelRect line_rect, VisualContextIndex);
-    void append_empty_editable(Paintable const&, CSSPixelRect, VisualContextIndex);
-    void append_chrome_widget(Paintable const&, ChromeWidget&, VisualContextIndex);
-    void visit_edges(GC::Cell::Visitor&);
-
-    u64 visual_context_tree_version() const { return m_visual_context_tree_version; }
-    [[nodiscard]] Optional<HitTestResult> hit_test(CSSPixelPoint, HitTestType, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&) const;
+    u64 visual_context_tree_structural_epoch() const { return m_visual_context_tree_structural_epoch; }
+    [[nodiscard]] bool is_current() const;
+    [[nodiscard]] Optional<HitTestResult> hit_test(CSSPixelPoint, HitTestQuery const&) const;
     // When constraint_scope is given, the caret position is constrained to lines inside that node, and points
     // outside it resolve to the closest position within it.
-    [[nodiscard]] Optional<CaretPosition> caret_position_from_point(CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&, CaretPositionMode = CaretPositionMode::Normal, DOM::Node const* constraint_scope = nullptr) const;
+    [[nodiscard]] Optional<CaretPosition> caret_position_from_point(CSSPixelPoint, HitTestQuery const&, CaretPositionMode = CaretPositionMode::Normal, GC::Ptr<DOM::Node const> constraint_scope = nullptr) const;
     // Resolve Home/End against the painted line containing the caret. A visual line can span several DOM nodes and
     // atomic inline boxes, so a text-node or block-element boundary is not necessarily a rendered line boundary.
     [[nodiscard]] Optional<CaretPosition> caret_position_at_line_edge(DOM::Node const&, size_t offset, TextAffinity, CaretLineEdge) const;
@@ -82,54 +91,22 @@ public:
     // rendered-content query: DOM adjacency alone cannot describe wrapping, writing modes, floats, or empty lines.
     [[nodiscard]] Optional<CaretPosition> caret_position_on_adjacent_line(DOM::Node const&, size_t offset, TextAffinity, CaretLineDirection, CSSPixels inline_coordinate, DOM::Node const& scope) const;
     [[nodiscard]] Optional<CSSPixels> caret_line_block_coordinate(DOM::Node const&, size_t offset, TextAffinity) const;
-    TraversalDecision hit_test_all(CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&, Function<TraversalDecision(HitTestResult)> const&) const;
+    TraversalDecision hit_test_all(CSSPixelPoint, HitTestQuery const&, Function<TraversalDecision(HitTestResult)> const&) const;
 
 private:
-    explicit HitTestDisplayList(u64 visual_context_tree_version);
-
-    enum class ItemKind : u8 {
-        Box,
-        SvgPath,
-        TextFragment,
-        // A line box with no fragments (e.g. a blank line in a textarea), recorded as a caret target only.
-        EmptyLine,
-        EmptyEditable,
-        ChromeWidget,
-    };
+    HitTestDisplayList(u64 visual_context_tree_structural_epoch, Layout::NodeArena&, ChromeWidgetRegistry&, u64 rust_generation);
 
     struct Item {
-        ItemKind kind;
-        NonnullRefPtr<Paintable> paintable;
-        RefPtr<ChromeWidget> chrome_widget;
-        PaintableFragment const* text_fragment { nullptr };
-        GC::Ptr<DOM::Node const> caret_node { nullptr };
-        // For EmptyLine items: the caret offset in caret_node.
-        size_t caret_offset { 0 };
-        CSSPixelRect rect;
-        CSSPixelRect caret_rect;
-        Optional<size_t> caret_line_index;
-        Optional<CSSPixelRect> caret_line_rect;
-        Optional<CSSPixelRect> block_container_margin_rect;
-        VisualContextIndex visual_context_index;
-        BorderRadiiData border_radii;
-        Optional<Gfx::Path> path {};
-        Gfx::WindingRule winding_rule { Gfx::WindingRule::Nonzero };
-    };
+        size_t item_index { 0 };
+        Layout::RustFFI::FfiHitTestItemExport facts;
 
-    struct SpatialIndex {
-        HashMap<u64, Vector<size_t>> cells;
-        Vector<size_t> unbucketed_items;
-    };
-
-    // A visual line assembled from consecutive caret-capable display-list items. Caret lines preserve painted
-    // topology independently of the spatial hit-test index so keyboard navigation can reason about lines that contain
-    // empty or zero-area caret targets.
-    struct CaretLine {
-        CSSPixelRect rect;
-        Optional<CSSPixelRect> block_container_margin_rect;
-        VisualContextIndex visual_context_index;
-        size_t first_caret_item_index { 0 };
-        size_t last_caret_item_index { 0 };
+        size_t index() const { return item_index; }
+        bool can_produce_caret_position() const { return facts.can_produce_caret_position; }
+        Compositing::RustFFI::NodeSlotId paintable() const { return facts.paintable; }
+        Compositing::RustFFI::NodeSlotId hit_node() const { return facts.hit_node; }
+        ChromeWidgetKind chrome_widget_kind() const { return static_cast<ChromeWidgetKind>(facts.chrome_widget_kind); }
+        CSSPixelRect caret_rect() const { return facts.caret_rect; }
+        Compositing::ContextRef context() const { return facts.context; }
     };
 
     enum class CaretPositionType : u8 {
@@ -138,46 +115,53 @@ private:
         After,
     };
 
-    void build_derived_structures_if_needed() const;
-    void verify_no_item_appended_after_derived_structures_are_built() const { VERIFY(!m_derived_structures_built); }
-    void add_item_to_spatial_index(size_t item_index) const;
-    void add_item_to_caret_items(size_t item_index) const;
-    SpatialIndex& spatial_index_for(VisualContextIndex) const;
+    struct TopmostItem {
+        size_t index { 0 };
+        CSSPixelPoint local_point;
+    };
 
-    [[nodiscard]] Optional<CSSPixelPoint> local_point_for_visual_context(VisualContextIndex, CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel, AccumulatedVisualContextTree::ClipBehavior = AccumulatedVisualContextTree::ClipBehavior::Respect) const;
-    [[nodiscard]] CSSPixelRect viewport_rect_for_item(Item const&, CSSPixelRect const&, ViewportPaintable const&, double device_pixels_per_css_pixel) const;
-    [[nodiscard]] CSSPixelRect caret_line_rect_for_item(Item const&) const;
-    [[nodiscard]] bool item_contains(Item const&, CSSPixelPoint local_point, ChromeMetrics const&) const;
-    [[nodiscard]] DOM::Node const* item_dom_node(Item const&) const;
-    [[nodiscard]] DOM::Node const* event_dispatch_dom_node_for_item(Item const&) const;
-    [[nodiscard]] bool item_can_produce_caret_position(Item const&) const;
-    [[nodiscard]] bool item_is_direct_caret_target(Item const&) const;
-    [[nodiscard]] HitTestResult hit_test_result_for_item(Item const&, CSSPixelPoint local_point) const;
-    [[nodiscard]] Optional<CaretPosition> caret_position_for_item(Item const&, CSSPixelPoint local_point, CaretPositionType = CaretPositionType::Closest) const;
-    [[nodiscard]] Optional<CaretPosition> caret_position_for_hit_container(Item const&) const;
-    [[nodiscard]] Optional<CaretPosition> caret_position_for_line(CaretLine const&, CSSPixelPoint local_point, CaretPositionMode) const;
-    [[nodiscard]] Item const& item_at_line_edge(CaretLine const&, CaretPositionType) const;
-    [[nodiscard]] bool item_contains_caret_position(Item const&, DOM::Node const&, size_t offset, TextAffinity) const;
-    [[nodiscard]] Optional<size_t> caret_line_index_for_position(DOM::Node const&, size_t offset, TextAffinity) const;
-    [[nodiscard]] bool line_contains_descendant_of(CaretLine const&, DOM::Node const&) const;
-    [[nodiscard]] bool item_is_inline_adjacent_to_line(Item const&, CaretLine const&) const;
-    void find_topmost_item_in_list(Vector<size_t> const&, CSSPixelPoint local_point, ChromeMetrics const&, Optional<size_t>& topmost_item_index) const;
-    void find_topmost_caret_item_in_list(Vector<size_t> const&, CSSPixelPoint local_point, ChromeMetrics const&, Optional<size_t>& topmost_item_index) const;
-    void find_items_in_list(Vector<size_t> const&, CSSPixelPoint local_point, ChromeMetrics const&, Vector<size_t>& hit_item_indices) const;
+    struct CaretItemForLine {
+        size_t item_index { 0 };
+        CaretPositionType type { CaretPositionType::Closest };
+    };
 
-    static bool items_equal_for_cache_verification(Item const&, Item const&);
-    static String dump_item_for_cache_verification(Item const&);
+    struct ClosestLine {
+        Optional<size_t> index;
+        CSSPixelPoint local_point;
+        CSSPixels block_distance { CSSPixels::max() };
+    };
 
-    u64 m_visual_context_tree_version { 0 };
-    u64 m_id { 0 };
-    Vector<Item> m_items;
-    mutable bool m_derived_structures_built { false };
-    mutable Vector<size_t> m_caret_item_indices;
-    mutable Vector<CaretLine> m_caret_lines;
-    mutable Vector<OwnPtr<SpatialIndex>> m_spatial_indexes;
-    mutable Vector<VisualContextIndex> m_used_visual_context_indices;
+    struct QueryContext;
+    static Optional<TopmostItem> topmost_item_from(Layout::RustFFI::FfiTopmostItem const&);
+    [[nodiscard]] Item item(size_t index) const;
+    [[nodiscard]] Layout::RustFFI::FfiCaretLineExport caret_line(size_t line_index) const { return Layout::RustFFI::layout_hit_test_caret_line(m_arena->host(), line_index); }
+
+    [[nodiscard]] Optional<TopmostItem> find_topmost_item(CSSPixelPoint, HitTestQuery const&) const;
+    void find_topmost_items_for_caret(CSSPixelPoint, HitTestQuery const&, Optional<TopmostItem>& caret_item, Optional<TopmostItem>& hit_item) const;
+    [[nodiscard]] Vector<size_t> hit_item_indices_topmost_first(CSSPixelPoint, HitTestQuery const&) const;
+    [[nodiscard]] size_t item_index_at_line_edge(size_t line_index, CaretPositionType) const;
+    [[nodiscard]] Optional<CaretItemForLine> caret_item_for_line(size_t line_index, CSSPixelPoint local_point, CaretPositionMode) const;
+    [[nodiscard]] bool item_is_inline_adjacent_to_line(size_t item_index, size_t line_index) const;
+    [[nodiscard]] ClosestLine find_closest_line(CSSPixelPoint, HitTestQuery const&, CaretPositionMode, DOM::Node const* scope_dom_node, Compositing::AccumulatedVisualContextTree::ClipBehavior) const;
+
+    [[nodiscard]] Optional<CSSPixelPoint> local_point_for_visual_context(Compositing::ContextRef, CSSPixelPoint, HitTestQuery const&) const;
+    [[nodiscard]] CSSPixelRect viewport_rect_for_context(Compositing::SpatialNodeIndex, CSSPixelRect const&, HitTestQuery const&) const;
+    [[nodiscard]] Layout::Node const* layout_node_for_item(Item) const;
+    [[nodiscard]] RefPtr<ChromeWidget> chrome_widget_for_item(Item) const;
+    [[nodiscard]] DOM::Node const* item_dom_node(size_t item_index) const;
+    [[nodiscard]] DOM::NodeIdentity item_identity(size_t item_index) const;
+    [[nodiscard]] DOM::NodeIdentity event_dispatch_identity_for_item(size_t item_index) const;
+    [[nodiscard]] DOM::Node const* event_dispatch_dom_node_for_item(size_t item_index) const;
+    [[nodiscard]] bool item_is_direct_caret_target(size_t item_index) const;
+    [[nodiscard]] HitTestResult hit_test_result_for_item(Item, CSSPixelPoint local_point) const;
+    [[nodiscard]] Optional<CaretPosition> caret_position_for_item(Item, CSSPixelPoint local_point, CaretPositionType = CaretPositionType::Closest) const;
+    [[nodiscard]] Optional<CaretPosition> caret_position_for_hit_container(Item) const;
+    [[nodiscard]] Optional<CaretPosition> caret_position_for_line(size_t line_index, CSSPixelPoint local_point, CaretPositionMode) const;
+
+    u64 m_visual_context_tree_structural_epoch { 0 };
+    NonnullRefPtr<Layout::NodeArena> m_arena;
+    NonnullRefPtr<ChromeWidgetRegistry> m_chrome_widget_registry;
+    u64 m_rust_generation { 0 };
 };
-
-}
 
 }

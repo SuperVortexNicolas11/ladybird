@@ -200,7 +200,7 @@ static Utf16View array_constructor_source()
 #endif
 }
 
-static void initialize_constructor(VM& vm, PropertyKey const& property_key, Object& constructor, Object* prototype, PropertyAttributes constructor_property_attributes = Attribute::Writable | Attribute::Configurable)
+static void initialize_constructor(VM& vm, PropertyKey const& property_key, Object& constructor, GC::Ptr<Object> prototype, PropertyAttributes constructor_property_attributes = Attribute::Writable | Attribute::Configurable)
 {
     constructor.define_direct_property(vm.names.name, PrimitiveString::create(vm, property_key.as_string()), Attribute::Configurable);
     if (prototype)
@@ -382,15 +382,30 @@ void Intrinsics::initialize_intrinsics(Realm& realm)
     // 27.6.1.1 AsyncGenerator.prototype.constructor, https://tc39.es/ecma262/#sec-asyncgenerator-prototype-constructor
     m_async_generator_prototype->define_direct_property(vm.names.constructor, m_async_generator_function_prototype, Attribute::Configurable);
 
+    // OPTIMIZATION: Like normal functions, the other function kinds start from a premade shape with their own properties
+    //               already in spec order, so creating one only has to store the property values.
+    auto create_function_shape = [&](GC::Ref<Object> prototype, bool has_prototype_property) {
+        auto shape = heap().allocate<Shape>(realm);
+        shape->set_prototype_without_transition(prototype);
+        shape->add_property_without_transition(vm.names.length, Attribute::Configurable);
+        shape->add_property_without_transition(vm.names.name, Attribute::Configurable);
+        if (has_prototype_property)
+            shape->add_property_without_transition(vm.names.prototype, Attribute::Writable);
+        VERIFY(shape->lookup(vm.names.length).value().offset == m_normal_function_length_offset);
+        VERIFY(shape->lookup(vm.names.name).value().offset == m_normal_function_name_offset);
+        return shape;
+    };
+    m_async_function_shape = create_function_shape(*m_async_function_prototype, false);
+    m_generator_function_shape = create_function_shape(*m_generator_function_prototype, true);
+    m_async_generator_function_shape = create_function_shape(*m_async_generator_function_prototype, true);
+    m_generator_function_prototype_property_offset = m_generator_function_shape->lookup(vm.names.prototype).value().offset;
+    VERIFY(m_async_generator_function_shape->lookup(vm.names.prototype).value().offset == m_generator_function_prototype_property_offset);
+
     m_array_prototype_values_function = &array_prototype()->get_without_side_effects(vm.names.values).as_function();
     m_date_constructor_now_function = &date_constructor()->get_without_side_effects(vm.names.now).as_function();
     m_json_parse_function = &json_object()->get_without_side_effects(vm.names.parse).as_function();
     m_json_stringify_function = &json_object()->get_without_side_effects(vm.names.stringify).as_function();
     m_object_prototype_to_string_function = &object_prototype()->get_without_side_effects(vm.names.toString).as_function();
-
-    array_prototype()->convert_to_prototype_if_needed();
-    m_default_array_prototype_shape = array_prototype()->shape();
-    m_default_object_prototype_shape = object_prototype()->shape();
 
     VERIFY(array_prototype()->indexed_array_like_size() == 0);
     VERIFY(object_prototype()->indexed_array_like_size() == 0);
@@ -500,12 +515,13 @@ void Intrinsics::visit_edges(Visitor& visitor)
     visitor.visit(m_iterator_result_object_shape);
     visitor.visit(m_normal_function_prototype_shape);
     visitor.visit(m_normal_function_shape);
+    visitor.visit(m_async_function_shape);
+    visitor.visit(m_generator_function_shape);
+    visitor.visit(m_async_generator_function_shape);
     visitor.visit(m_native_function_shape);
     visitor.visit(m_unmapped_arguments_object_shape);
     visitor.visit(m_mapped_arguments_object_shape);
     visitor.visit(m_regexp_builtin_exec_array_shape);
-    visitor.visit(m_default_array_prototype_shape);
-    visitor.visit(m_default_object_prototype_shape);
     visitor.visit(m_proxy_constructor);
     visitor.visit(m_async_from_sync_iterator_prototype);
     visitor.visit(m_async_generator_prototype);

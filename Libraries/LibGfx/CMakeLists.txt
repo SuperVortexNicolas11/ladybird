@@ -13,10 +13,13 @@ set(SOURCES
     Cursor.cpp
     Filter.cpp
     Font/Font.cpp
+    Font/FontCatalog.cpp
     Font/FontDatabase.cpp
     Font/FontSupport.cpp
     Font/FontVariationSettings.cpp
     Font/PathFontProvider.cpp
+    Font/SharedFontProvider.cpp
+    Font/SystemFallbackFonts.cpp
     Font/Typeface.cpp
     Font/TypefaceSkia.cpp
     Font/WOFF/Loader.cpp
@@ -26,6 +29,7 @@ set(SOURCES
     Gradients.cpp
     Matrix4x4.cpp
     DecodedImageFrame.cpp
+    RustProcessState.cpp
     ImageFormats/BMPWriter.cpp
     ImageFormats/JPEGWriter.cpp
     ImageFormats/PNGWriter.cpp
@@ -56,7 +60,7 @@ set(SOURCES
 )
 
 if (APPLE)
-    list(APPEND SOURCES MetalContext.mm)
+    list(APPEND SOURCES MetalContext.mm VideoSurfaceImage.mm)
 endif()
 
 if (HAS_DIRECTX)
@@ -73,7 +77,7 @@ endif()
 
 ladybird_lib(LibGfx gfx)
 
-target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem LibTextCodec LibIPC LibSync LibUnicode)
+target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem LibTextCodec LibIPC LibUnicode)
 
 target_link_libraries(LibGfx PRIVATE PkgConfig::WOFF2 JPEG::JPEG PNG::PNG skia harfbuzz)
 

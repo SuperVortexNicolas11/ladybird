@@ -27,8 +27,8 @@ public:
         return vm.heap().allocate<TransferTrackingResponse>();
     }
 
-    bool was_released_for_transfer() const { return m_was_released_for_transfer; }
-    virtual void release_request_for_transfer() const override { m_was_released_for_transfer = true; }
+    bool transfer_lease_was_released() const { return m_transfer_lease_was_released; }
+    virtual void release_request_transfer_lease() const override { m_transfer_lease_was_released = true; }
 
 private:
     TransferTrackingResponse()
@@ -36,7 +36,7 @@ private:
     {
     }
 
-    mutable bool m_was_released_for_transfer { false };
+    mutable bool m_transfer_lease_was_released { false };
 };
 
 GC_DEFINE_ALLOCATOR(TransferTrackingResponse);
@@ -52,7 +52,7 @@ TEST_CASE(javascript_bytecode_cache_memory_cache_request_headers_are_cloned)
     auto request_headers = HTTP::HeaderList::create({
         { "User-Agent"sv, "Ladybird"sv },
     });
-    auto response = Web::Fetch::Infrastructure::Response::create(*vm);
+    auto response = Web::Fetch::Infrastructure::Response::create();
     response->set_javascript_bytecode_cache_memory_cache_request_headers(request_headers);
 
     auto cloned_response = response->clone(realm);
@@ -63,7 +63,7 @@ TEST_CASE(javascript_bytecode_cache_memory_cache_request_headers_are_cloned)
     EXPECT_EQ((*cloned_request_headers)->get("User-Agent"sv), Optional<ByteString> { "Ladybird" });
 }
 
-TEST_CASE(http_redirect_fetch_releases_intermediate_response_for_transfer)
+TEST_CASE(http_redirect_fetch_releases_intermediate_response_transfer_lease)
 {
     auto vm = JS::VM::create();
     auto root_execution_context = JS::create_simple_execution_context<JS::GlobalObject>(*vm);
@@ -76,7 +76,7 @@ TEST_CASE(http_redirect_fetch_releases_intermediate_response_for_transfer)
     request->set_url_list({ request_url.release_value() });
     request->set_redirect_count(20);
 
-    auto fetch_params = Web::Fetch::Infrastructure::FetchParams::create(*vm, request, Web::Fetch::Infrastructure::FetchTimingInfo::create(*vm));
+    auto fetch_params = Web::Fetch::Infrastructure::FetchParams::create(request, Web::Fetch::Infrastructure::FetchTimingInfo::create());
     auto response = TransferTrackingResponse::create(*vm);
     response->set_status(302);
     response->set_header_list(HTTP::HeaderList::create({ { "Location"sv, "/redirected"sv } }));
@@ -84,5 +84,5 @@ TEST_CASE(http_redirect_fetch_releases_intermediate_response_for_transfer)
     auto pending_response = Web::Fetch::Fetching::http_redirect_fetch(realm, fetch_params, response);
 
     VERIFY(pending_response);
-    EXPECT(response->was_released_for_transfer());
+    EXPECT(response->transfer_lease_was_released());
 }

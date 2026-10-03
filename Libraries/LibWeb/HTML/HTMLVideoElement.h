@@ -23,16 +23,11 @@ struct VideoFrame {
 };
 
 class HTMLVideoElement final : public HTMLMediaElement {
-    WEB_PLATFORM_OBJECT(HTMLVideoElement, HTMLMediaElement);
+    WEB_WRAPPABLE(HTMLVideoElement, HTMLMediaElement);
     GC_DECLARE_ALLOCATOR(HTMLVideoElement);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     virtual ~HTMLVideoElement() override;
-
-    Layout::VideoBox* layout_node();
-    Layout::VideoBox const* layout_node() const;
 
     void set_intrinsic_video_dimensions(Optional<Gfx::Size<u32>>);
     u32 video_width() const;
@@ -42,7 +37,7 @@ public:
     Optional<Gfx::Size<u32>> natural_media_size() const;
     Optional<CSSPixelSize> natural_element_size() const;
 
-    RefPtr<Gfx::Bitmap> const& poster_frame() const { return m_poster_frame; }
+    Optional<Gfx::DecodedImageFrame> const& poster_frame() const { return m_poster_frame; }
 
     // https://html.spec.whatwg.org/multipage/media.html#the-video-element:the-video-element-7
     // NB: We combine the values of...
@@ -63,8 +58,6 @@ public:
 
 private:
     HTMLVideoElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
     virtual void finalize() override;
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void adopted_from(DOM::Document&) override;
@@ -76,13 +69,13 @@ private:
 
     virtual bool is_html_video_element() const override { return true; }
 
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     WebIDL::ExceptionOr<void> determine_element_poster_frame(Optional<Utf16String> const& poster);
 
     GC::Ptr<HTML::VideoTrack> m_video_track;
     VideoFrame m_current_frame;
-    RefPtr<Gfx::Bitmap> m_poster_frame;
+    Optional<Gfx::DecodedImageFrame> m_poster_frame;
 
     Optional<Gfx::Size<u32>> m_intrinsic_video_dimensions;
     Optional<CSSPixelSize> m_natural_dimensions;
@@ -97,15 +90,5 @@ namespace Web::DOM {
 
 template<>
 inline bool Node::fast_is<HTML::HTMLVideoElement>() const { return is_html_video_element(); }
-
-}
-
-namespace JS {
-
-template<>
-inline bool Object::fast_is<Web::HTML::HTMLVideoElement>() const
-{
-    return is_dom_node() && static_cast<Web::DOM::Node const&>(*this).is_html_video_element();
-}
 
 }

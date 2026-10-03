@@ -6,10 +6,8 @@
 
 #include <AK/LexicalPath.h>
 #include <LibCore/Directory.h>
-#include <LibCore/Environment.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
-#include <LibGfx/Font/FontDatabase.h>
 #include <LibSandbox/Sandbox.h>
 #include <LibSandbox/Seccomp.h>
 #include <LibWebView/Utilities.h>
@@ -17,7 +15,7 @@
 
 namespace RendererSandbox {
 
-ErrorOr<void> apply_sandbox(Optional<StringView> config_path, Optional<StringView>)
+ErrorOr<void> apply_sandbox(StringView, AudioAccess audio_access)
 {
     TRY(Sandbox::install_no_new_privileges());
     TRY(Sandbox::configure_runtime());
@@ -27,26 +25,21 @@ ErrorOr<void> apply_sandbox(Optional<StringView> config_path, Optional<StringVie
 
     Vector<Sandbox::LandlockPath> paths;
     TRY(Sandbox::add_landlock_path_if_exists(paths, WebView::s_ladybird_resource_root, Sandbox::LandlockPath::Access::ReadOnly));
-    if (config_path.has_value())
-        TRY(Sandbox::add_landlock_path_if_exists(paths, *config_path, Sandbox::LandlockPath::Access::ReadOnly));
     // cpptrace opens loaded ELF objects when symbolizing in-process stack traces.
     TRY(Sandbox::add_landlock_path_if_exists(paths, executable_path, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, LexicalPath::join(build_root, "lib"sv).string(), Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/proc/self"sv, Sandbox::LandlockPath::Access::ReadOnly));
-    for (auto const& path : TRY(Gfx::FontDatabase::font_directories()))
-        TRY(Sandbox::add_landlock_path_if_exists(paths, path, Sandbox::LandlockPath::Access::ReadOnly));
-
-    if (auto cranelift_compiler_path = Core::Environment::get("LADYBIRD_CRANELIFT_COMPILER"sv); cranelift_compiler_path.has_value()) {
-        TRY(Sandbox::add_landlock_path_if_exists(paths, *cranelift_compiler_path, Sandbox::LandlockPath::Access::ReadAndExecute));
-    } else {
-        auto default_cranelift_compiler_path = LexicalPath::join(build_root, "bin/cranelift-compiler"sv).string();
-        TRY(Sandbox::add_landlock_path_if_exists(paths, default_cranelift_compiler_path, Sandbox::LandlockPath::Access::ReadAndExecute));
+    if (audio_access == AudioAccess::Yes) {
+        // NB: Connecting is not a path operation, so the broker is what reaches the socket. libpulse
+        //     still has to find it, and pa_make_secure_dir() opens the directory the socket lives in
+        //     before it will use one, so the directory has to be readable or discovery stops there.
+        //     Read is all it needs: nothing in the audio path writes here, and this used to be
+        //     granted for writing, which made it a place to leave files inside the sandbox.
+        auto pulse_runtime_path = LexicalPath::join(TRY(Core::StandardPaths::runtime_directory()), "pulse"sv).string();
+        TRY(Core::Directory::create(pulse_runtime_path, Core::Directory::CreateDirectories::Yes, 0700));
+        TRY(Sandbox::add_landlock_path_if_exists(paths, pulse_runtime_path, Sandbox::LandlockPath::Access::ReadOnly));
+        TRY(Sandbox::add_landlock_path_if_exists(paths, LexicalPath::join(Core::StandardPaths::config_directory(), "pulse"sv).string(), Sandbox::LandlockPath::Access::ReadOnly));
     }
-
-    auto pulse_runtime_path = LexicalPath::join(TRY(Core::StandardPaths::runtime_directory()), "pulse"sv).string();
-    TRY(Core::Directory::create(pulse_runtime_path, Core::Directory::CreateDirectories::Yes, 0700));
-    TRY(Sandbox::add_landlock_path_if_exists(paths, pulse_runtime_path, Sandbox::LandlockPath::Access::ReadWrite));
-    TRY(Sandbox::add_landlock_path_if_exists(paths, LexicalPath::join(Core::StandardPaths::config_directory(), "pulse"sv).string(), Sandbox::LandlockPath::Access::ReadOnly));
 
     TRY(Sandbox::restrict_filesystem_with_landlock(paths.span()));
 
@@ -55,8 +48,11 @@ ErrorOr<void> apply_sandbox(Optional<StringView> config_path, Optional<StringVie
     policy.allow_filesystem_metadata_queries();
     policy.allow_filesystem_writes();
     policy.allow_file_descriptor_operations();
-    policy.allow_process_creation();
     policy.allow_ipc();
+    if (audio_access == AudioAccess::Yes) {
+        policy.broker_unix_socket_connections();
+        policy.allow_pulseaudio_client_file_operations();
+    }
     policy.allow_common_runtime();
     policy.allow_executable_memory_mappings();
     TRY(policy.install());

@@ -72,11 +72,23 @@ private:
 };
 
 template<Arithmetic T>
+requires(!IsSame<T, bool>)
 ErrorOr<T> decode(Decoder& decoder)
 {
     T value { 0 };
     TRY(decoder.decode_into(value));
     return value;
+}
+
+template<SameAs<bool> T>
+ErrorOr<T> decode(Decoder& decoder)
+{
+    // Only 0 and 1 are valid representations of a bool, so read the byte as an integer first.
+    u8 byte { 0 };
+    TRY(decoder.decode_into(byte));
+    if (byte > 1)
+        return Error::from_string_literal("IPC decode: Invalid bool value");
+    return byte == 1;
 }
 
 template<Enum T>
@@ -132,6 +144,9 @@ template<>
 ErrorOr<URL::Host> decode(Decoder&);
 
 template<>
+ErrorOr<URL::OpaqueHost> decode(Decoder&);
+
+template<>
 ErrorOr<File> decode(Decoder&);
 
 template<>
@@ -144,13 +159,7 @@ template<>
 ErrorOr<Core::AnonymousBuffer> decode(Decoder&);
 
 template<>
-ErrorOr<Core::ProxyData> decode(Decoder&);
-
-template<>
-ErrorOr<URL::BlobURLEntry::Blob> decode(Decoder&);
-
-template<>
-ErrorOr<URL::BlobURLEntry::MediaSource> decode(Decoder&);
+ErrorOr<URL::BlobURLEntry> decode(Decoder&);
 
 template<Concepts::Array T>
 ErrorOr<T> decode(Decoder& decoder)
@@ -191,6 +200,12 @@ ErrorOr<T> decode(Decoder& decoder)
         return Error::from_string_literal("IPC decode: Vector size would overflow");
     TRY(vector.try_resize(size));
     TRY(decoder.decode_into({ reinterpret_cast<u8*>(vector.data()), size * sizeof(typename T::ValueType) }));
+    if constexpr (IsSame<typename T::ValueType, bool>) {
+        for (auto byte : ReadonlyBytes { reinterpret_cast<u8 const*>(vector.data()), size }) {
+            if (byte > 1)
+                return Error::from_string_literal("IPC decode: Invalid bool value");
+        }
+    }
     return vector;
 }
 

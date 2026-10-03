@@ -6,10 +6,10 @@
 
 #include "WebViewImplementationNative.h"
 #include "JNIHelpers.h"
+#include <AK/Random.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Painter.h>
-#include <LibWeb/Crypto/Crypto.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
 #include <android/bitmap.h>
@@ -52,13 +52,13 @@ void WebViewImplementationNative::initialize_client(WebView::ViewImplementation:
 
     auto new_client = bind_web_content_client();
 
-    m_client_state.client = new_client;
-    m_client_state.client->on_web_content_process_crash = [] {
+    new_client->on_web_content_process_crash = [] {
         warnln("WebContent crashed!");
         // FIXME: launch a new client
     };
+    new_client->register_view(0, *this);
 
-    m_client_state.client_handle = MUST(Web::Crypto::generate_random_uuid());
+    m_client_state.client_handle = generate_random_uuid();
     client().async_set_window_handle(0, m_client_state.client_handle);
 
     client().async_set_viewport(0, viewport_size(), m_device_pixel_ratio, Web::ViewportIsFullscreen::No);
@@ -112,6 +112,9 @@ void WebViewImplementationNative::mouse_event(Web::MouseEvent::Type event_type, 
         Web::UIEvents::MouseButton::Primary,
         Web::UIEvents::KeyModifier::Mod_None,
         0,
+        0,
+        Web::WheelDeltaPrecision::Discrete,
+        Web::ScrollGesturePhase::None,
         0,
         nullptr
     };

@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
 #include <LibTLS/TLSv12.h>
 #include <RequestServer/Resolver.h>
 
@@ -28,6 +29,15 @@ DNSInfo& DNSInfo::the()
     return g_dns_info;
 }
 
+// System resolver to resolve the resolvers themselves.
+static DNS::Resolver& system_resolver()
+{
+    static NeverDestroyed<DNS::Resolver> resolver { [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> {
+        return OptionalNone {};
+    } };
+    return *resolver;
+}
+
 NonnullRefPtr<Resolver> Resolver::default_resolver()
 {
     static WeakPtr<Resolver> g_resolver {};
@@ -35,14 +45,14 @@ NonnullRefPtr<Resolver> Resolver::default_resolver()
     if (auto resolver = g_resolver.strong_ref())
         return *resolver;
 
-    auto resolver = adopt_ref(*new Resolver([] -> ErrorOr<DNS::Resolver::SocketResult> {
+    auto resolver = adopt_ref(*new Resolver([] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> {
         auto& dns_info = DNSInfo::the();
 
         if (!dns_info.server_address.has_value()) {
             if (!dns_info.server_hostname.has_value())
-                return Error::from_string_literal("No DNS server configured");
+                return OptionalNone {};
 
-            auto resolved = TRY(default_resolver()->dns.lookup(*dns_info.server_hostname)->await());
+            auto resolved = TRY(system_resolver().lookup(*dns_info.server_hostname)->await());
             if (!resolved->has_cached_addresses())
                 return Error::from_string_literal("Failed to resolve DNS server hostname");
 
@@ -63,8 +73,11 @@ NonnullRefPtr<Resolver> Resolver::default_resolver()
         }
 
         return DNS::Resolver::SocketResult {
-            MaybeOwned<Core::Socket>(TRY(Core::BufferedUDPSocket::create(TRY(Core::UDPSocket::connect(*dns_info.server_address))))),
+            MaybeOwned<Core::Socket>(TRY(Core::UDPSocket::connect(*dns_info.server_address))),
             DNS::Resolver::ConnectionMode::UDP,
+            [address = *dns_info.server_address] -> ErrorOr<NonnullOwnPtr<Core::Socket>> {
+                return TRY(Core::TCPSocket::connect(address));
+            },
         };
     }));
 
@@ -72,7 +85,7 @@ NonnullRefPtr<Resolver> Resolver::default_resolver()
     return resolver;
 }
 
-Resolver::Resolver(Function<ErrorOr<DNS::Resolver::SocketResult>()> create_socket)
+Resolver::Resolver(Function<ErrorOr<Optional<DNS::Resolver::SocketResult>>()> create_socket)
     : dns(move(create_socket))
 {
 }

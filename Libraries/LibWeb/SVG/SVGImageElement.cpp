@@ -8,19 +8,28 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/Bindings/SVGImageElement.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentObserver.h>
 #include <LibWeb/DOM/Event.h>
+#include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
-#include <LibWeb/Layout/SVGImageBox.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Namespace.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 
 namespace Web::SVG {
 
 GC_DEFINE_ALLOCATOR(SVGImageElement);
+
+Layout::Node const* SVGImageElement::image_provider_layout_node() const
+{
+    return unsafe_layout_node();
+}
 
 SVGImageElement::SVGImageElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGGraphicsElement(document, move(qualified_name))
@@ -33,12 +42,6 @@ void SVGImageElement::finalize()
 {
     Base::finalize();
     unregister_with_decoded_image_data_if_needed();
-}
-
-void SVGImageElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGImageElement);
-    Base::initialize(realm);
 }
 
 void SVGImageElement::visit_edges(Cell::Visitor& visitor)
@@ -60,15 +63,7 @@ void SVGImageElement::attribute_changed(Utf16FlyString const& name, Optional<Utf
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
-    if (name == SVG::AttributeNames::x) {
-        m_x = AttributeParser::parse_number_percentage(value.value_or({}));
-    } else if (name == SVG::AttributeNames::y) {
-        m_y = AttributeParser::parse_number_percentage(value.value_or({}));
-    } else if (name == SVG::AttributeNames::width) {
-        m_width = AttributeParser::parse_number_percentage(value.value_or({}));
-    } else if (name == SVG::AttributeNames::height) {
-        m_height = AttributeParser::parse_number_percentage(value.value_or({}));
-    } else if (name == SVG::AttributeNames::href) {
+    if (name == SVG::AttributeNames::href) {
         // https://svgwg.org/svg2-draft/linking.html#XLinkRefAttrs
         // For backwards compatibility, elements with an ‘href’ attribute also recognize an ‘href’ attribute in the
         // XLink namespace. If the element is in the XLink namespace, it does not recognize an ‘href’ attribute in the
@@ -83,36 +78,6 @@ void SVGImageElement::attribute_changed(Utf16FlyString const& name, Optional<Utf
 
         process_the_url(href);
     }
-}
-
-Gfx::FloatRect SVGImageElement::bounding_box(CSSPixelSize viewport_size) const
-{
-    Optional<float> width;
-    if (m_width.has_value())
-        width = m_width->resolve_relative_to(viewport_size.width().to_float());
-
-    Optional<float> height;
-    if (m_height.has_value())
-        height = m_height->resolve_relative_to(viewport_size.height().to_float());
-
-    if (!height.has_value() && width.has_value() && intrinsic_aspect_ratio().has_value())
-        height = width.value() / intrinsic_aspect_ratio().value().to_float();
-
-    if (!width.has_value() && height.has_value() && intrinsic_aspect_ratio().has_value())
-        width = height.value() * intrinsic_aspect_ratio().value().to_float();
-
-    if (!width.has_value() && intrinsic_width().has_value())
-        width = intrinsic_width()->to_float();
-
-    if (!height.has_value() && intrinsic_height().has_value())
-        height = intrinsic_height()->to_float();
-
-    return {
-        m_x.value_or(NumberPercentage::create_number(0)).resolve_relative_to(viewport_size.width().to_float()),
-        m_y.value_or(NumberPercentage::create_number(0)).resolve_relative_to(viewport_size.height().to_float()),
-        width.value_or(0.0f),
-        height.value_or(0.0f),
-    };
 }
 
 // https://www.w3.org/TR/SVG2/linking.html#processingURL
@@ -135,32 +100,36 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
 {
     m_load_event_delayer.emplace(document());
     unregister_with_decoded_image_data_if_needed();
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(realm(), document().page(), url);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), url);
+    CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
         [this, resource_request = GC::Root { m_resource_request }] {
             m_load_event_delayer.clear();
             register_with_decoded_image_data_if_needed();
-            set_needs_style_update(true);
+            CSS::record_element_replaced_content_input(*this);
+            image_provider_contents_changed();
             set_needs_layout_update(DOM::SetNeedsLayoutReason::SVGImageElementFetchTheDocument);
 
-            dispatch_event(DOM::Event::create(realm(), HTML::EventNames::load));
+            dispatch_event(DOM::Event::create(HTML::EventNames::load,
+                HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
         },
         [this] {
             m_load_event_delayer.clear();
 
-            dispatch_event(DOM::Event::create(realm(), HTML::EventNames::error));
+            dispatch_event(DOM::Event::create(HTML::EventNames::error,
+                HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
         });
 
     if (m_resource_request->needs_fetching()) {
-        auto request = HTML::create_potential_CORS_request(vm(), url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
+        auto request = HTML::create_potential_CORS_request(url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
         request->set_client(&document().relevant_settings_object());
-        m_resource_request->fetch_resource(realm(), request);
+        m_resource_request->fetch_resource(request);
     }
 }
 
-RefPtr<Layout::Node> SVGImageElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+CSS::ElementBoxKind SVGImageElement::box_kind() const
 {
-    return make_ref_counted<Layout::SVGImageBox>(document(), *this, style);
+    return CSS::ElementBoxKind::SvgImage;
 }
 
 GC::Ptr<HTML::DecodedImageData> SVGImageElement::decoded_image_data() const
@@ -168,6 +137,13 @@ GC::Ptr<HTML::DecodedImageData> SVGImageElement::decoded_image_data() const
     if (!m_resource_request)
         return nullptr;
     return m_resource_request->image_data();
+}
+
+void SVGImageElement::decoded_image_data_did_update()
+{
+    // An SVG image works out its natural size again after it redraws itself or changes color scheme.
+    CSS::record_element_replaced_content_input(*this);
+    image_provider_contents_changed();
 }
 
 }

@@ -12,6 +12,7 @@
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <AK/kmalloc.h>
 #include <LibCrypto/BigInt/TommathForward.h>
 
 namespace Crypto {
@@ -20,6 +21,8 @@ struct UnsignedDivisionResult;
 
 class UnsignedBigInteger {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     template<Integral T>
     UnsignedBigInteger(T value)
         : UnsignedBigInteger(static_cast<u64>(value))
@@ -87,6 +90,8 @@ public:
     [[nodiscard]] UnsignedBigInteger shift_right(size_t num_bits) const;
     [[nodiscard]] UnsignedBigInteger multiplied_by(UnsignedBigInteger const& other) const;
     [[nodiscard]] UnsignedDivisionResult divided_by(UnsignedBigInteger const& divisor) const;
+    [[nodiscard]] UnsignedBigInteger quotient(UnsignedBigInteger const& divisor) const;
+    [[nodiscard]] UnsignedBigInteger remainder(UnsignedBigInteger const& divisor) const;
     [[nodiscard]] UnsignedBigInteger pow(u32 exponent) const;
     [[nodiscard]] UnsignedBigInteger gcd(UnsignedBigInteger const& other) const;
     [[nodiscard]] UnsignedBigInteger lcm(UnsignedBigInteger const& other) const;

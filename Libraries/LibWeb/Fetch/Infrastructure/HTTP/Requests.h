@@ -28,8 +28,13 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
+#include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestPriority.h>
+#include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestReferrer.h>
+#include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 
 namespace Web::Fetch::Infrastructure {
+
+class Response;
 
 // https://fetch.spec.whatwg.org/#concept-request
 class WEB_API Request final : public JS::Cell {
@@ -61,6 +66,7 @@ public:
         ServiceWorker,
         SharedWorker,
         Style,
+        Text,
         Track,
         Video,
         WebIdentity,
@@ -128,10 +134,7 @@ public:
         Manual,
     };
 
-    enum class Referrer {
-        NoReferrer,
-        Client,
-    };
+    using Referrer = RequestReferrer;
 
     enum class ResponseTainting {
         Basic,
@@ -149,11 +152,7 @@ public:
         Client,
     };
 
-    enum class Priority {
-        High,
-        Low,
-        Auto
-    };
+    using Priority = RequestPriority;
 
     // Members are implementation-defined
     struct InternalPriority { };
@@ -161,10 +160,11 @@ public:
     using BodyType = Variant<Empty, ByteBuffer, GC::Ref<Body>>;
     using OriginType = Variant<Origin, URL::Origin>;
     using PolicyContainerType = Variant<PolicyContainer, GC::Ref<HTML::PolicyContainer>>;
-    using ReferrerType = Variant<Referrer, URL::URL>;
+    using ReferrerType = RequestReferrerType;
     using ReservedClientType = GC::Ptr<HTML::Environment>;
-    using TraversableForUserPromptsType = Variant<TraversableForUserPrompts, GC::Ptr<HTML::EnvironmentSettingsObject>, GC::Ptr<HTML::LocalTraversableNavigable>>;
+    using TraversableForUserPromptsType = Variant<TraversableForUserPrompts, GC::Ptr<HTML::EnvironmentSettingsObject>, GC::Ptr<HTML::Navigable>>;
 
+    [[nodiscard]] static GC::Ref<Request> create();
     [[nodiscard]] static GC::Ref<Request> create(JS::VM&);
 
     [[nodiscard]] ByteString const& method() const { return m_method; }
@@ -185,14 +185,14 @@ public:
 
     [[nodiscard]] GC::Ptr<HTML::EnvironmentSettingsObject const> client() const { return m_client; }
     [[nodiscard]] GC::Ptr<HTML::EnvironmentSettingsObject> client() { return m_client; }
-    void set_client(HTML::EnvironmentSettingsObject* client) { m_client = client; }
+    void set_client(GC::Ptr<HTML::EnvironmentSettingsObject> client) { m_client = client; }
 
     [[nodiscard]] ReservedClientType const& reserved_client() const { return m_reserved_client; }
     [[nodiscard]] ReservedClientType& reserved_client() { return m_reserved_client; }
     void set_reserved_client(ReservedClientType reserved_client) { m_reserved_client = move(reserved_client); }
 
-    [[nodiscard]] Utf16String const& replaces_client_id() const { return m_replaces_client_id; }
-    void set_replaces_client_id(Utf16String replaces_client_id) { m_replaces_client_id = move(replaces_client_id); }
+    [[nodiscard]] HTML::EnvironmentId const& replaces_client_id() const { return m_replaces_client_id; }
+    void set_replaces_client_id(HTML::EnvironmentId replaces_client_id) { m_replaces_client_id = move(replaces_client_id); }
 
     [[nodiscard]] TraversableForUserPromptsType const& traversable_for_user_prompts() const { return m_traversable_for_user_prompts; }
     void set_traversable_for_user_prompts(TraversableForUserPromptsType traversable_for_user_prompts) { m_traversable_for_user_prompts = move(traversable_for_user_prompts); }
@@ -260,6 +260,9 @@ public:
     [[nodiscard]] bool user_activation() const { return m_user_activation; }
     void set_user_activation(bool user_activation) { m_user_activation = user_activation; }
 
+    [[nodiscard]] bool user_agent_initiated() const { return m_user_agent_initiated; }
+    void set_user_agent_initiated(bool user_agent_initiated) { m_user_agent_initiated = user_agent_initiated; }
+
     [[nodiscard]] bool render_blocking() const { return m_render_blocking; }
     void set_render_blocking(bool render_blocking) { m_render_blocking = render_blocking; }
 
@@ -287,6 +290,9 @@ public:
 
     [[nodiscard]] bool timing_allow_failed() const { return m_timing_allow_failed; }
     void set_timing_allow_failed(bool timing_allow_failed) { m_timing_allow_failed = timing_allow_failed; }
+
+    [[nodiscard]] Vector<Vector<String>> const& navigation_timing_allow_values_list() const { return m_navigation_timing_allow_values_list; }
+    void append_to_navigation_timing_allow_values_list(Response const&);
 
     [[nodiscard]] URL::URL& url();
     [[nodiscard]] URL::URL const& url() const;
@@ -362,7 +368,7 @@ private:
 
     // https://fetch.spec.whatwg.org/#concept-request-replaces-client-id
     // A request has an associated replaces client id (a string). Unless stated otherwise it is the empty string.
-    Utf16String m_replaces_client_id;
+    HTML::EnvironmentId m_replaces_client_id;
 
     // https://fetch.spec.whatwg.org/#concept-request-window
     // A request has an associated traversable for user prompts, that is "no-traversable", "client", or a traversable
@@ -486,6 +492,10 @@ private:
     // A request has an associated boolean user-activation. Unless stated otherwise, it is false.
     bool m_user_activation { false };
 
+    // NB: Not a Fetch concept. Fetch Metadata's "set site" sends Sec-Fetch-Site:none for a navigation whose URL
+    //     the user agent itself supplied, and populating a history entry sets this from the entry's document state.
+    bool m_user_agent_initiated { false };
+
     // https://fetch.spec.whatwg.org/#request-render-blocking
     // A request has an associated boolean render-blocking. Unless stated otherwise, it is false.
     bool m_render_blocking { false };
@@ -517,6 +527,10 @@ private:
     // https://fetch.spec.whatwg.org/#timing-allow-failed
     // A request has an associated timing allow failed flag. Unless stated otherwise, it is unset.
     bool m_timing_allow_failed { false };
+
+    // https://fetch.spec.whatwg.org/#request-navigation-timing-allow-values-list
+    // A request has an associated navigation timing allow values list (a list of lists of strings). Unless stated otherwise, it is « ».
+    Vector<Vector<String>> m_navigation_timing_allow_values_list;
 
     // Non-standard
     Vector<GC::Ref<Fetching::PendingResponse>> m_pending_responses;

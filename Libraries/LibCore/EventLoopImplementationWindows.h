@@ -7,12 +7,15 @@
 #pragma once
 
 #include <AK/NonnullOwnPtr.h>
+#include <AK/kmalloc.h>
 #include <LibCore/EventLoopImplementation.h>
 
 namespace Core {
 
 class EventLoopManagerWindows final : public EventLoopManager {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual ~EventLoopManagerWindows() override = default;
 
     virtual NonnullOwnPtr<EventLoopImplementation> make_implementation() override;
@@ -43,12 +46,8 @@ public:
     virtual size_t pump(PumpMode) override;
     virtual void quit(int) override;
     virtual void wake() override;
-    virtual bool was_exit_requested() const override { return m_exit_requested; }
 
 private:
-    bool m_exit_requested { false };
-    int m_exit_code { 0 };
-
     // The wake event handle of this event loop needs to be accessible from other threads.
     void* m_wake_event;
 };

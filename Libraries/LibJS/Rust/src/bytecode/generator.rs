@@ -30,6 +30,8 @@ use crate::ast::Position;
 use crate::ast::Utf16String;
 use crate::u32_from_usize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 /// Identifies an operand that auto-frees its register when the last
 /// clone is dropped.
@@ -55,6 +57,7 @@ pub struct PendingSharedFunctionData {
     pub class_field_initializer_name: Option<(Utf16String, bool)>,
     pub should_eager_compile: bool,
     pub precompiled_function: Option<Box<PrecompiledFunction>>,
+    pub enclosing_environment_scope: Option<Arc<EnclosingEnvironmentScope>>,
 }
 
 /// Metadata computed from scope analysis for a SharedFunctionInstanceData.
@@ -109,16 +112,82 @@ pub struct PendingClassBlueprint {
 }
 
 struct EnvironmentCoordinateScope {
-    bindings: HashMap<Utf16String, u32>,
+    bindings: HashMap<ak::Utf16FlyString, u32>,
     next_binding_index: u32,
     kind: EnvironmentCoordinateScopeKind,
+    stops_unresolved_lookups: bool,
+    captured_scope: Option<Arc<EnclosingEnvironmentScope>>,
 }
 
-#[derive(PartialEq)]
+pub struct EnclosingEnvironmentScope {
+    bindings: HashMap<ak::Utf16FlyString, u32>,
+    imports: HashMap<ak::Utf16FlyString, u32>,
+    kind: EnvironmentCoordinateScopeKind,
+    stops_unresolved_lookups: AtomicBool,
+    parent: Option<Arc<EnclosingEnvironmentScope>>,
+}
+
+impl EnclosingEnvironmentScope {
+    pub fn for_module_environment(
+        binding_names: Vec<ak::Utf16FlyString>,
+        import_names: Vec<ak::Utf16FlyString>,
+    ) -> Arc<Self> {
+        fn index_names(names: Vec<ak::Utf16FlyString>) -> HashMap<ak::Utf16FlyString, u32> {
+            let mut indices = HashMap::with_capacity(names.len());
+            for name in names {
+                let index = u32_from_usize(indices.len());
+                let previous_index = indices.insert(name, index);
+                debug_assert!(previous_index.is_none());
+            }
+            indices
+        }
+        Arc::new(Self {
+            bindings: index_names(binding_names),
+            imports: index_names(import_names),
+            kind: EnvironmentCoordinateScopeKind::Static,
+            stops_unresolved_lookups: AtomicBool::new(false),
+            parent: None,
+        })
+    }
+}
+
+pub enum BindingLocation {
+    Environment(EnvironmentCoordinate),
+    Import(u32),
+}
+
+enum ScopeLookup {
+    Found(u32),
+    NotFound,
+    Unresolvable,
+}
+
+fn look_up_in_scope(
+    name: &ak::Utf16FlyString,
+    bindings: &HashMap<ak::Utf16FlyString, u32>,
+    kind: EnvironmentCoordinateScopeKind,
+    stops_unresolved_lookups: bool,
+) -> ScopeLookup {
+    // Coordinates are only safe through fully-known declarative scopes. If
+    // any dynamic scope is crossed, preserve the runtime lookup semantics.
+    if kind == EnvironmentCoordinateScopeKind::Dynamic {
+        return ScopeLookup::Unresolvable;
+    }
+    if let Some(index) = bindings.get(name) {
+        return ScopeLookup::Found(*index);
+    }
+    if stops_unresolved_lookups {
+        return ScopeLookup::Unresolvable;
+    }
+    ScopeLookup::NotFound
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum EnvironmentCoordinateScopeKind {
-    // A declarative environment whose bindings are created by bytecode we emit.
-    // The binding indexes are therefore known while generating the instruction
-    // stream and can be embedded in EnvironmentCoordinate operands.
+    // A declarative environment whose bindings are created by bytecode we emit,
+    // or by module linking in an order we mirror. The binding indexes are
+    // therefore known while generating the instruction stream and can be
+    // embedded in EnvironmentCoordinate operands.
     Static,
     // An object environment, such as `with`, can intercept any name. Once one
     // is between the current point and a binding, resolution must stay dynamic.
@@ -126,6 +195,32 @@ enum EnvironmentCoordinateScopeKind {
 }
 
 const ENVIRONMENT_MODE_LEXICAL: u32 = 0;
+const ENVIRONMENT_MODE_VAR: u32 = 1;
+
+fn should_verify_environment_coordinates() -> bool {
+    static SHOULD_VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHOULD_VERIFY.get_or_init(|| {
+        std::env::var_os("LADYBIRD_JS_VERIFY_ENVIRONMENT_COORDINATES").is_some_and(|value| value == "1")
+    })
+}
+
+fn environment_coordinate_to_verify(
+    instruction: &Instruction,
+) -> Option<(IdentifierTableIndex, EnvironmentCoordinate, u32)> {
+    match instruction {
+        Instruction::GetBinding { identifier, cache, .. }
+        | Instruction::GetInitializedBinding { identifier, cache, .. }
+        | Instruction::GetCalleeAndThisFromEnvironment { identifier, cache, .. }
+        | Instruction::InitializeLexicalBinding { identifier, cache, .. }
+        | Instruction::SetLexicalBinding { identifier, cache, .. }
+        | Instruction::TypeofBinding { identifier, cache, .. } => Some((*identifier, *cache, ENVIRONMENT_MODE_LEXICAL)),
+        Instruction::InitializeVariableBinding { identifier, cache, .. }
+        | Instruction::SetVariableBinding { identifier, cache, .. } => {
+            Some((*identifier, *cache, ENVIRONMENT_MODE_VAR))
+        }
+        _ => None,
+    }
+}
 
 impl std::fmt::Debug for ScopedOperandInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -204,11 +299,12 @@ pub struct FinallyJump {
 }
 
 /// A local variable name with metadata.
-#[derive(Debug)]
 pub struct LocalVariable {
-    pub name: Utf16String,
+    pub name: ak::Utf16FlyString,
     pub is_lexically_declared: bool,
     pub is_initialized_during_declaration_instantiation: bool,
+    pub is_mutable: bool,
+    pub scope_range: Option<crate::ast::SourceRange>,
 }
 
 /// The bytecode generator.
@@ -237,12 +333,12 @@ pub struct Generator {
     string_constants: HashMap<Utf16String, ScopedOperand>,
 
     // --- String/identifier/property tables (with deduplication) ---
-    pub string_table: Vec<Utf16String>,
-    string_table_index: HashMap<Utf16String, StringTableIndex>,
-    pub identifier_table: Vec<Utf16String>,
-    identifier_table_index: HashMap<Utf16String, IdentifierTableIndex>,
-    pub property_key_table: Vec<Utf16String>,
-    property_key_table_index: HashMap<Utf16String, PropertyKeyTableIndex>,
+    pub string_table: Vec<ak::Utf16FlyString>,
+    string_table_index: HashMap<ak::Utf16FlyString, StringTableIndex>,
+    pub identifier_table: Vec<ak::Utf16FlyString>,
+    identifier_table_index: HashMap<ak::Utf16FlyString, IdentifierTableIndex>,
+    pub property_key_table: Vec<ak::Utf16FlyString>,
+    property_key_table_index: HashMap<ak::Utf16FlyString, PropertyKeyTableIndex>,
     pub compiled_regexes: Vec<*mut std::ffi::c_void>,
 
     // --- Scope/unwind state ---
@@ -259,6 +355,12 @@ pub struct Generator {
     // current lexical environment. Keep a separate anchor so a var write inside
     // a nested block does not accidentally count the block as a hop.
     variable_environment_coordinate_scope_index: Option<usize>,
+    // A non-strict direct eval can add `var` bindings to the variable
+    // environment at runtime, so a name it lacks cannot resolve to any outer
+    // environment.
+    pub contains_direct_call_to_eval_in_non_strict_mode: bool,
+    pub enclosing_environment_scope: Option<Arc<EnclosingEnvironmentScope>>,
+    verify_environment_coordinates: bool,
     pub home_objects: Vec<ScopedOperand>,
 
     // --- Finally context ---
@@ -274,12 +376,14 @@ pub struct Generator {
     pub next_template_object_cache: u32,
     pub next_object_shape_cache: u32,
     pub next_object_property_iterator_cache: u32,
+    pub next_environment_shape_cache: u32,
 
     // --- Codegen state ---
     pub strict: bool,
     pub this_value_needs_environment_resolution: bool,
     pub enclosing_function_kind: FunctionKind,
     pub local_variables: Vec<LocalVariable>,
+    pub argument_variable_names: Vec<ak::Utf16FlyString>,
     pub initialized_locals: Vec<bool>,
     pub initialized_arguments: Vec<bool>,
 
@@ -318,6 +422,7 @@ pub struct Generator {
     // --- Unwind context ---
     // When set, newly created basic blocks inherit this handler index.
     pub current_unwind_handler: Option<Label>,
+    pub catch_handler_labels: HashSet<u32>,
 
     // --- AnnexB function names ---
     // Names approved for AnnexB.3.3 hoisting by the scope collector.
@@ -381,11 +486,11 @@ macro_rules! next_cache_method {
 macro_rules! define_intern_method {
     ($method_name:ident, $index_type:ident, $table:ident, $cache:ident) => {
         pub fn $method_name(&mut self, s: &[u16]) -> $index_type {
-            if let Some(&index) = self.$cache.get(s) {
+            let key = ak::Utf16FlyString::from_utf16(s);
+            if let Some(&index) = self.$cache.get(&key) {
                 return index;
             }
             let index = $index_type(u32_from_usize(self.$table.len()));
-            let key = Utf16String(s.to_vec());
             self.$table.push(key.clone());
             self.$cache.insert(key, index);
             index
@@ -431,6 +536,9 @@ impl Generator {
             lexical_environment_register_stack: Vec::new(),
             environment_coordinate_scope_stack: Vec::new(),
             variable_environment_coordinate_scope_index: None,
+            contains_direct_call_to_eval_in_non_strict_mode: false,
+            enclosing_environment_scope: None,
+            verify_environment_coordinates: should_verify_environment_coordinates(),
             home_objects: Vec::new(),
             finally_contexts: Vec::new(),
             current_finally_context: None,
@@ -440,10 +548,12 @@ impl Generator {
             next_template_object_cache: 0,
             next_object_shape_cache: 0,
             next_object_property_iterator_cache: 0,
+            next_environment_shape_cache: 0,
             strict: false,
             this_value_needs_environment_resolution: true,
             enclosing_function_kind: FunctionKind::Normal,
             local_variables: Vec::new(),
+            argument_variable_names: Vec::new(),
             initialized_locals: Vec::new(),
             initialized_arguments: Vec::new(),
             pending_lhs_name: None,
@@ -477,6 +587,7 @@ impl Generator {
             class_blueprints: Vec::new(),
             length_identifier: None,
             current_unwind_handler: None,
+            catch_handler_labels: HashSet::new(),
             annexb_function_names: HashSet::new(),
             builtin_abstract_operations_enabled: false,
             vm_ptr: std::ptr::null_mut(),
@@ -710,8 +821,7 @@ impl Generator {
     }
 
     /// If `operand` is a constant string that is not an array index, intern it
-    /// as a property key and return the index. Uses split borrows to avoid
-    /// cloning the string when it is already interned (the common case).
+    /// as a property key and return the index.
     pub fn try_constant_string_to_property_key(&mut self, operand: &ScopedOperand) -> Option<PropertyKeyTableIndex> {
         if !operand.operand().is_constant() {
             return None;
@@ -721,12 +831,10 @@ impl Generator {
             Some(ConstantValue::String(s)) if !super::codegen::is_array_index(&s.0) => &s.0,
             _ => return None,
         };
-        // Split borrow: s borrows self.constants, get() borrows self.property_key_table_index
-        if let Some(&key_index) = self.property_key_table_index.get(s) {
+        let owned = ak::Utf16FlyString::from_utf16(s);
+        if let Some(&key_index) = self.property_key_table_index.get(&owned) {
             return Some(key_index);
         }
-        // Cold path: not yet interned, must clone
-        let owned = Utf16String(s.to_vec());
         let key_index = PropertyKeyTableIndex(u32_from_usize(self.property_key_table.len()));
         self.property_key_table.push(owned.clone());
         self.property_key_table_index.insert(owned, key_index);
@@ -734,7 +842,8 @@ impl Generator {
     }
 
     /// Register a pending SharedFunctionInstanceData descriptor and return its index.
-    pub fn register_shared_function_data(&mut self, data: PendingSharedFunctionData) -> u32 {
+    pub fn register_shared_function_data(&mut self, mut data: PendingSharedFunctionData) -> u32 {
+        data.enclosing_environment_scope = self.capture_environment_coordinate_scopes();
         let index = u32_from_usize(self.shared_function_data.len());
         self.shared_function_data.push(data);
         index
@@ -825,6 +934,15 @@ impl Generator {
         if self.is_current_block_terminated() {
             return;
         }
+        if self.verify_environment_coordinates
+            && let Some((identifier, coordinate, mode)) = environment_coordinate_to_verify(&instruction)
+        {
+            self.emit(Instruction::VerifyEnvironmentCoordinate {
+                identifier,
+                coordinate,
+                mode,
+            });
+        }
         // Keep coordinate scopes in lockstep with the actual declarative
         // environment shape. Most bindings are created explicitly, while
         // CreateArguments can implicitly create an `arguments` binding.
@@ -850,7 +968,7 @@ impl Generator {
             self.record_environment_binding(name);
         }
         if let Instruction::CreateArguments { dst: None, .. } = &instruction {
-            self.record_environment_binding(Utf16String::from(utf16!("arguments")));
+            self.record_environment_binding(ak::Utf16FlyString::from_utf8("arguments"));
         }
         let source_map = SourceMapEntry {
             bytecode_offset: 0, // filled during flattening
@@ -985,6 +1103,7 @@ impl Generator {
     next_cache_method!(next_template_object_cache, next_template_object_cache);
     next_cache_method!(next_object_shape_cache, next_object_shape_cache);
     next_cache_method!(next_object_property_iterator_cache, next_object_property_iterator_cache);
+    next_cache_method!(next_environment_shape_cache, next_environment_shape_cache);
 
     // --- Lexical environment helpers ---
 
@@ -1001,11 +1120,14 @@ impl Generator {
         self.push_untracked_lexical_environment(env_reg);
     }
 
-    pub fn capture_saved_lexical_environment_with_coordinates(&mut self) {
+    pub fn capture_saved_lexical_environment_with_coordinates(&mut self, has_function_environment: bool) {
         let env_reg = self.scoped_operand(Operand::register(Register::SAVED_LEXICAL_ENVIRONMENT));
         self.emit(Instruction::GetLexicalEnvironment { dst: env_reg.operand() });
-        self.push_static_lexical_environment(env_reg);
-        self.variable_environment_coordinate_scope_index = self.environment_coordinate_scope_stack.len().checked_sub(1);
+        if !has_function_environment {
+            self.push_untracked_lexical_environment(env_reg);
+            return;
+        }
+        self.push_static_variable_environment(env_reg);
     }
 
     pub fn end_variable_scope(&mut self) {
@@ -1041,10 +1163,12 @@ impl Generator {
     fn push_new_lexical_environment_impl(&mut self, capacity: u32, is_catch_environment: bool) -> ScopedOperand {
         let parent = self.current_lexical_environment();
         let new_env = self.allocate_register();
+        let shape_cache = self.next_environment_shape_cache();
         self.emit(Instruction::CreateLexicalEnvironment {
             dst: new_env.operand(),
             parent: parent.operand(),
             capacity,
+            shape_cache,
             is_catch_environment,
         });
         self.push_static_lexical_environment(new_env.clone());
@@ -1067,7 +1191,10 @@ impl Generator {
 
     pub fn push_static_variable_environment(&mut self, environment: ScopedOperand) {
         self.push_static_lexical_environment(environment);
-        self.variable_environment_coordinate_scope_index = self.environment_coordinate_scope_stack.len().checked_sub(1);
+        let scope_index = self.environment_coordinate_scope_stack.len() - 1;
+        self.environment_coordinate_scope_stack[scope_index].stops_unresolved_lookups =
+            self.contains_direct_call_to_eval_in_non_strict_mode;
+        self.variable_environment_coordinate_scope_index = Some(scope_index);
     }
 
     pub fn pop_untracked_lexical_environment(&mut self) -> Option<ScopedOperand> {
@@ -1085,68 +1212,114 @@ impl Generator {
                 bindings: HashMap::new(),
                 next_binding_index: 0,
                 kind,
+                stops_unresolved_lookups: false,
+                captured_scope: None,
             });
+    }
+
+    fn capture_environment_coordinate_scopes(&mut self) -> Option<Arc<EnclosingEnvironmentScope>> {
+        let mut parent = self.enclosing_environment_scope.clone();
+        let mut parent_was_captured_again = false;
+        for scope in &mut self.environment_coordinate_scope_stack {
+            if parent_was_captured_again || scope.captured_scope.is_none() {
+                scope.captured_scope = Some(Arc::new(EnclosingEnvironmentScope {
+                    bindings: scope.bindings.clone(),
+                    imports: HashMap::new(),
+                    kind: scope.kind,
+                    stops_unresolved_lookups: AtomicBool::new(scope.stops_unresolved_lookups),
+                    parent,
+                }));
+                parent_was_captured_again = true;
+            }
+            parent = scope.captured_scope.clone();
+        }
+        parent
     }
 
     fn pop_environment_coordinate_scope(&mut self) {
         self.environment_coordinate_scope_stack.pop();
     }
 
-    fn record_environment_binding(&mut self, name: Utf16String) {
+    fn record_environment_binding(&mut self, name: ak::Utf16FlyString) {
         let Some(scope_index) = self.environment_coordinate_scope_stack.len().checked_sub(1) else {
             return;
         };
         self.record_environment_binding_at_scope_index(name, scope_index);
     }
 
-    fn record_variable_environment_binding(&mut self, name: Utf16String) {
+    fn record_variable_environment_binding(&mut self, name: ak::Utf16FlyString) {
         let Some(scope_index) = self.variable_environment_coordinate_scope_index else {
             return;
         };
         self.record_environment_binding_at_scope_index(name, scope_index);
     }
 
-    fn record_environment_binding_at_scope_index(&mut self, name: Utf16String, scope_index: usize) {
+    fn record_environment_binding_at_scope_index(&mut self, name: ak::Utf16FlyString, scope_index: usize) {
         let Some(scope) = self.environment_coordinate_scope_stack.get_mut(scope_index) else {
             return;
         };
         if scope.kind == EnvironmentCoordinateScopeKind::Dynamic {
             return;
         }
-        // DeclarativeEnvironment appends duplicate bindings and resolves the
-        // name to the newest slot, so mirror that layout here.
+        debug_assert!(!scope.bindings.contains_key(&name));
         scope.bindings.insert(name, scope.next_binding_index);
         scope.next_binding_index += 1;
+        if let Some(captured_scope) = scope.captured_scope.take() {
+            captured_scope.stops_unresolved_lookups.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn environment_coordinate_for(&self, name: &[u16]) -> Option<EnvironmentCoordinate> {
         self.environment_coordinate_for_from_scope_index(
-            name,
-            self.environment_coordinate_scope_stack.len().checked_sub(1)?,
+            &ak::Utf16FlyString::from_utf16(name),
+            self.environment_coordinate_scope_stack.len().checked_sub(1),
         )
     }
 
     fn environment_coordinate_for_from_scope_index(
         &self,
-        name: &[u16],
-        scope_index: usize,
+        name: &ak::Utf16FlyString,
+        scope_index: Option<usize>,
     ) -> Option<EnvironmentCoordinate> {
-        // Coordinates are only safe through fully-known declarative scopes. If
-        // any dynamic scope is crossed, preserve the runtime lookup semantics.
-        for (hops, scope) in self.environment_coordinate_scope_stack[..=scope_index]
-            .iter()
-            .rev()
-            .enumerate()
-        {
-            if scope.kind == EnvironmentCoordinateScopeKind::Dynamic {
-                return None;
+        match self.binding_location_for_from_scope_index(name, scope_index)? {
+            BindingLocation::Environment(coordinate) => Some(coordinate),
+            BindingLocation::Import(_) => None,
+        }
+    }
+
+    fn binding_location_for_from_scope_index(
+        &self,
+        name: &ak::Utf16FlyString,
+        scope_index: Option<usize>,
+    ) -> Option<BindingLocation> {
+        let local_scopes = match scope_index {
+            Some(scope_index) => &self.environment_coordinate_scope_stack[..=scope_index],
+            None => &[],
+        };
+        let mut hops = 0;
+        for scope in local_scopes.iter().rev() {
+            match look_up_in_scope(name, &scope.bindings, scope.kind, scope.stops_unresolved_lookups) {
+                ScopeLookup::Found(index) => {
+                    return Some(BindingLocation::Environment(EnvironmentCoordinate { hops, index }));
+                }
+                ScopeLookup::NotFound => hops += 1,
+                ScopeLookup::Unresolvable => return None,
             }
-            if let Some(index) = scope.bindings.get(name) {
-                return Some(EnvironmentCoordinate {
-                    hops: u32_from_usize(hops),
-                    index: *index,
-                });
+        }
+        let mut enclosing_scope = self.enclosing_environment_scope.as_deref();
+        while let Some(scope) = enclosing_scope {
+            let stops_unresolved_lookups = scope.stops_unresolved_lookups.load(Ordering::Relaxed);
+            match look_up_in_scope(name, &scope.bindings, scope.kind, stops_unresolved_lookups) {
+                ScopeLookup::Found(index) => {
+                    return Some(BindingLocation::Environment(EnvironmentCoordinate { hops, index }));
+                }
+                ScopeLookup::NotFound => hops += 1,
+                ScopeLookup::Unresolvable => return None,
             }
+            if let Some(import_index) = scope.imports.get(name) {
+                return Some(BindingLocation::Import(*import_index));
+            }
+            enclosing_scope = scope.parent.as_deref();
         }
         None
     }
@@ -1156,7 +1329,15 @@ impl Generator {
         identifier: IdentifierTableIndex,
     ) -> Option<EnvironmentCoordinate> {
         let name = &self.identifier_table[identifier.0 as usize];
-        self.environment_coordinate_for(name)
+        self.environment_coordinate_for_from_scope_index(
+            name,
+            self.environment_coordinate_scope_stack.len().checked_sub(1),
+        )
+    }
+
+    pub fn binding_location_for_identifier(&self, identifier: IdentifierTableIndex) -> Option<BindingLocation> {
+        let name = &self.identifier_table[identifier.0 as usize];
+        self.binding_location_for_from_scope_index(name, self.environment_coordinate_scope_stack.len().checked_sub(1))
     }
 
     pub fn variable_environment_coordinate_for_identifier(
@@ -1164,7 +1345,7 @@ impl Generator {
         identifier: IdentifierTableIndex,
     ) -> Option<EnvironmentCoordinate> {
         let name = &self.identifier_table[identifier.0 as usize];
-        self.environment_coordinate_for_from_scope_index(name, self.variable_environment_coordinate_scope_index?)
+        self.environment_coordinate_for_from_scope_index(name, Some(self.variable_environment_coordinate_scope_index?))
     }
 
     // --- Boundary management ---
@@ -1665,27 +1846,27 @@ impl Generator {
     /// 4. Encode to bytes and build source map + exception handlers
     pub fn assemble(&mut self) -> AssembledBytecode {
         let saved_environment = Operand::register(Register::SAVED_LEXICAL_ENVIRONMENT);
-        let synthetic_load_block = self.basic_blocks.iter().position(|block| {
+        let synthetic_load = self.basic_blocks.iter().enumerate().find_map(|(block_index, block)| {
+            let (instruction_index, (instruction, _, _)) = block
+                .instructions
+                .iter()
+                .enumerate()
+                .find(|(_, (instruction, _, _))| !matches!(instruction, Instruction::Enter))?;
             matches!(
-                block.instructions.first(),
-                Some((
-                    Instruction::GetLexicalEnvironment {
-                        dst,
-                    },
-                    _,
-                    _
-                )) if *dst == saved_environment
+                instruction,
+                Instruction::GetLexicalEnvironment { dst } if *dst == saved_environment
             )
+            .then_some((block_index, instruction_index))
         });
 
-        if let Some(load_block_index) = synthetic_load_block {
+        if let Some((load_block_index, load_instruction_index)) = synthetic_load {
             let saved_environment_is_used = self.basic_blocks.iter().enumerate().any(|(block_index, block)| {
                 block
                     .instructions
                     .iter()
                     .enumerate()
                     .any(|(instruction_index, (instruction, _, _))| {
-                        if block_index == load_block_index && instruction_index == 0 {
+                        if block_index == load_block_index && instruction_index == load_instruction_index {
                             return false;
                         }
                         let mut instruction = instruction.clone();
@@ -1700,7 +1881,9 @@ impl Generator {
             });
 
             if !saved_environment_is_used {
-                self.basic_blocks[load_block_index].instructions.remove(0);
+                self.basic_blocks[load_block_index]
+                    .instructions
+                    .remove(load_instruction_index);
             }
         }
 
@@ -1721,29 +1904,7 @@ impl Generator {
         for block in &mut self.basic_blocks {
             remove_redundant_movs(&mut block.instructions);
 
-            let mut index = 0;
-            while index < block.instructions.len() {
-                let instructions = block.instructions[index..]
-                    .iter()
-                    .map(|(instruction, _, _)| instruction);
-                let Some((specialized, component_count)) =
-                    specialize_instruction_sequence(instructions, &self.constants)
-                else {
-                    index += 1;
-                    continue;
-                };
-                let strict = block.instructions[index].2;
-                if block.instructions[index..index + component_count]
-                    .iter()
-                    .any(|(_, _, component_strict)| *component_strict != strict)
-                {
-                    index += 1;
-                    continue;
-                }
-                block.instructions[index].0 = specialized;
-                block.instructions.drain(index + 1..index + component_count);
-                index += 1;
-            }
+            specialize_instructions(&mut block.instructions, &self.constants);
         }
 
         let number_of_registers = self.next_register;
@@ -2021,6 +2182,7 @@ impl Generator {
                     start_offset: u32_from_usize(block_start),
                     end_offset: u32_from_usize(bytecode.len()),
                     handler_offset: u32_from_usize(block_offsets[handler_label.basic_block_index()]),
+                    catches_exception: self.catch_handler_labels.contains(&handler_label.0),
                 });
             }
         }
@@ -2031,6 +2193,7 @@ impl Generator {
             if let Some(last) = merged_handlers.last_mut()
                 && last.end_offset == handler.start_offset
                 && last.handler_offset == handler.handler_offset
+                && last.catches_exception == handler.catches_exception
             {
                 last.end_offset = handler.end_offset;
                 continue;
@@ -2069,6 +2232,7 @@ pub struct ExceptionHandler {
     pub start_offset: u32,
     pub end_offset: u32,
     pub handler_offset: u32,
+    pub catches_exception: bool,
 }
 
 /// A typed constant value stored in the constant pool.
@@ -2126,6 +2290,32 @@ pub fn choose_dst(generator: &mut Generator, preferred_dst: Option<&ScopedOperan
         Some(dst) => dst.clone(),
         None => generator.allocate_register(),
     }
+}
+
+fn specialize_instructions(instructions: &mut Vec<(Instruction, SourceMapEntry, bool)>, constants: &[ConstantValue]) {
+    let mut read_index = 0;
+    let mut write_index = 0;
+    while read_index < instructions.len() {
+        let mut consumed = 1;
+        if let Some((specialized, component_count)) = specialize_instruction_sequence(
+            instructions[read_index..].iter().map(|(instruction, _, _)| instruction),
+            constants,
+        ) {
+            let strict = instructions[read_index].2;
+            if instructions[read_index..read_index + component_count]
+                .iter()
+                .all(|(_, _, component_strict)| *component_strict == strict)
+            {
+                instructions[read_index].0 = specialized;
+                consumed = component_count;
+            }
+        }
+        // Compact once instead of shifting the entire tail after each fused sequence.
+        instructions.swap(write_index, read_index);
+        write_index += 1;
+        read_index += consumed;
+    }
+    instructions.truncate(write_index);
 }
 
 fn remove_redundant_movs(instructions: &mut Vec<(Instruction, SourceMapEntry, bool)>) {
@@ -2187,6 +2377,67 @@ mod tests {
 
     fn register(index: u32) -> Operand {
         Operand::register(Register(index))
+    }
+
+    #[test]
+    fn compacts_fused_sequences_with_their_original_source_locations() {
+        let mut instructions: Vec<_> = (0..3000)
+            .map(|index| {
+                let mut instruction = mov(register(index), Operand::constant(0));
+                instruction.1.line = index;
+                instruction
+            })
+            .collect();
+        specialize_instructions(&mut instructions, &[ConstantValue::Undefined]);
+        assert_eq!(instructions.len(), 1000);
+        for (index, (instruction, source, strict)) in instructions.iter().enumerate() {
+            assert!(matches!(instruction, Instruction::MovUndefined3 { .. }));
+            assert_eq!(source.line, index as u32 * 3);
+            assert!(!strict);
+        }
+    }
+
+    #[test]
+    fn preserves_strict_mode_boundaries_when_compacting_fused_sequences() {
+        let mut instructions: Vec<_> = (0..7)
+            .map(|index| {
+                let mut instruction = mov(register(index), Operand::constant(0));
+                instruction.1.line = index;
+                instruction.2 = index >= 3;
+                instruction
+            })
+            .collect();
+        specialize_instructions(&mut instructions, &[ConstantValue::Undefined]);
+        assert_eq!(instructions.len(), 3);
+        assert!(matches!(instructions[0].0, Instruction::MovUndefined3 { .. }));
+        assert!(matches!(instructions[1].0, Instruction::MovUndefined3 { .. }));
+        assert!(matches!(instructions[2].0, Instruction::MovSrcUndefined { .. }));
+        assert_eq!(
+            instructions
+                .iter()
+                .map(|(_, source, strict)| (source.line, *strict))
+                .collect::<Vec<_>>(),
+            vec![(0, false), (3, true), (6, true)]
+        );
+    }
+
+    #[test]
+    fn does_not_fuse_a_sequence_that_crosses_strict_mode_boundaries() {
+        let mut instructions = vec![
+            mov(register(0), Operand::constant(0)),
+            mov(register(1), Operand::constant(0)),
+            mov(register(2), Operand::constant(0)),
+        ];
+        instructions[1].2 = true;
+        specialize_instructions(&mut instructions, &[ConstantValue::Undefined]);
+        assert_eq!(instructions.len(), 3);
+        assert!(matches!(instructions[0].0, Instruction::Mov { .. }));
+        assert!(matches!(instructions[1].0, Instruction::Mov { .. }));
+        assert!(matches!(instructions[2].0, Instruction::MovSrcUndefined { .. }));
+        assert_eq!(
+            instructions.iter().map(|(_, _, strict)| *strict).collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
     }
 
     #[test]

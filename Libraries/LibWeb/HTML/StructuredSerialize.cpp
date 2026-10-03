@@ -16,8 +16,11 @@
 #include <AK/StdLibExtras.h>
 #include <AK/String.h>
 #include <AK/UnicodeUtils.h>
+#include <LibCore/AnonymousBuffer.h>
+#include <LibCrypto/ASN1/DER.h>
 #include <LibCrypto/BigInt/SignedBigInteger.h>
 #include <LibCrypto/BigInt/UnsignedBigInteger.h>
+#include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Color.h>
 #include <LibIPC/File.h>
@@ -36,6 +39,7 @@
 #include <LibJS/Runtime/StringObject.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibWeb/Bindings/CryptoKey.h>
 #include <LibWeb/Bindings/DOMException.h>
 #include <LibWeb/Bindings/DOMMatrix.h>
 #include <LibWeb/Bindings/DOMMatrixReadOnly.h>
@@ -49,6 +53,8 @@
 #include <LibWeb/Bindings/ImageBitmap.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/MessagePort.h>
+#include <LibWeb/Bindings/PredefinedColorSpace.h>
+#include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/Bindings/QuotaExceededError.h>
 #include <LibWeb/Bindings/ReadableStream.h>
 #include <LibWeb/Bindings/Serializable.h>
@@ -69,6 +75,7 @@
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/HTML/MessagePort.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/Streams/ReadableStream.h>
@@ -79,7 +86,7 @@
 
 namespace Web::HTML {
 
-enum class ErrorType : u8 {
+enum ErrorType {
     Error,
 #define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
     ClassName,
@@ -118,23 +125,24 @@ static ErrorOr<String> utf16_to_utf8_text(Utf16String const& text)
 }
 
 // Explicit return types keep these non-capturing lambdas function-pointer compatible.
-static constexpr Array<SerializableRegistryEntry, 15> s_serializable_storage_registry { {
-    { Bindings::InterfaceName::Blob, "Blob"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return FileAPI::Blob::create(realm); } },
-    { Bindings::InterfaceName::File, "File"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return FileAPI::File::create(realm); } },
-    { Bindings::InterfaceName::FileList, "FileList"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return FileAPI::FileList::create(realm); } },
-    { Bindings::InterfaceName::DOMException, "DOMException"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return WebIDL::DOMException::create(realm); } },
-    { Bindings::InterfaceName::DOMMatrixReadOnly, "DOMMatrixReadOnly"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return Geometry::DOMMatrixReadOnly::create(realm); } },
-    { Bindings::InterfaceName::DOMMatrix, "DOMMatrix"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return Geometry::DOMMatrix::create(realm); } },
-    { Bindings::InterfaceName::DOMPointReadOnly, "DOMPointReadOnly"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return Geometry::DOMPointReadOnly::create(realm); } },
-    { Bindings::InterfaceName::DOMPoint, "DOMPoint"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return Geometry::DOMPoint::create(realm); } },
-    { Bindings::InterfaceName::DOMRectReadOnly, "DOMRectReadOnly"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return Geometry::DOMRectReadOnly::create(realm); } },
-    { Bindings::InterfaceName::DOMRect, "DOMRect"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return Geometry::DOMRect::create(realm); } },
-    { Bindings::InterfaceName::CryptoKey, "CryptoKey"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return Crypto::CryptoKey::create(realm); } },
-    { Bindings::InterfaceName::DOMQuad, "DOMQuad"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return Geometry::DOMQuad::create(realm); } },
-    { Bindings::InterfaceName::ImageData, "ImageData"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return ImageData::create(realm); } },
-    { Bindings::InterfaceName::ImageBitmap, "ImageBitmap"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return ImageBitmap::create(realm); } },
-    { Bindings::InterfaceName::QuotaExceededError, "QuotaExceededError"sv, [](JS::Realm& realm) -> GC::Ref<Bindings::PlatformObject> { return WebIDL::QuotaExceededError::create(realm); } },
-} };
+static constexpr auto s_serializable_storage_registry = to_array<SerializableRegistryEntry>({
+    { Bindings::InterfaceName::Blob, "Blob"sv },
+    { Bindings::InterfaceName::CryptoKey, "CryptoKey"sv },
+    { Bindings::InterfaceName::DOMException, "DOMException"sv },
+    { Bindings::InterfaceName::DOMMatrix, "DOMMatrix"sv },
+    { Bindings::InterfaceName::DOMMatrixReadOnly, "DOMMatrixReadOnly"sv },
+    { Bindings::InterfaceName::DOMPoint, "DOMPoint"sv },
+    { Bindings::InterfaceName::DOMPointReadOnly, "DOMPointReadOnly"sv },
+    { Bindings::InterfaceName::DOMQuad, "DOMQuad"sv },
+    { Bindings::InterfaceName::DOMRect, "DOMRect"sv },
+    { Bindings::InterfaceName::DOMRectReadOnly, "DOMRectReadOnly"sv },
+    { Bindings::InterfaceName::File, "File"sv },
+    { Bindings::InterfaceName::FileList, "FileList"sv },
+    { Bindings::InterfaceName::ImageBitmap, "ImageBitmap"sv },
+    { Bindings::InterfaceName::ImageData, "ImageData"sv },
+    { Bindings::InterfaceName::Module, "Module"sv },
+    { Bindings::InterfaceName::QuotaExceededError, "QuotaExceededError"sv },
+});
 
 ReadonlySpan<SerializableRegistryEntry> serializable_storage_registry()
 {
@@ -194,21 +202,21 @@ static ErrorOr<StringView> key_usage_to_storage_identifier(Bindings::KeyUsage ke
         return "sign"sv;
     case Bindings::KeyUsage::Verify:
         return "verify"sv;
-    case Bindings::KeyUsage::Derivekey:
+    case Bindings::KeyUsage::DeriveKey:
         return "deriveKey"sv;
-    case Bindings::KeyUsage::Derivebits:
+    case Bindings::KeyUsage::DeriveBits:
         return "deriveBits"sv;
-    case Bindings::KeyUsage::Wrapkey:
+    case Bindings::KeyUsage::WrapKey:
         return "wrapKey"sv;
-    case Bindings::KeyUsage::Unwrapkey:
+    case Bindings::KeyUsage::UnwrapKey:
         return "unwrapKey"sv;
-    case Bindings::KeyUsage::Encapsulatekey:
+    case Bindings::KeyUsage::EncapsulateKey:
         return "encapsulateKey"sv;
-    case Bindings::KeyUsage::Encapsulatebits:
+    case Bindings::KeyUsage::EncapsulateBits:
         return "encapsulateBits"sv;
-    case Bindings::KeyUsage::Decapsulatekey:
+    case Bindings::KeyUsage::DecapsulateKey:
         return "decapsulateKey"sv;
-    case Bindings::KeyUsage::Decapsulatebits:
+    case Bindings::KeyUsage::DecapsulateBits:
         return "decapsulateBits"sv;
     }
     return Error::from_string_literal("Invalid structured serialize key usage");
@@ -225,21 +233,21 @@ static ErrorOr<Bindings::KeyUsage> storage_identifier_to_key_usage(StringView id
     if (identifier == "verify"sv)
         return Bindings::KeyUsage::Verify;
     if (identifier == "deriveKey"sv)
-        return Bindings::KeyUsage::Derivekey;
+        return Bindings::KeyUsage::DeriveKey;
     if (identifier == "deriveBits"sv)
-        return Bindings::KeyUsage::Derivebits;
+        return Bindings::KeyUsage::DeriveBits;
     if (identifier == "wrapKey"sv)
-        return Bindings::KeyUsage::Wrapkey;
+        return Bindings::KeyUsage::WrapKey;
     if (identifier == "unwrapKey"sv)
-        return Bindings::KeyUsage::Unwrapkey;
+        return Bindings::KeyUsage::UnwrapKey;
     if (identifier == "encapsulateKey"sv)
-        return Bindings::KeyUsage::Encapsulatekey;
+        return Bindings::KeyUsage::EncapsulateKey;
     if (identifier == "encapsulateBits"sv)
-        return Bindings::KeyUsage::Encapsulatebits;
+        return Bindings::KeyUsage::EncapsulateBits;
     if (identifier == "decapsulateKey"sv)
-        return Bindings::KeyUsage::Decapsulatekey;
+        return Bindings::KeyUsage::DecapsulateKey;
     if (identifier == "decapsulateBits"sv)
-        return Bindings::KeyUsage::Decapsulatebits;
+        return Bindings::KeyUsage::DecapsulateBits;
     return Error::from_string_literal("Unknown structured serialize key usage");
 }
 
@@ -321,13 +329,10 @@ static ErrorOr<Gfx::AlphaType> storage_identifier_to_alpha_type(StringView ident
     return Error::from_string_literal("Unknown structured serialize alpha type");
 }
 
-static constexpr Array<u8, 4> storage_format_magic = { 'L', 'B', 'S', 'C' };
-
-// Flags are for optional envelope features (e.g. compression); changes to the value encoding bump the version instead.
-static constexpr u64 storage_format_flags = 0;
-
 class StructuredSerializeDataEncoder {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual ~StructuredSerializeDataEncoder() = default;
 
     virtual SerializationType type() const = 0;
@@ -351,6 +356,8 @@ public:
 
 class StructuredSerializeDataDecoder {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual ~StructuredSerializeDataDecoder() = default;
 
     virtual SerializationType type() const = 0;
@@ -444,9 +451,7 @@ class StorageStructuredSerializeDataEncoder final : public StructuredSerializeDa
 public:
     StorageStructuredSerializeDataEncoder()
     {
-        m_data.append(storage_format_magic.data(), storage_format_magic.size());
-        encode(storage_format_version);
-        encode(storage_format_flags);
+        append_storage_format_prologue(m_data);
     }
 
     virtual SerializationType type() const override { return SerializationType::Storage; }
@@ -719,11 +724,31 @@ static void encode_value(StructuredSerializeDataEncoder& encoder, int value)
     encoder.encode(static_cast<i32>(value));
 }
 
+static void encode_value(StructuredSerializeDataEncoder& encoder, long value)
+{
+    encoder.encode(static_cast<i64>(value));
+}
+
+static void encode_value(StructuredSerializeDataEncoder& encoder, long long value)
+{
+    encoder.encode(static_cast<i64>(value));
+}
+
+static void encode_value(StructuredSerializeDataEncoder& encoder, unsigned long value)
+{
+    encoder.encode(static_cast<u64>(value));
+}
+
+static void encode_value(StructuredSerializeDataEncoder& encoder, unsigned long long value)
+{
+    encoder.encode(static_cast<u64>(value));
+}
+
 static void encode_value(StructuredSerializeDataEncoder& encoder, ErrorType value)
 {
     auto identifier = MUST(error_type_to_name(value));
     if (encoder.type() == SerializationType::IPC)
-        encoder.encode(to_underlying(value));
+        encoder.encode(static_cast<u8>(to_underlying(value)));
     else
         encoder.encode(Utf16String::from_utf8(identifier));
 }
@@ -736,7 +761,7 @@ static void encode_value(StructuredSerializeDataEncoder& encoder, Bindings::Inte
         encoder.encode(Utf16String::from_utf8(MUST(serializable_interface_name_to_storage_identifier(value))));
 }
 
-static void encode_value(StructuredSerializeDataEncoder& encoder, Bindings::KeyType value)
+[[maybe_unused]] static void encode_value(StructuredSerializeDataEncoder& encoder, Bindings::KeyType value)
 {
     auto identifier = MUST(key_type_to_storage_identifier(value));
     if (encoder.type() == SerializationType::IPC)
@@ -745,7 +770,7 @@ static void encode_value(StructuredSerializeDataEncoder& encoder, Bindings::KeyT
         encoder.encode(Utf16String::from_utf8(identifier));
 }
 
-static void encode_value(StructuredSerializeDataEncoder& encoder, Bindings::KeyUsage value)
+[[maybe_unused]] static void encode_value(StructuredSerializeDataEncoder& encoder, Bindings::KeyUsage value)
 {
     auto identifier = MUST(key_usage_to_storage_identifier(value));
     if (encoder.type() == SerializationType::IPC)
@@ -754,7 +779,12 @@ static void encode_value(StructuredSerializeDataEncoder& encoder, Bindings::KeyU
         encoder.encode(Utf16String::from_utf8(identifier));
 }
 
-static void encode_value(StructuredSerializeDataEncoder& encoder, Bindings::PredefinedColorSpace value)
+static void encode_value(StructuredSerializeDataEncoder& encoder, Crypto::KeyType value)
+{
+    encoder.encode(to_underlying(value));
+}
+
+[[maybe_unused]] static void encode_value(StructuredSerializeDataEncoder& encoder, Bindings::PredefinedColorSpace value)
 {
     auto identifier = MUST(color_space_to_storage_identifier(value));
     if (encoder.type() == SerializationType::IPC)
@@ -763,7 +793,7 @@ static void encode_value(StructuredSerializeDataEncoder& encoder, Bindings::Pred
         encoder.encode(Utf16String::from_utf8(identifier));
 }
 
-static void encode_value(StructuredSerializeDataEncoder& encoder, Gfx::BitmapFormat value)
+[[maybe_unused]] static void encode_value(StructuredSerializeDataEncoder& encoder, Gfx::BitmapFormat value)
 {
     auto identifier = MUST(bitmap_format_to_storage_identifier(value));
     if (encoder.type() == SerializationType::IPC)
@@ -772,7 +802,7 @@ static void encode_value(StructuredSerializeDataEncoder& encoder, Gfx::BitmapFor
         encoder.encode(Utf16String::from_utf8(identifier));
 }
 
-static void encode_value(StructuredSerializeDataEncoder& encoder, Gfx::AlphaType value)
+[[maybe_unused]] static void encode_value(StructuredSerializeDataEncoder& encoder, Gfx::AlphaType value)
 {
     auto identifier = MUST(alpha_type_to_storage_identifier(value));
     if (encoder.type() == SerializationType::IPC)
@@ -781,8 +811,8 @@ static void encode_value(StructuredSerializeDataEncoder& encoder, Gfx::AlphaType
         encoder.encode(Utf16String::from_utf8(identifier));
 }
 
-template<typename T>
-static void encode_value(StructuredSerializeDataEncoder& encoder, Vector<T> const& value)
+template<typename T, size_t inline_capacity>
+static void encode_value(StructuredSerializeDataEncoder& encoder, Vector<T, inline_capacity> const& value)
 {
     encoder.encode(static_cast<u64>(value.size()));
     for (auto const& element : value)
@@ -803,14 +833,42 @@ void StructuredSerializeWriter::encode(T const& value)
     encode_value(*m_encoder, value);
 }
 
+// The same-process SharedArrayBuffer aliases of an IPCSerializationRecord. Only this file creates side tables, so the
+// reader can rely on a record's side table being one of these.
+class SharedArrayBufferSideTable final : public SameProcessSerializationSideTable {
+public:
+    explicit SharedArrayBufferSideTable(Vector<GC::Root<JS::ArrayBuffer>> array_buffers)
+        : m_array_buffers(move(array_buffers))
+    {
+    }
+
+    Vector<GC::Root<JS::ArrayBuffer>> const& array_buffers() const { return m_array_buffers; }
+
+private:
+    Vector<GC::Root<JS::ArrayBuffer>> m_array_buffers;
+};
+
 void StructuredSerializeWriter::append(IPCSerializationRecord&& record)
 {
+    // TransferDataEncoder only appends record.data. Silently accepting a side table here would
+    // produce a record whose SharedArrayBuffer references cannot be decoded.
+    VERIFY(!record.same_process_side_table);
     m_encoder->append(move(record));
+}
+
+u32 StructuredSerializeWriter::add_shared_array_buffer(JS::ArrayBuffer& array_buffer)
+{
+    VERIFY(m_shared_array_buffers.size() < NumericLimits<u32>::max());
+    m_shared_array_buffers.append(GC::make_root(array_buffer));
+    return static_cast<u32>(m_shared_array_buffers.size() - 1);
 }
 
 IPCSerializationRecord StructuredSerializeWriter::take_ipc_record()
 {
-    return m_encoder->take_ipc_record();
+    auto record = m_encoder->take_ipc_record();
+    if (!m_shared_array_buffers.is_empty())
+        record.same_process_side_table = adopt_ref(*new SharedArrayBufferSideTable(move(m_shared_array_buffers)));
+    return record;
 }
 
 StorageSerializationRecord StructuredSerializeWriter::take_storage_record()
@@ -818,8 +876,16 @@ StorageSerializationRecord StructuredSerializeWriter::take_storage_record()
     return m_encoder->take_storage_record();
 }
 
+ReadonlySpan<GC::Root<JS::ArrayBuffer>> same_process_shared_array_buffers(IPCSerializationRecord const& record)
+{
+    if (!record.same_process_side_table)
+        return {};
+    return static_cast<SharedArrayBufferSideTable const&>(*record.same_process_side_table).array_buffers();
+}
+
 StructuredSerializeReader::StructuredSerializeReader(IPCSerializationRecord const& record)
     : m_decoder(make<IPCStructuredSerializeDataDecoder>(record))
+    , m_shared_array_buffers(same_process_shared_array_buffers(record))
 {
 }
 
@@ -862,6 +928,37 @@ static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, int& 
     return {};
 }
 
+template<typename NativeType, typename WireType>
+static ErrorOr<void> decode_native_integer(StructuredSerializeDataDecoder& decoder, NativeType& value)
+{
+    WireType decoded = 0;
+    TRY(decoder.decode(decoded));
+    if (!AK::is_within_range<NativeType>(decoded))
+        return Error::from_string_literal("Structured serialize integer does not fit in native integer type");
+    value = static_cast<NativeType>(decoded);
+    return {};
+}
+
+static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, long& value)
+{
+    return decode_native_integer<long, i64>(decoder, value);
+}
+
+static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, long long& value)
+{
+    return decode_native_integer<long long, i64>(decoder, value);
+}
+
+static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, unsigned long& value)
+{
+    return decode_native_integer<unsigned long, u64>(decoder, value);
+}
+
+static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, unsigned long long& value)
+{
+    return decode_native_integer<unsigned long long, u64>(decoder, value);
+}
+
 static ErrorOr<String> decode_utf8_text(StructuredSerializeDataDecoder& decoder)
 {
     Utf16String text;
@@ -902,7 +999,7 @@ static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Bindi
     return {};
 }
 
-static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Bindings::KeyType& value)
+[[maybe_unused]] static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Bindings::KeyType& value)
 {
     if (decoder.type() == SerializationType::IPC) {
         u8 decoded = 0;
@@ -918,7 +1015,7 @@ static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Bindi
     return {};
 }
 
-static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Bindings::KeyUsage& value)
+[[maybe_unused]] static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Bindings::KeyUsage& value)
 {
     if (decoder.type() == SerializationType::IPC) {
         u8 decoded = 0;
@@ -934,7 +1031,22 @@ static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Bindi
     return {};
 }
 
-static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Bindings::PredefinedColorSpace& value)
+static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Crypto::KeyType& value)
+{
+    int decoded = 0;
+    TRY(decoder.decode(decoded));
+    auto key_type = static_cast<Crypto::KeyType>(decoded);
+    switch (key_type) {
+    case Crypto::KeyType::Public:
+    case Crypto::KeyType::Private:
+    case Crypto::KeyType::Secret:
+        value = key_type;
+        return {};
+    }
+    return Error::from_string_literal("Unknown structured serialize key type");
+}
+
+[[maybe_unused]] static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Bindings::PredefinedColorSpace& value)
 {
     if (decoder.type() == SerializationType::IPC) {
         u8 decoded = 0;
@@ -950,7 +1062,7 @@ static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Bindi
     return {};
 }
 
-static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Gfx::BitmapFormat& value)
+[[maybe_unused]] static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Gfx::BitmapFormat& value)
 {
     if (decoder.type() == SerializationType::IPC) {
         u32 decoded = 0;
@@ -966,7 +1078,7 @@ static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Gfx::
     return {};
 }
 
-static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Gfx::AlphaType& value)
+[[maybe_unused]] static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Gfx::AlphaType& value)
 {
     if (decoder.type() == SerializationType::IPC) {
         u32 decoded = 0;
@@ -982,8 +1094,8 @@ static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Gfx::
     return {};
 }
 
-template<typename T>
-static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Vector<T>& value)
+template<typename T, size_t inline_capacity>
+static ErrorOr<void> decode_value(StructuredSerializeDataDecoder& decoder, Vector<T, inline_capacity>& value)
 {
     u64 size = 0;
     TRY(decoder.decode(size));
@@ -1020,6 +1132,61 @@ ErrorOr<T> StructuredSerializeReader::decode()
     return value;
 }
 
+// These templates are declared in the public header but their implementation
+// uses the private encode_value/decode_value overload set above. Explicitly
+// instantiate the concrete wire types used by LibWeb so users of the header do
+// not end up with unresolved template symbols at link time.
+template WEB_API void StructuredSerializeWriter::encode(ByteBuffer const&);
+template WEB_API void StructuredSerializeWriter::encode(Optional<::Crypto::ASN1::ObjectIdentifier> const&);
+template WEB_API void StructuredSerializeWriter::encode(Optional<double> const&);
+template WEB_API void StructuredSerializeWriter::encode(Span<u8 const> const&);
+template WEB_API void StructuredSerializeWriter::encode(Bindings::InterfaceName const&);
+template WEB_API void StructuredSerializeWriter::encode(Bindings::KeyType const&);
+template WEB_API void StructuredSerializeWriter::encode(Vector<Bindings::KeyUsage> const&);
+template WEB_API void StructuredSerializeWriter::encode(Bindings::KeyUsage const&);
+template WEB_API void StructuredSerializeWriter::encode(Gfx::AlphaType const&);
+template WEB_API void StructuredSerializeWriter::encode(Gfx::BitmapFormat const&);
+template WEB_API void StructuredSerializeWriter::encode(Bindings::PredefinedColorSpace const&);
+template WEB_API void StructuredSerializeWriter::encode(Crypto::KeyType const&);
+template WEB_API void StructuredSerializeWriter::encode(bool const&);
+template WEB_API void StructuredSerializeWriter::encode(double const&);
+template WEB_API void StructuredSerializeWriter::encode(int const&);
+template WEB_API void StructuredSerializeWriter::encode(Utf16String const&);
+template WEB_API void StructuredSerializeWriter::encode(Optional<Utf16String> const&);
+template WEB_API void StructuredSerializeWriter::encode(Optional<bool> const&);
+template WEB_API void StructuredSerializeWriter::encode(long const&);
+template WEB_API void StructuredSerializeWriter::encode(long long const&);
+template WEB_API void StructuredSerializeWriter::encode(unsigned long const&);
+template WEB_API void StructuredSerializeWriter::encode(unsigned long long const&);
+template WEB_API void StructuredSerializeWriter::encode(u8 const&);
+template WEB_API void StructuredSerializeWriter::encode(u32 const&);
+template WEB_API void StructuredSerializeWriter::encode(u16 const&);
+
+template WEB_API ErrorOr<ByteBuffer> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<int> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Optional<::Crypto::ASN1::ObjectIdentifier>> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Optional<double>> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Bindings::InterfaceName> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Bindings::KeyType> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Vector<Bindings::KeyUsage>> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Bindings::KeyUsage> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Gfx::AlphaType> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Gfx::BitmapFormat> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Bindings::PredefinedColorSpace> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Crypto::KeyType> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<bool> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<double> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Utf16String> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Optional<Utf16String>> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<Optional<bool>> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<long> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<long long> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<unsigned long> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<unsigned long long> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<u8> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<u32> StructuredSerializeReader::decode();
+template WEB_API ErrorOr<u16> StructuredSerializeReader::decode();
+
 WebIDL::Exception data_clone_error_from_serialization_error(JS::Realm& realm, AK::Error const& error)
 {
     dbgln_if(STRUCTURED_SERIALIZE_DEBUG, "Rejecting structured serialized data: {}", error);
@@ -1037,8 +1204,31 @@ WebIDL::ExceptionOr<String> decode_utf8_text_or_throw_data_clone_error(JS::Realm
     return utf8.release_value();
 }
 
+static GC::Ref<WebIDL::DOMException> data_clone_error(Utf16String message)
+{
+    return WebIDL::DataCloneError::create(move(message));
+}
+
+// The [[AgentCluster]] of a shared buffer's record: the surrounding agent's agent cluster, which deserialization holds
+// the target realm's against — so the buffer never leaves the cluster it was created in. A SameAgentAlways clone never
+// leaves its agent, and names no cluster.
+static WebIDL::ExceptionOr<void> serialize_agent_cluster(StructuredSerializeWriter& data_holder, AllowSharedArrayBuffers allow_shared_array_buffers)
+{
+    if (allow_shared_array_buffers == AllowSharedArrayBuffers::SameAgentAlways) {
+        data_holder.encode(false);
+        return {};
+    }
+
+    auto agent_cluster = current_settings_object().agent_cluster_id();
+    if (!agent_cluster.has_value())
+        return data_clone_error("Cannot serialize SharedArrayBuffer outside an agent cluster"_utf16);
+    data_holder.encode(true);
+    data_holder.encode(*agent_cluster);
+    return {};
+}
+
 // https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal
-static WebIDL::ExceptionOr<void> serialize_array_buffer(JS::VM& vm, StructuredSerializeWriter& data_holder, JS::ArrayBuffer const& array_buffer, bool for_storage)
+static WebIDL::ExceptionOr<void> serialize_array_buffer(JS::VM& vm, StructuredSerializeWriter& data_holder, JS::ArrayBuffer& array_buffer, bool for_storage, AllowSharedArrayBuffers allow_shared_array_buffers)
 {
     // 13. Otherwise, if value has an [[ArrayBufferData]] internal slot, then:
 
@@ -1047,34 +1237,65 @@ static WebIDL::ExceptionOr<void> serialize_array_buffer(JS::VM& vm, StructuredSe
         // 1. If the current settings object's cross-origin isolated capability is false, then throw a "DataCloneError" DOMException.
         // NOTE: This check is only needed when serializing (and not when deserializing) as the cross-origin isolated capability cannot change
         //       over time and a SharedArrayBuffer cannot leave an agent cluster.
-        if (current_settings_object().cross_origin_isolated_capability() == CanUseCrossOriginIsolatedAPIs::No)
-            return WebIDL::DataCloneError::create(*vm.current_realm(), "Cannot serialize SharedArrayBuffer when cross-origin isolated"_utf16);
-
+        // AD-HOC: SameAgentAlways clones never leave the surrounding agent, so the gate's threat model does not apply to
+        //         them; see AllowSharedArrayBuffers.
+        if (allow_shared_array_buffers == AllowSharedArrayBuffers::CrossOriginIsolatedOnly
+            && current_settings_object().cross_origin_isolated_capability() == CanUseCrossOriginIsolatedAPIs::No)
+            return data_clone_error("Cannot serialize SharedArrayBuffer when not cross-origin isolated"_utf16);
         // 2. If forStorage is true, then throw a "DataCloneError" DOMException.
         if (for_storage)
-            return WebIDL::DataCloneError::create(*vm.current_realm(), "Cannot serialize SharedArrayBuffer for storage"_utf16);
+            return data_clone_error("Cannot serialize SharedArrayBuffer for storage"_utf16);
 
         if (!array_buffer.is_fixed_length()) {
             // 3. If value has an [[ArrayBufferMaxByteLength]] internal slot, then set serialized to { [[Type]]: "GrowableSharedArrayBuffer",
             //           [[ArrayBufferData]]: value.[[ArrayBufferData]], [[ArrayBufferByteLengthData]]: value.[[ArrayBufferByteLengthData]],
             //           [[ArrayBufferMaxByteLength]]: value.[[ArrayBufferMaxByteLength]],
-            //           FIXME: [[AgentCluster]]: the surrounding agent's agent cluster }.
+            //           [[AgentCluster]]: the surrounding agent's agent cluster }.
+            // To share with a same-process target, stash the source buffer in the side table. The byte copy keeps the
+            // wire format self-contained for records that cross a process boundary.
+            // AD-HOC: A growable SharedArrayBuffer isn't backed by cross-process shared memory (its storage is
+            //         process-local) — so only a same-process target can share it. A record that crosses a process
+            //         boundary hands the peer a copy.
+            // FIXME: Share it across processes too: a max-sized shared mapping with a shared length word (#11682).
             data_holder.encode(ValueTag::GrowableSharedArrayBuffer);
+            TRY(serialize_agent_cluster(data_holder, allow_shared_array_buffers));
+            data_holder.encode(data_holder.add_shared_array_buffer(array_buffer));
             data_holder.encode(MUST(array_buffer.copy_to_byte_buffer()));
             data_holder.encode(static_cast<u64>(array_buffer.max_byte_length()));
         } else {
             // 4. Otherwise, set serialized to { [[Type]]: "SharedArrayBuffer", [[ArrayBufferData]]: value.[[ArrayBufferData]],
             //           [[ArrayBufferByteLength]]: value.[[ArrayBufferByteLength]],
-            //           FIXME: [[AgentCluster]]: the surrounding agent's agent cluster }.
+            //           [[AgentCluster]]: the surrounding agent's agent cluster }.
+            // To share (rather than copy) [[ArrayBufferData]] with a same-process target, stash the source buffer in the
+            // record's side table and encode its index. A record that crosses a process boundary arrives with an empty
+            // side table — and shares through the file-descriptor side list below instead, or falls back to a byte copy.
             data_holder.encode(ValueTag::SharedArrayBuffer);
-            data_holder.encode(MUST(array_buffer.copy_to_byte_buffer()));
+            TRY(serialize_agent_cluster(data_holder, allow_shared_array_buffers));
+            data_holder.encode(data_holder.add_shared_array_buffer(array_buffer));
+            // AD-HOC: When backed by cross-process shared memory and a side list is available (the messaging path),
+            //         transfer the buffer by appending it to shared_buffers, and encoding its index. That lets the file
+            //         descriptor survive structured clone, whose main record is bytes-only, so an agent in another
+            //         process references the same [[ArrayBufferData]]. Without a side list (e.g., serialization for
+            //         storage) or a shared backing (e.g., a zero-length buffer), fall back to copying the bytes.
+            auto shared_buffer = array_buffer.shared_buffer();
+            auto can_share = shared_buffer.has_value() && data_holder.supports_shared_buffers();
+            data_holder.encode(can_share);
+            if (can_share) {
+                data_holder.encode(static_cast<u32>(data_holder.shared_buffers().size()));
+                // Carried beside the index — so the receiving agent can tell this object apart from any other, even
+                // when it maps this same one twice, from two separate messages.
+                data_holder.encode(array_buffer.shared_object_id());
+                data_holder.shared_buffers().append(shared_buffer.release_value());
+            } else {
+                data_holder.encode(MUST(array_buffer.copy_to_byte_buffer()));
+            }
         }
     }
     // 2. Otherwise:
     else {
         // 1. If IsDetachedBuffer(value) is true, then throw a "DataCloneError" DOMException.
         if (array_buffer.is_detached())
-            return WebIDL::DataCloneError::create(*vm.current_realm(), "Cannot serialize detached ArrayBuffer"_utf16);
+            return data_clone_error("Cannot serialize detached ArrayBuffer"_utf16);
 
         // 2. Let size be value.[[ArrayBufferByteLength]].
         auto size = array_buffer.byte_length();
@@ -1104,7 +1325,7 @@ static WebIDL::ExceptionOr<void> serialize_array_buffer(JS::VM& vm, StructuredSe
 
 // https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal
 template<OneOf<JS::TypedArrayBase, JS::DataView> ViewType>
-static WebIDL::ExceptionOr<void> serialize_viewed_array_buffer(JS::VM& vm, StructuredSerializeWriter& data_holder, ViewType const& view, bool for_storage, SerializationMemory& memory)
+static WebIDL::ExceptionOr<void> serialize_viewed_array_buffer(JS::VM& vm, StructuredSerializeWriter& data_holder, ViewType const& view, bool for_storage, SerializationMemory& memory, AllowSharedArrayBuffers allow_shared_array_buffers)
 {
     // 14. Otherwise, if value has a [[ViewedArrayBuffer]] internal slot, then:
 
@@ -1112,11 +1333,11 @@ static WebIDL::ExceptionOr<void> serialize_viewed_array_buffer(JS::VM& vm, Struc
     if constexpr (IsSame<ViewType, JS::DataView>) {
         auto view_record = JS::make_data_view_with_buffer_witness_record(view, JS::ArrayBuffer::Order::SeqCst);
         if (JS::is_view_out_of_bounds(view_record))
-            return WebIDL::DataCloneError::create(*vm.current_realm(), Utf16String::formatted(JS::ErrorType::BufferOutOfBounds.format(), "DataView"sv));
+            return data_clone_error(Utf16String::formatted(JS::ErrorType::BufferOutOfBounds.format(), "DataView"sv));
     } else {
         auto typed_array_record = JS::make_typed_array_with_buffer_witness_record(view, JS::ArrayBuffer::Order::SeqCst);
         if (JS::is_typed_array_out_of_bounds(typed_array_record))
-            return WebIDL::DataCloneError::create(*vm.current_realm(), Utf16String::formatted(JS::ErrorType::BufferOutOfBounds.format(), "TypedArray"sv));
+            return data_clone_error(Utf16String::formatted(JS::ErrorType::BufferOutOfBounds.format(), "TypedArray"sv));
     }
 
     // 2. Let buffer be the value of value's [[ViewedArrayBuffer]] internal slot.
@@ -1135,8 +1356,8 @@ static WebIDL::ExceptionOr<void> serialize_viewed_array_buffer(JS::VM& vm, Struc
     if constexpr (IsSame<ViewType, JS::DataView>) {
         data_holder.encode(ValueTag::ArrayBufferView);
         // 3. Let bufferSerialized be ? StructuredSerializeInternal(buffer, forStorage, memory).
-        TRY(structured_serialize_internal(vm, data_holder, buffer, for_storage, memory)); // [[ArrayBufferSerialized]]
-        data_holder.encode("DataView"_utf16);                                             // [[Constructor]]
+        TRY(structured_serialize_internal(vm, data_holder, buffer, for_storage, memory, allow_shared_array_buffers)); // [[ArrayBufferSerialized]]
+        data_holder.encode("DataView"_utf16);                                                                         // [[Constructor]]
         serialize_byte_length(view.byte_length());
         data_holder.encode(view.byte_offset());
     }
@@ -1148,8 +1369,8 @@ static WebIDL::ExceptionOr<void> serialize_viewed_array_buffer(JS::VM& vm, Struc
         //    [[ArrayBufferSerialized]]: bufferSerialized, [[ByteLength]]: value.[[ByteLength]],
         //    [[ByteOffset]]: value.[[ByteOffset]], [[ArrayLength]]: value.[[ArrayLength]] }.
         data_holder.encode(ValueTag::ArrayBufferView);
-        TRY(structured_serialize_internal(vm, data_holder, buffer, for_storage, memory)); // [[ArrayBufferSerialized]]
-        data_holder.encode(view.element_name().to_utf16_string());                        // [[Constructor]]
+        TRY(structured_serialize_internal(vm, data_holder, buffer, for_storage, memory, allow_shared_array_buffers)); // [[ArrayBufferSerialized]]
+        data_holder.encode(view.element_name().to_utf16_string());                                                    // [[Constructor]]
         serialize_byte_length(view.byte_length());
         data_holder.encode(view.byte_offset());
         serialize_byte_length(view.array_length());
@@ -1163,11 +1384,12 @@ static WebIDL::ExceptionOr<void> serialize_viewed_array_buffer(JS::VM& vm, Struc
 // 2. Translate all the references into the appropriate form
 class Serializer {
 public:
-    Serializer(JS::VM& vm, StructuredSerializeWriter& serialized, SerializationMemory& memory, bool for_storage)
+    Serializer(JS::VM& vm, StructuredSerializeWriter& serialized, SerializationMemory& memory, bool for_storage, AllowSharedArrayBuffers allow_shared_array_buffers)
         : m_vm(vm)
         , m_serialized(serialized)
         , m_memory(memory)
         , m_for_storage(for_storage)
+        , m_allow_shared_array_buffers(allow_shared_array_buffers)
     {
     }
 
@@ -1220,7 +1442,7 @@ public:
 
         // 5. If value is a Symbol, then throw a "DataCloneError" DOMException.
         if (value.is_symbol())
-            return WebIDL::DataCloneError::create(*m_vm.current_realm(), "Cannot serialize Symbol"_utf16);
+            return data_clone_error("Cannot serialize Symbol"_utf16);
 
         // 6. Let serialized be an uninitialized value.
         // NOTE: We created the serialized value above.
@@ -1268,15 +1490,15 @@ public:
             }
 
             // 13. Otherwise, if value has an [[ArrayBufferData]] internal slot, then:
-            else if (auto const* array_buffer = as_if<JS::ArrayBuffer>(*object)) {
-                TRY(serialize_array_buffer(m_vm, serialized, *array_buffer, m_for_storage));
+            else if (auto* array_buffer = as_if<JS::ArrayBuffer>(*object)) {
+                TRY(serialize_array_buffer(m_vm, serialized, *array_buffer, m_for_storage, m_allow_shared_array_buffers));
             }
 
             // 14. Otherwise, if value has a [[ViewedArrayBuffer]] internal slot, then:
             else if (auto const* typed_array_base = as_if<JS::TypedArrayBase>(*object)) {
-                TRY(serialize_viewed_array_buffer(m_vm, serialized, *typed_array_base, m_for_storage, m_memory));
+                TRY(serialize_viewed_array_buffer(m_vm, serialized, *typed_array_base, m_for_storage, m_memory, m_allow_shared_array_buffers));
             } else if (auto const* data_view = as_if<JS::DataView>(*object)) {
-                TRY(serialize_viewed_array_buffer(m_vm, serialized, *data_view, m_for_storage, m_memory));
+                TRY(serialize_viewed_array_buffer(m_vm, serialized, *data_view, m_for_storage, m_memory, m_allow_shared_array_buffers));
             }
 
             // 15. Otherwise, if value has a [[MapData]] internal slot, then:
@@ -1298,7 +1520,7 @@ public:
             }
 
             // 17. Otherwise, if value has an [[ErrorData]] internal slot and value is not a platform object, then:
-            else if (is<JS::Error>(*object) && !is<Bindings::PlatformObject>(*object)) {
+            else if (is<JS::Error>(*object) && !Bindings::is_platform_object(*object)) {
                 // 1. Let name be ? Get(value, "name").
                 auto name = TRY(object->get(m_vm.names.name));
 
@@ -1348,29 +1570,28 @@ public:
             }
 
             // 19. Otherwise, if value is a platform object that is a serializable object:
-            else if (auto const* serializable = as_if<Bindings::Serializable>(*object)) {
+            else if (auto serializable = Bindings::serializable_from_object(*object); serializable.has_value()) {
                 // FIXME: 1. If value has a [[Detached]] internal slot whose value is true, then throw a "DataCloneError" DOMException.
 
                 // 2. Let typeString be the identifier of the primary interface of value.
                 // 3. Set serialized to { [[Type]]: typeString }.
-                encode(ValueTag::SerializableObject);
-                encode(as<Bindings::PlatformObject>(serializable)->interface_name());
-
-                if (serialized.type() == SerializationType::Storage)
-                    serialized.encode(serializable->serialization_version());
+                serialized.encode(ValueTag::SerializableObject);
+                serialized.encode(serializable->interface_name);
+                if (m_for_storage)
+                    serialized.encode(serializable_payload_version);
 
                 // 4. Set deep to true
                 deep = true;
             }
 
             // 20. Otherwise, if value is a platform object, then throw a "DataCloneError" DOMException.
-            else if (is<Bindings::PlatformObject>(*object)) {
-                return throw_completion(WebIDL::DataCloneError::create(*m_vm.current_realm(), "Cannot serialize platform objects"_utf16));
+            else if (Bindings::is_platform_object(*object)) {
+                return data_clone_error("Cannot serialize platform objects"_utf16);
             }
 
             // 21. Otherwise, if IsCallable(value) is true, then throw a "DataCloneError" DOMException.
             else if (value.is_function()) {
-                return throw_completion(WebIDL::DataCloneError::create(*m_vm.current_realm(), "Cannot serialize functions"_utf16));
+                return data_clone_error("Cannot serialize functions"_utf16);
             }
 
             // FIXME: 22. Otherwise, if value has any internal slot other than [[Prototype]] or [[Extensible]], then throw a "DataCloneError" DOMException.
@@ -1415,7 +1636,7 @@ public:
                 for (auto copied_value : copied_list) {
                     // 1. Let serializedKey be ? StructuredSerializeInternal(entry.[[Key]], forStorage, memory).
                     // 2. Let serializedValue be ? StructuredSerializeInternal(entry.[[Value]], forStorage, memory).
-                    TRY(structured_serialize_internal(m_vm, serialized, copied_value, m_for_storage, m_memory));
+                    TRY(structured_serialize_internal(m_vm, m_serialized, copied_value, m_for_storage, m_memory, m_allow_shared_array_buffers));
 
                     // 3. Append { [[Key]]: serializedKey, [[Value]]: serializedValue } to serialized.[[MapData]].
                 }
@@ -1438,15 +1659,15 @@ public:
                 // 3. For each entry of copiedList:
                 for (auto copied_value : copied_list) {
                     // 1. Let serializedEntry be ? StructuredSerializeInternal(entry, forStorage, memory).
-                    TRY(structured_serialize_internal(m_vm, serialized, copied_value, m_for_storage, m_memory));
+                    TRY(structured_serialize_internal(m_vm, m_serialized, copied_value, m_for_storage, m_memory, m_allow_shared_array_buffers));
 
                     // 2. Append serializedEntry to serialized.[[SetData]].
                 }
             }
 
             // 3. Otherwise, if value is a platform object that is a serializable object, then perform the serialization steps for value's primary interface, given value, serialized, and forStorage.
-            else if (auto* serializable = as_if<Bindings::Serializable>(object)) {
-                TRY(serializable->serialization_steps(serialized, m_for_storage, m_memory));
+            else if (auto serializable = Bindings::serializable_from_object(object); serializable.has_value()) {
+                TRY(serializable->serializable->serialization_steps(serialized, m_for_storage, m_memory));
             }
 
             // 4. Otherwise, for each key in ! EnumerableOwnProperties(value, key):
@@ -1460,7 +1681,7 @@ public:
                         auto input_value = TRY(object.internal_get(property_key, value));
 
                         // 2. Let outputValue be ? StructuredSerializeInternal(inputValue, forStorage, memory).
-                        TRY(structured_serialize_internal(m_vm, serialized, input_value, m_for_storage, m_memory));
+                        TRY(structured_serialize_internal(m_vm, m_serialized, input_value, m_for_storage, m_memory, m_allow_shared_array_buffers));
 
                         // 3. Append { [[Key]]: key, [[Value]]: outputValue } to serialized.[[Properties]].
                         encode(key.as_string().utf16_string());
@@ -1486,16 +1707,49 @@ private:
     StructuredSerializeWriter& m_serialized;
     SerializationMemory& m_memory; // JS value -> index
     bool m_for_storage { false };
+    AllowSharedArrayBuffers m_allow_shared_array_buffers { AllowSharedArrayBuffers::CrossOriginIsolatedOnly };
 };
+
+// Returns no value when the source storage cannot be aliased, allowing the caller to copy it.
+static Optional<JS::DataBlock> data_block_sharing_storage_with(JS::ArrayBuffer& source_buffer, size_t byte_length, bool preserve_growability = false)
+{
+    VERIFY(source_buffer.is_shared_array_buffer());
+    auto const& source_block = source_buffer.data_block();
+
+    // Flatten alias chains to the actual owner. Keep this buffer's byte length because the owner's
+    // storage may be larger (for example, a fixed-length view of growable WebAssembly.Memory).
+    if (auto const* external = source_block.byte_buffer.get_pointer<JS::DataBlock::ExternalPrimitiveStorage>()) {
+        if (preserve_growability)
+            return JS::DataBlock { JS::DataBlock::ExternalPrimitiveStorage { external->owner, external->handle }, JS::DataBlock::Shared::Yes };
+        return JS::DataBlock { JS::DataBlock::ExternalPrimitiveStorage { external->owner, external->handle, byte_length }, JS::DataBlock::Shared::Yes };
+    }
+
+    // AD-HOC: A fixed-length shared block backed by cross-process shared memory is aliased by referencing the same
+    //         shared object — so the clone shares its bytes, and can itself be shared with an agent in another process.
+    if (auto const* shared = source_block.byte_buffer.get_pointer<JS::DataBlock::SharedBackingStore>())
+        return JS::DataBlock { JS::DataBlock::SharedBackingStore { shared->buffer, shared->object_id }, JS::DataBlock::Shared::Yes };
+
+    if (auto const* owned = source_block.byte_buffer.get_pointer<JS::DataBlock::OwnedBackingStore>()) {
+        // Zero-length buffers have no backing storage to share.
+        if (!owned->handle().is_valid())
+            return {};
+        if (preserve_growability)
+            return JS::DataBlock { JS::DataBlock::ExternalPrimitiveStorage { GC::Ref<GC::Cell> { source_buffer }, owned->handle() }, JS::DataBlock::Shared::Yes };
+        return JS::DataBlock { JS::DataBlock::ExternalPrimitiveStorage { GC::Ref<GC::Cell> { source_buffer }, owned->handle(), byte_length }, JS::DataBlock::Shared::Yes };
+    }
+
+    // A detached block has no storage to share.
+    return {};
+}
 
 class Deserializer {
 public:
     Deserializer(JS::VM& vm, StructuredSerializeReader& serialized, JS::Realm& target_realm, DeserializationMemory& memory)
         : m_vm(vm)
         , m_serialized(serialized)
+        , m_target_realm(target_realm)
         , m_memory(memory)
     {
-        VERIFY(vm.current_realm() == &target_realm);
     }
 
     // https://html.spec.whatwg.org/multipage/structured-data.html#structureddeserialize
@@ -1504,13 +1758,27 @@ public:
         return deserialize_value(TRY(decode<u8>()));
     }
 
+    // Step 1 of deserializing a "SharedArrayBuffer" or "GrowableSharedArrayBuffer" record: it names the agent cluster it
+    // was serialized in, and a target realm in any other cluster can't have the buffer. A record that names none (a
+    // SameAgentAlways clone's) is deserialized in the agent that serialized it.
+    WebIDL::ExceptionOr<void> deserialize_agent_cluster()
+    {
+        if (!TRY(decode<bool>()))
+            return {};
+        auto agent_cluster = TRY(decode<u64>());
+        auto target_agent_cluster = Bindings::principal_host_defined_environment_settings_object(*m_target_realm).agent_cluster_id();
+        if (!target_agent_cluster.has_value() || *target_agent_cluster != agent_cluster)
+            return data_clone_error("Cannot deserialize SharedArrayBuffer outside its agent cluster"_utf16);
+        return {};
+    }
+
     // The Object/Array property loop is the only caller allowed to pre-read EndObject.
     WebIDL::ExceptionOr<JS::Value> deserialize_value(u8 raw_tag)
     {
         if (m_vm.did_reach_stack_space_limit())
             return m_vm.throw_completion<JS::InternalError>(JS::ErrorType::CallStackSizeExceeded);
 
-        auto& realm = *m_vm.current_realm();
+        auto& realm = *m_target_realm;
 
         auto tag = static_cast<ValueTag>(raw_tag);
 
@@ -1522,9 +1790,7 @@ public:
         if (tag == ValueTag::ObjectReference) {
             auto index = TRY(decode<u32>());
             if (index == NumericLimits<u32>::max())
-                return JS::Object::create(*m_vm.current_realm(), nullptr);
-            if (index >= m_memory.size())
-                return data_clone_error_from_serialization_error(realm, AK::Error::from_string_literal("Object reference index out of range"));
+                return JS::Object::create(realm, nullptr);
             return m_memory[index];
         }
 
@@ -1616,24 +1882,63 @@ public:
 
         // 12. Otherwise, if serialized.[[Type]] is "SharedArrayBuffer", then:
         case ValueTag::SharedArrayBuffer: {
-            // FIXME: 1. If targetRealm's corresponding agent cluster is not serialized.[[AgentCluster]], then throw a "DataCloneError" DOMException.
+            // 1. If targetRealm's corresponding agent cluster is not serialized.[[AgentCluster]], then throw a "DataCloneError" DOMException.
+            TRY(deserialize_agent_cluster());
 
             // 2. Otherwise, set value to a new SharedArrayBuffer object in targetRealm whose [[ArrayBufferData]] internal slot value is serialized.[[ArrayBufferData]]
             //    and whose [[ArrayBufferByteLength]] internal slot value is serialized.[[ArrayBufferByteLength]].
+            auto side_table_index = TRY(decode<u32>());
+
+            // AD-HOC: When the backing was transferred as cross-process shared memory, map it from the side list by
+            //         index — so both agents reference the same bytes.
+            auto is_shared_backed = TRY(decode<bool>());
+            if (is_shared_backed) {
+                auto index = TRY(decode<u32>());
+                auto shared_object_id = TRY(decode<u64>());
+                auto* shared_buffers = m_serialized.shared_buffers();
+                if (!shared_buffers || index >= shared_buffers->size())
+                    return data_clone_error_from_serialization_error(realm, AK::Error::from_string_literal("SharedArrayBuffer side-list index out of range"));
+                value = JS::ArrayBuffer::create(realm, shared_buffers->at(index), shared_object_id);
+                break;
+            }
+
             auto buffer = TRY(decode<ByteBuffer>());
+
+            auto shared_array_buffers = m_serialized.shared_array_buffers();
+            if (side_table_index < shared_array_buffers.size()) {
+                if (auto data_block = data_block_sharing_storage_with(*shared_array_buffers[side_table_index], buffer.size()); data_block.has_value()) {
+                    value = JS::ArrayBuffer::create(realm, data_block.release_value());
+                    break;
+                }
+            }
+
+            // A buffer with no cross-process shared memory to share (a zero-length one, e.g.) whose record crossed a
+            // process boundary arrives with an empty side table — so it's reconstructed from the byte copy.
             value = JS::ArrayBuffer::create(realm, move(buffer), JS::DataBlock::Shared::Yes);
             break;
         }
 
         // 13. Otherwise, if serialized.[[Type]] is "GrowableSharedArrayBuffer", then:
         case ValueTag::GrowableSharedArrayBuffer: {
-            // FIXME: 1. If targetRealm's corresponding agent cluster is not serialized.[[AgentCluster]], then throw a "DataCloneError" DOMException.
+            // 1. If targetRealm's corresponding agent cluster is not serialized.[[AgentCluster]], then throw a "DataCloneError" DOMException.
+            TRY(deserialize_agent_cluster());
 
             // 2. Otherwise, set value to a new SharedArrayBuffer object in targetRealm whose [[ArrayBufferData]] internal slot value is serialized.[[ArrayBufferData]],
             //    whose [[ArrayBufferByteLengthData]] internal slot value is serialized.[[ArrayBufferByteLengthData]],
             //    and whose [[ArrayBufferMaxByteLength]] internal slot value is serialized.[[ArrayBufferMaxByteLength]].
+            auto side_table_index = TRY(decode<u32>());
             auto buffer = TRY(decode<ByteBuffer>());
-            auto max_byte_length = TRY(decode_max_byte_length());
+            auto max_byte_length = TRY(decode<size_t>());
+
+            auto shared_array_buffers = m_serialized.shared_array_buffers();
+            if (side_table_index < shared_array_buffers.size()) {
+                if (auto data_block = data_block_sharing_storage_with(*shared_array_buffers[side_table_index], buffer.size(), true); data_block.has_value()) {
+                    auto data = JS::ArrayBuffer::create(realm, data_block.release_value());
+                    data->set_max_byte_length(max_byte_length);
+                    value = data;
+                    break;
+                }
+            }
 
             auto data = JS::ArrayBuffer::create(realm, move(buffer), JS::DataBlock::Shared::Yes);
             data->set_max_byte_length(max_byte_length);
@@ -1652,7 +1957,7 @@ public:
         // 15. Otherwise, if serialized.[[Type]] is "ResizableArrayBuffer", then set value to a new ArrayBuffer object in targetRealm whose [[ArrayBufferData]] internal slot value is serialized.[[ArrayBufferData]], whose [[ArrayBufferByteLength]] internal slot value is serialized.[[ArrayBufferByteLength]], and whose [[ArrayBufferMaxByteLength]] internal slot value is a serialized.[[ArrayBufferMaxByteLength]].
         case ValueTag::ResizeableArrayBuffer: {
             auto buffer = TRY(decode<ByteBuffer>());
-            auto max_byte_length = TRY(decode_max_byte_length());
+            auto max_byte_length = TRY(decode<size_t>());
 
             auto data = JS::ArrayBuffer::create(realm, move(buffer));
             data->set_max_byte_length(max_byte_length);
@@ -1820,17 +2125,14 @@ public:
                 version = TRY(decode<u64>());
 
             // 2. If the interface identified by interfaceName is not exposed in targetRealm, then throw a "DataCloneError" DOMException.
-            if (!is_exposed(interface_name, realm))
+            if (!Bindings::is_exposed(interface_name, realm))
                 return WebIDL::DataCloneError::create(realm, "Unsupported type"_utf16);
 
             // 3. Set value to a new instance of the interface identified by interfaceName, created in targetRealm.
-            value = create_serialized_type(interface_name, realm);
+            value = Bindings::create_serialized_platform_object(interface_name, realm);
 
-            if (version.has_value()) {
-                auto supported_version = as<Bindings::Serializable>(value.as_object()).serialization_version();
-                if (*version == 0 || *version != supported_version)
-                    return data_clone_error_from_serialization_error(realm, AK::Error::from_string_literal("Unsupported serializable payload version"));
-            }
+            if (version.has_value() && *version != serializable_payload_version)
+                return data_clone_error_from_serialization_error(realm, AK::Error::from_string_literal("Unsupported serializable payload version"));
 
             // 4. Set deep to true.
             deep = true;
@@ -1899,8 +2201,9 @@ public:
             // 4. Otherwise:
             else {
                 // 1. Perform the appropriate deserialization steps for the interface identified by serialized.[[Type]], given serialized, value, and targetRealm.
-                auto& serializable = as<Bindings::Serializable>(value.as_object());
-                TRY(serializable.deserialization_steps(m_serialized, m_memory));
+                auto serializable = Bindings::serializable_from_object(value.as_object());
+                VERIFY(serializable.has_value());
+                TRY(serializable->serializable->deserialization_steps(realm, m_serialized, m_memory));
             }
         }
 
@@ -1912,34 +2215,20 @@ private:
     template<typename T>
     WebIDL::ExceptionOr<T> decode()
     {
-        return decode_or_throw_data_clone_error<T>(*m_vm.current_realm(), m_serialized);
-    }
-
-    WebIDL::ExceptionOr<size_t> decode_max_byte_length()
-    {
-        auto value = TRY(decode<u64>());
-        if (!AK::is_within_range<size_t>(value))
-            return data_clone_error_from_serialization_error(*m_vm.current_realm(), AK::Error::from_string_literal("Max byte length does not fit on this platform"));
-        return static_cast<size_t>(value);
-    }
-
-    static GC::Ref<Bindings::PlatformObject> create_serialized_type(Bindings::InterfaceName serialize_type, JS::Realm& realm)
-    {
-        for (auto const& entry : serializable_storage_registry()) {
-            if (entry.interface_name == serialize_type)
-                return entry.create(realm);
-        }
-        VERIFY_NOT_REACHED();
+        return decode_or_throw_data_clone_error<T>(*m_target_realm, m_serialized);
     }
 
     JS::VM& m_vm;
     StructuredSerializeReader& m_serialized;
+    GC::Ref<JS::Realm> m_target_realm;
     DeserializationMemory& m_memory;
 };
 
 // https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializewithtransfer
-WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer(JS::VM& vm, JS::Value value, ReadonlySpan<GC::Ref<JS::Object>> transfer_list)
+WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer(JS::Realm& realm, JS::Value value, ReadonlySpan<GC::Ref<JS::Object>> transfer_list)
 {
+    auto& vm = realm.vm();
+
     // 1. Let memory be an empty map.
     SerializationMemory memory = {};
 
@@ -1949,27 +2238,43 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
 
         // 1. If transferable has neither an [[ArrayBufferData]] internal slot nor a [[Detached]] internal slot, then throw a "DataCloneError" DOMException.
         // FIXME: Handle transferring objects with [[Detached]] internal slot.
-        if (!as_array_buffer && !is<Bindings::Transferable>(*transferable))
-            return WebIDL::DataCloneError::create(*vm.current_realm(), "Cannot transfer type"_utf16);
+        if (!as_array_buffer && !Bindings::transferable_from_object(*transferable))
+            return WebIDL::DataCloneError::create("Cannot transfer type"_utf16);
 
         // 2. If transferable has an [[ArrayBufferData]] internal slot and IsSharedArrayBuffer(transferable) is true, then throw a "DataCloneError" DOMException.
         if (as_array_buffer && as_array_buffer->is_shared_array_buffer())
-            return WebIDL::DataCloneError::create(*vm.current_realm(), "Cannot transfer shared array buffer"_utf16);
+            return WebIDL::DataCloneError::create("Cannot transfer shared array buffer"_utf16);
 
         JS::Value transferable_value { transferable };
 
         // 3. If memory[transferable] exists, then throw a "DataCloneError" DOMException.
         if (memory.contains(transferable_value))
-            return WebIDL::DataCloneError::create(*vm.current_realm(), "Cannot transfer value twice"_utf16);
+            return WebIDL::DataCloneError::create("Cannot transfer value twice"_utf16);
 
         // 4. Set memory[transferable] to { [[Type]]: an uninitialized value }.
         memory.set(GC::make_root(transferable_value), memory.size());
     }
 
     // 3. Let serialized be ? StructuredSerializeInternal(value, false, memory).
-    auto serialized = StructuredSerializeWriter::create_ipc();
-    TRY(structured_serialize_internal(vm, serialized, value, false, memory));
-    auto serialized_record = serialized.take_ipc_record();
+    auto serialized_writer = StructuredSerializeWriter::create_ipc();
+    serialized_writer.enable_shared_buffers();
+    TRY(structured_serialize_internal(vm, serialized_writer, value, false, memory));
+    auto serialized_record = serialized_writer.take_ipc_record();
+
+    // AD-HOC: Gather the pixels of the transferred ImageBitmaps in one buffer of shared memory. Without it, as when there
+    //         is not enough memory for it, the pixels travel inline.
+    Optional<ImageBitmap::SharedPixels> image_bitmap_pixels;
+    Checked<size_t> image_bitmap_pixels_size = 0;
+    for (auto const& transferable : transfer_list) {
+        if (auto* image_bitmap = Bindings::impl_from<ImageBitmap>(transferable.ptr()); image_bitmap && image_bitmap->bitmap())
+            image_bitmap_pixels_size += ImageBitmap::shared_pixels_size(*image_bitmap->bitmap());
+    }
+    if (!image_bitmap_pixels_size.has_overflow() && image_bitmap_pixels_size.value() > 0) {
+        if (auto buffer = Core::AnonymousBuffer::create_with_size(image_bitmap_pixels_size.value(), Core::AnonymousBuffer::Sealability::Sealable); !buffer.is_error()) {
+            image_bitmap_pixels = ImageBitmap::SharedPixels { .buffer = buffer.release_value(), .buffer_index = static_cast<u32>(serialized_writer.shared_buffers().size()) };
+            serialized_writer.shared_buffers().append(image_bitmap_pixels->buffer);
+        }
+    }
 
     // 4. Let transferDataHolders be a new empty List.
     Vector<TransferDataEncoder> transfer_data_holders;
@@ -1982,12 +2287,12 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
 
         // 1. If transferable has an [[ArrayBufferData]] internal slot and IsDetachedBuffer(transferable) is true, then throw a "DataCloneError" DOMException.
         if (is_detached)
-            return WebIDL::DataCloneError::create(*vm.current_realm(), "Cannot transfer detached buffer"_utf16);
+            return WebIDL::DataCloneError::create("Cannot transfer detached buffer"_utf16);
 
         // 2. If transferable has a [[Detached]] internal slot and transferable.[[Detached]] is true, then throw a "DataCloneError" DOMException.
-        if (auto* transferable_object = as_if<Bindings::Transferable>(*transferable)) {
+        if (auto* transferable_object = Bindings::transferable_from_object(*transferable)) {
             if (transferable_object->is_detached())
-                return WebIDL::DataCloneError::create(*vm.current_realm(), "Value already transferred"_utf16);
+                return WebIDL::DataCloneError::create("Value already transferred"_utf16);
         }
 
         // 3. Let dataHolder be memory[transferable].
@@ -2027,8 +2332,8 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
         // 5. Otherwise:
         else {
             // 1. Assert: transferable is a platform object that is a transferable object.
-            auto& transferable_object = as<Bindings::Transferable>(*transferable);
-            VERIFY(is<Bindings::PlatformObject>(*transferable));
+            auto& transferable_object = *Bindings::transferable_from_object(*transferable);
+            VERIFY(Bindings::is_platform_object(*transferable));
 
             // 2. Let interfaceName be the identifier of the primary interface of transferable.
             auto interface_name = transferable_object.primary_interface();
@@ -2037,7 +2342,10 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
             MUST(data_holder.encode(interface_name));
 
             // 4. Perform the appropriate transfer steps for the interface identified by interfaceName, given transferable and dataHolder.
-            TRY(transferable_object.transfer_steps(data_holder));
+            if (interface_name == TransferType::ImageBitmap)
+                TRY(Bindings::impl_from<ImageBitmap>(transferable.ptr())->transfer_steps(data_holder, image_bitmap_pixels.has_value() ? &image_bitmap_pixels.value() : nullptr));
+            else
+                TRY(transferable_object.transfer_steps(realm, data_holder));
 
             // 5. Set transferable.[[Detached]] to true.
             transferable_object.set_detached(true);
@@ -2048,7 +2356,7 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
     }
 
     // 6. Return { [[Serialized]]: serialized, [[TransferDataHolders]]: transferDataHolders }.
-    return SerializedTransferRecord { .serialized = move(serialized_record), .transfer_data_holders = move(transfer_data_holders) };
+    return SerializedTransferRecord { .serialized = move(serialized_record), .transfer_data_holders = move(transfer_data_holders), .shared_buffers = serialized_writer.take_shared_buffers() };
 }
 
 static bool is_transferable_interface_exposed_on_target_realm(TransferType name, JS::Realm& realm)
@@ -2064,6 +2372,8 @@ static bool is_transferable_interface_exposed_on_target_realm(TransferType name,
         return is_exposed(Bindings::InterfaceName::TransformStream, realm);
     case TransferType::ImageBitmap:
         return is_exposed(Bindings::InterfaceName::ImageBitmap, realm);
+    case TransferType::OffscreenCanvas:
+        return is_exposed(Bindings::InterfaceName::OffscreenCanvas, realm);
     case TransferType::Unknown:
         dbgln("Unknown interface type for transfer: {}", to_underlying(name));
         break;
@@ -2071,42 +2381,6 @@ static bool is_transferable_interface_exposed_on_target_realm(TransferType name,
         VERIFY_NOT_REACHED();
     }
     return false;
-}
-
-static WebIDL::ExceptionOr<GC::Ref<Bindings::PlatformObject>> create_transferred_value(TransferType name, JS::Realm& target_realm, TransferDataDecoder& decoder)
-{
-    switch (name) {
-    case TransferType::MessagePort: {
-        auto message_port = HTML::MessagePort::create(target_realm);
-        TRY(message_port->transfer_receiving_steps(decoder));
-        return message_port;
-    }
-    case TransferType::ReadableStream: {
-        auto readable_stream = target_realm.create<Streams::ReadableStream>(target_realm);
-        TRY(readable_stream->transfer_receiving_steps(decoder));
-        return readable_stream;
-    }
-    case TransferType::WritableStream: {
-        auto writable_stream = target_realm.create<Streams::WritableStream>(target_realm);
-        TRY(writable_stream->transfer_receiving_steps(decoder));
-        return writable_stream;
-    }
-    case TransferType::TransformStream: {
-        auto transform_stream = target_realm.create<Streams::TransformStream>(target_realm);
-        TRY(transform_stream->transfer_receiving_steps(decoder));
-        return transform_stream;
-    }
-    case TransferType::ImageBitmap: {
-        auto image_bitmap = target_realm.create<ImageBitmap>(target_realm);
-        TRY(image_bitmap->transfer_receiving_steps(decoder));
-        return image_bitmap;
-    }
-    case TransferType::ArrayBuffer:
-    case TransferType::ResizableArrayBuffer:
-    case TransferType::Unknown:
-        break;
-    }
-    VERIFY_NOT_REACHED();
 }
 
 // https://html.spec.whatwg.org/multipage/structured-data.html#structureddeserializewithtransfer
@@ -2126,6 +2400,7 @@ WebIDL::ExceptionOr<DeserializedTransferRecord> structured_deserialize_with_tran
             continue;
 
         TransferDataDecoder decoder { move(transfer_data_holder) };
+        decoder.set_shared_buffers(serialize_with_transfer_result.shared_buffers);
 
         // 1. Let value be an uninitialized value.
         auto value = TRY(structured_deserialize_with_transfer_internal(decoder, target_realm));
@@ -2138,7 +2413,11 @@ WebIDL::ExceptionOr<DeserializedTransferRecord> structured_deserialize_with_tran
     }
 
     // 4. Let deserialized be ? StructuredDeserialize(serializeWithTransferResult.[[Serialized]], targetRealm, memory).
-    auto deserialized = TRY(structured_deserialize(vm, serialize_with_transfer_result.serialized, target_realm, memory));
+    auto deserialized = TRY(structured_deserialize(vm, serialize_with_transfer_result.serialized, target_realm, memory, &serialize_with_transfer_result.shared_buffers));
+
+    // NB: The deserialized values hold their own references to the shared memory they use. The record can outlive its
+    //     delivery, as in a task that awaits garbage collection, so it must not keep that memory alive.
+    serialize_with_transfer_result.shared_buffers.clear();
 
     // 5. Return { [[Deserialized]]: deserialized, [[TransferredValues]]: transferredValues }.
     return DeserializedTransferRecord { .deserialized = deserialized, .transferred_values = move(transferred_values) };
@@ -2161,7 +2440,7 @@ WebIDL::ExceptionOr<JS::Value> structured_deserialize_with_transfer_internal(Tra
     //       [[ArrayBufferData]] is instead just getting transferred into the new ArrayBuffer. This could be true, for example,
     //       when both the source and target realms are in the same process.
     if (type == TransferType::ArrayBuffer) {
-        auto buffer = TRY(decode_or_throw_data_clone_error<ByteBuffer>(target_realm, decoder));
+        auto buffer = TRY(decoder.decode_buffer());
         value = JS::ArrayBuffer::create(target_realm, move(buffer));
     }
 
@@ -2171,7 +2450,7 @@ WebIDL::ExceptionOr<JS::Value> structured_deserialize_with_transfer_internal(Tra
     //     [[ArrayBufferMaxByteLength]] internal slot value is transferDataHolder.[[ArrayBufferMaxByteLength]].
     // NOTE: For the same reason as the previous step, this step is also unlikely to throw an exception.
     else if (type == TransferType::ResizableArrayBuffer) {
-        auto buffer = TRY(decode_or_throw_data_clone_error<ByteBuffer>(target_realm, decoder));
+        auto buffer = TRY(decoder.decode_buffer());
         auto max_byte_length = TRY(decode_or_throw_data_clone_error<size_t>(target_realm, decoder));
 
         auto data = JS::ArrayBuffer::create(target_realm, move(buffer));
@@ -2185,11 +2464,11 @@ WebIDL::ExceptionOr<JS::Value> structured_deserialize_with_transfer_internal(Tra
         // 1. Let interfaceName be transferDataHolder.[[Type]].
         // 2. If the interface identified by interfaceName is not exposed in targetRealm, then throw a "DataCloneError" DOMException.
         if (!is_transferable_interface_exposed_on_target_realm(type, target_realm))
-            return WebIDL::DataCloneError::create(target_realm, "Unknown type transferred"_utf16);
+            return WebIDL::DataCloneError::create("Unknown type transferred"_utf16);
 
         // 3. Set value to a new instance of the interface identified by interfaceName, created in targetRealm.
         // 4. Perform the appropriate transfer-receiving steps for the interface identified by interfaceName given transferDataHolder and value.
-        value = TRY(create_transferred_value(type, target_realm, decoder));
+        value = TRY(Bindings::create_transferred_platform_object(type, target_realm, decoder));
     }
 
     return value;
@@ -2198,10 +2477,31 @@ WebIDL::ExceptionOr<JS::Value> structured_deserialize_with_transfer_internal(Tra
 // https://html.spec.whatwg.org/multipage/structured-data.html#structuredserialize
 WebIDL::ExceptionOr<IPCSerializationRecord> structured_serialize(JS::VM& vm, JS::Value value)
 {
+    return structured_serialize(vm, value, AllowSharedArrayBuffers::CrossOriginIsolatedOnly);
+}
+
+// https://html.spec.whatwg.org/multipage/structured-data.html#structuredserialize
+WebIDL::ExceptionOr<IPCSerializationRecord> structured_serialize(JS::VM& vm, JS::Value value, AllowSharedArrayBuffers allow_shared_array_buffers)
+{
     // 1. Return ? StructuredSerializeInternal(value, false).
     SerializationMemory memory = {};
     auto serialized = StructuredSerializeWriter::create_ipc();
+    TRY(structured_serialize_internal(vm, serialized, value, false, memory, allow_shared_array_buffers));
+    return serialized.take_ipc_record();
+}
+
+// https://html.spec.whatwg.org/multipage/structured-data.html#structuredserialize
+// AD-HOC: For a record that reaches agents in other processes. The record itself is bytes-only, so a shared-memory-
+//         backed SharedArrayBuffer is handed over beside it, in shared_buffers, by file descriptor — and every
+//         receiver references the same [[ArrayBufferData]], rather than rebuilding the buffer from a byte copy.
+WebIDL::ExceptionOr<IPCSerializationRecord> structured_serialize(JS::VM& vm, JS::Value value, Vector<Core::AnonymousBuffer>& shared_buffers)
+{
+    // 1. Return ? StructuredSerializeInternal(value, false).
+    SerializationMemory memory = {};
+    auto serialized = StructuredSerializeWriter::create_ipc();
+    serialized.enable_shared_buffers();
     TRY(structured_serialize_internal(vm, serialized, value, false, memory));
+    shared_buffers = serialized.take_shared_buffers();
     return serialized.take_ipc_record();
 }
 
@@ -2215,18 +2515,23 @@ WebIDL::ExceptionOr<StorageSerializationRecord> structured_serialize_for_storage
     return serialized.take_storage_record();
 }
 
-// https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal
-WebIDL::ExceptionOr<void> structured_serialize_internal(JS::VM& vm, StructuredSerializeWriter& serialized, JS::Value value, bool for_storage, SerializationMemory& memory)
+// https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeforstorage
+// NB: StructuredSerializeInternal returns undefined and null as primitives at step 4, which needs no VM.
+StorageSerializationRecord structured_serialize_undefined_or_null_for_storage(JS::Value value)
 {
-    // 1. If memory was not supplied, let memory be an empty map.
-    // IMPLEMENTATION DEFINED: We move this requirement up to the callers to make recursion easier
+    VERIFY(value.is_undefined() || value.is_null());
+    return value.is_undefined() ? storage_serialization_record_for_undefined() : storage_serialization_record_for_null();
+}
 
-    Serializer serializer(vm, serialized, memory, for_storage);
+// https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal
+WebIDL::ExceptionOr<void> structured_serialize_internal(JS::VM& vm, StructuredSerializeWriter& serialized, JS::Value value, bool for_storage, SerializationMemory& memory, AllowSharedArrayBuffers allow_shared_array_buffers)
+{
+    Serializer serializer(vm, serialized, memory, for_storage, allow_shared_array_buffers);
     return serializer.serialize(value);
 }
 
 // https://html.spec.whatwg.org/multipage/structured-data.html#structureddeserialize
-WebIDL::ExceptionOr<JS::Value> structured_deserialize(JS::VM& vm, IPCSerializationRecord const& serialized, JS::Realm& target_realm, Optional<DeserializationMemory> memory)
+WebIDL::ExceptionOr<JS::Value> structured_deserialize(JS::VM& vm, IPCSerializationRecord const& serialized, JS::Realm& target_realm, Optional<DeserializationMemory> memory, Vector<Core::AnonymousBuffer> const* shared_buffers)
 {
     TemporaryExecutionContext execution_context { target_realm };
 
@@ -2234,6 +2539,8 @@ WebIDL::ExceptionOr<JS::Value> structured_deserialize(JS::VM& vm, IPCSerializati
         memory = DeserializationMemory {};
 
     StructuredSerializeReader decoder { serialized };
+    if (shared_buffers)
+        decoder.set_shared_buffers(*shared_buffers);
     return structured_deserialize_internal(vm, decoder, target_realm, *memory);
 }
 
@@ -2260,41 +2567,6 @@ WebIDL::ExceptionOr<JS::Value> structured_deserialize_internal(JS::VM& vm, Struc
     return value;
 }
 
-TransferDataEncoder::TransferDataEncoder()
-    : m_encoder(m_buffer)
-{
-}
-
-TransferDataEncoder::TransferDataEncoder(IPC::MessageBuffer&& buffer)
-    : m_buffer(move(buffer))
-    , m_encoder(m_buffer)
-{
-}
-
-IPC::MessageBuffer const& TransferDataEncoder::buffer() const
-{
-    return m_buffer;
-}
-
-IPC::MessageBuffer TransferDataEncoder::take_buffer() const
-{
-    VERIFY(!m_buffer_has_been_taken);
-    m_buffer_has_been_taken = true;
-    return move(m_buffer);
-}
-
-void TransferDataEncoder::append(IPCSerializationRecord&& record)
-{
-    VERIFY(!m_buffer_has_been_taken);
-    MUST(m_buffer.append_data(record.data.data(), record.data.size()));
-}
-
-void TransferDataEncoder::extend(Vector<TransferDataEncoder> data_holders)
-{
-    for (auto& data_holder : data_holders)
-        MUST(m_buffer.extend(data_holder.take_buffer()));
-}
-
 TransferDataDecoder::TransferDataDecoder(IPCSerializationRecord const& record)
     : m_stream(record.data.span())
     , m_decoder(m_stream, m_attachments)
@@ -2310,50 +2582,16 @@ TransferDataDecoder::TransferDataDecoder(TransferDataEncoder&& data_holder)
         m_attachments.enqueue(move(attachment));
 }
 
-template WEB_API void StructuredSerializeWriter::encode<bool>(bool const&);
-template WEB_API void StructuredSerializeWriter::encode<int>(int const&);
-template WEB_API void StructuredSerializeWriter::encode<u32>(u32 const&);
-template WEB_API void StructuredSerializeWriter::encode<u64>(u64 const&);
-template WEB_API void StructuredSerializeWriter::encode<i64>(i64 const&);
-template WEB_API void StructuredSerializeWriter::encode<double>(double const&);
-template WEB_API void StructuredSerializeWriter::encode<Utf16String>(Utf16String const&);
-template WEB_API void StructuredSerializeWriter::encode<ByteBuffer>(ByteBuffer const&);
-template WEB_API void StructuredSerializeWriter::encode<ReadonlyBytes>(ReadonlyBytes const&);
-template WEB_API void StructuredSerializeWriter::encode<Bindings::InterfaceName>(Bindings::InterfaceName const&);
-template WEB_API void StructuredSerializeWriter::encode<Bindings::KeyType>(Bindings::KeyType const&);
-template WEB_API void StructuredSerializeWriter::encode<Bindings::KeyUsage>(Bindings::KeyUsage const&);
-template WEB_API void StructuredSerializeWriter::encode<Bindings::PredefinedColorSpace>(Bindings::PredefinedColorSpace const&);
-template WEB_API void StructuredSerializeWriter::encode<Gfx::BitmapFormat>(Gfx::BitmapFormat const&);
-template WEB_API void StructuredSerializeWriter::encode<Gfx::AlphaType>(Gfx::AlphaType const&);
-template WEB_API void StructuredSerializeWriter::encode<u8>(u8 const&);
-template WEB_API void StructuredSerializeWriter::encode<u16>(u16 const&);
-template WEB_API void StructuredSerializeWriter::encode<Optional<double>>(Optional<double> const&);
-template WEB_API void StructuredSerializeWriter::encode<Optional<Utf16String>>(Optional<Utf16String> const&);
-template WEB_API void StructuredSerializeWriter::encode<Optional<bool>>(Optional<bool> const&);
-template WEB_API void StructuredSerializeWriter::encode<Vector<Bindings::KeyUsage>>(Vector<Bindings::KeyUsage> const&);
-template WEB_API void StructuredSerializeWriter::encode<Optional<Vector<int>>>(Optional<Vector<int>> const&);
+WebIDL::ExceptionOr<ByteBuffer> TransferDataDecoder::decode_buffer()
+{
+    auto buffer = m_decoder.decode<ByteBuffer>();
 
-template WEB_API ErrorOr<bool> StructuredSerializeReader::decode<bool>();
-template WEB_API ErrorOr<int> StructuredSerializeReader::decode<int>();
-template WEB_API ErrorOr<u32> StructuredSerializeReader::decode<u32>();
-template WEB_API ErrorOr<u64> StructuredSerializeReader::decode<u64>();
-template WEB_API ErrorOr<i64> StructuredSerializeReader::decode<i64>();
-template WEB_API ErrorOr<double> StructuredSerializeReader::decode<double>();
-template WEB_API ErrorOr<Utf16String> StructuredSerializeReader::decode<Utf16String>();
-template WEB_API ErrorOr<ByteBuffer> StructuredSerializeReader::decode<ByteBuffer>();
-template WEB_API ErrorOr<Bindings::InterfaceName> StructuredSerializeReader::decode<Bindings::InterfaceName>();
-template WEB_API ErrorOr<Bindings::KeyType> StructuredSerializeReader::decode<Bindings::KeyType>();
-template WEB_API ErrorOr<Bindings::KeyUsage> StructuredSerializeReader::decode<Bindings::KeyUsage>();
-template WEB_API ErrorOr<Bindings::PredefinedColorSpace> StructuredSerializeReader::decode<Bindings::PredefinedColorSpace>();
-template WEB_API ErrorOr<Gfx::BitmapFormat> StructuredSerializeReader::decode<Gfx::BitmapFormat>();
-template WEB_API ErrorOr<Gfx::AlphaType> StructuredSerializeReader::decode<Gfx::AlphaType>();
-template WEB_API ErrorOr<u8> StructuredSerializeReader::decode<u8>();
-template WEB_API ErrorOr<u16> StructuredSerializeReader::decode<u16>();
-template WEB_API ErrorOr<Optional<double>> StructuredSerializeReader::decode<Optional<double>>();
-template WEB_API ErrorOr<Optional<Utf16String>> StructuredSerializeReader::decode<Optional<Utf16String>>();
-template WEB_API ErrorOr<Optional<bool>> StructuredSerializeReader::decode<Optional<bool>>();
-template WEB_API ErrorOr<Vector<Bindings::KeyUsage>> StructuredSerializeReader::decode<Vector<Bindings::KeyUsage>>();
-template WEB_API ErrorOr<Optional<Vector<int>>> StructuredSerializeReader::decode<Optional<Vector<int>>>();
+    if (buffer.is_error()) {
+        VERIFY(buffer.error().code() == ENOMEM);
+        return WebIDL::DataCloneError::create("Unable to allocate memory for transferred buffer"_utf16);
+    }
+    return buffer.release_value();
+}
 
 void encode_unsigned_big_integer(StructuredSerializeWriter& writer, ::Crypto::UnsignedBigInteger const& value)
 {
@@ -2366,6 +2604,12 @@ void encode_unsigned_big_integer(StructuredSerializeWriter& writer, ::Crypto::Un
 WebIDL::ExceptionOr<::Crypto::UnsignedBigInteger> decode_unsigned_big_integer(StructuredSerializeReader& reader, JS::Realm& realm)
 {
     auto buffer = TRY(decode_or_throw_data_clone_error<ByteBuffer>(realm, reader));
+    return ::Crypto::UnsignedBigInteger::import_data(buffer);
+}
+
+WebIDL::ExceptionOr<::Crypto::UnsignedBigInteger> TransferDataDecoder::decode_unsigned_big_integer()
+{
+    auto buffer = TRY(decode_buffer());
     return ::Crypto::UnsignedBigInteger::import_data(buffer);
 }
 
@@ -2383,85 +2627,6 @@ WebIDL::ExceptionOr<::Crypto::SignedBigInteger> decode_signed_big_integer(Struct
     if (buffer.is_empty())
         return data_clone_error_from_serialization_error(realm, AK::Error::from_string_literal("Invalid BigInt"));
     return ::Crypto::SignedBigInteger::import_data(buffer);
-}
-
-}
-
-namespace IPC {
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::HTML::TransferDataEncoder const& data_holder)
-{
-    auto buffer = data_holder.take_buffer();
-    auto data = buffer.take_data();
-    auto attachments = buffer.take_attachments();
-
-    TRY(encoder.encode(data));
-    TRY(encoder.encode(static_cast<u32>(attachments.size())));
-    for (auto& attachment : attachments)
-        TRY(encoder.append_attachment(move(attachment)));
-
-    return {};
-}
-
-template<>
-ErrorOr<Web::HTML::TransferDataEncoder> decode(Decoder& decoder)
-{
-    auto data = TRY(decoder.decode<MessageDataType>());
-    auto attachment_count = TRY(decoder.decode<u32>());
-
-    Vector<Attachment> attachments;
-    TRY(attachments.try_ensure_capacity(attachment_count));
-    for (u32 i = 0; i < attachment_count; ++i)
-        attachments.unchecked_append(TRY(decoder.attachments().try_dequeue()));
-
-    IPC::MessageBuffer buffer { move(data), move(attachments) };
-    return Web::HTML::TransferDataEncoder { move(buffer) };
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::HTML::IPCSerializationRecord const& record)
-{
-    TRY(encoder.encode(record.data));
-    return {};
-}
-
-template<>
-ErrorOr<Web::HTML::IPCSerializationRecord> decode(Decoder& decoder)
-{
-    auto data = TRY(decoder.decode<MessageDataType>());
-    return Web::HTML::IPCSerializationRecord { move(data) };
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::HTML::StorageSerializationRecord const& record)
-{
-    TRY(encoder.encode(record.data));
-    return {};
-}
-
-template<>
-ErrorOr<Web::HTML::StorageSerializationRecord> decode(Decoder& decoder)
-{
-    auto data = TRY(decoder.decode<ByteBuffer>());
-    return Web::HTML::StorageSerializationRecord { move(data) };
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::HTML::SerializedTransferRecord const& record)
-{
-    TRY(encoder.encode(record.serialized));
-    TRY(encoder.encode(record.transfer_data_holders));
-    return {};
-}
-
-template<>
-ErrorOr<Web::HTML::SerializedTransferRecord> decode(Decoder& decoder)
-{
-    auto serialized = TRY(decoder.decode<Web::HTML::IPCSerializationRecord>());
-    auto transfer_data_holders = TRY(decoder.decode<Vector<Web::HTML::TransferDataEncoder>>());
-
-    return Web::HTML::SerializedTransferRecord { move(serialized), move(transfer_data_holders) };
 }
 
 }

@@ -12,22 +12,29 @@
 #include <AK/JsonObjectSerializer.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Utf16StringBuilder.h>
+#include <AK/Vector.h>
+#include <LibGC/ConservativeVector.h>
 #include <LibGC/DeferGC.h>
-#include <LibGC/WeakHashMap.h>
+#include <LibGC/Heap.h>
 #include <LibJS/Runtime/ExternalMemory.h>
-#include <LibJS/Runtime/FunctionObject.h>
 #include <LibWeb/Animations/Animation.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/Node.h>
-#include <LibWeb/CSS/ComputedProperties.h>
-#include <LibWeb/CSS/Invalidation/NodeInvalidator.h>
-#include <LibWeb/CSS/Invalidation/StructuralMutationInvalidator.h>
+#include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/CSS/CountersSet.h>
+#include <LibWeb/CSS/GeneratedContent.h>
+#include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
+#include <LibWeb/CSS/Invalidation/LanguageInvalidator.h>
+#include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
+#include <LibWeb/CSS/SelectorMatching.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/AccessibilityTreeNode.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/CDATASection.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Comment.h>
+#include <LibWeb/DOM/CommitMessages.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
 #include <LibWeb/DOM/DocumentType.h>
@@ -35,24 +42,29 @@
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/EventDispatcher.h>
+#include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/IDLEventListener.h>
+#include <LibWeb/DOM/InvalidationJournal.h>
 #include <LibWeb/DOM/LiveNodeList.h>
+#include <LibWeb/DOM/MutationObserver.h>
 #include <LibWeb/DOM/MutationType.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
 #include <LibWeb/DOM/Node.h>
+#include <LibWeb/DOM/NodeIdentity.h>
 #include <LibWeb/DOM/NodeIterator.h>
 #include <LibWeb/DOM/ProcessingInstruction.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/StaticNodeList.h>
+#include <LibWeb/DOM/SubtreeInsertionScope.h>
 #include <LibWeb/DOM/XMLDocument.h>
 #include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
-#include <LibWeb/HTML/HTMLAnchorElement.h>
 #include <LibWeb/HTML/HTMLDocument.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
+#include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLLegendElement.h>
@@ -65,67 +77,132 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/XMLSerializer.h>
-#include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Box.h>
+#include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TextNode.h>
-#include <LibWeb/Layout/TextOffsetMapping.h>
+#include <LibWeb/Layout/TreeBuilderRustFFI.h>
 #include <LibWeb/MathML/MathMLElement.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
 #include <LibWeb/XLink/AttributeNames.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
 
 namespace Web::DOM {
 
-static UniqueNodeID s_next_unique_id;
-static GC::WeakHashMap<UniqueNodeID, Node>& node_directory()
+static bool final_direct_list_item_does_not_renumber_existing_content(Element const& list_item)
 {
-    static NeverDestroyed<GC::WeakHashMap<UniqueNodeID, Node>> directory;
+    auto list_owner = list_item.parent_element();
+    if (!list_owner || !list_owner->is_html_ol_ul_menu_element() || list_item.next_element_sibling())
+        return false;
+    if (list_owner->after_pseudo_element_style_depends_on_list_item_counter())
+        return false;
+
+    return CSS::innermost_list_item_counter_is_own_forward_counter(*list_owner);
+}
+
+// The text the pseudo-element's content resolved to when its box was built: its alt text when it has one, otherwise
+// every string in it.
+static Utf16String generated_content_accessible_text(Element const& element, CSS::PseudoElement pseudo_element)
+{
+    auto* arena = element.document().layout_node_arena_if_created();
+    VERIFY(arena);
+    return Utf16String::adopt_raw(Layout::RustFFI::layout_script_generated_content_accessible_text(
+        arena->host(), element.style_node_id().value(), Layout::Node::encode_generated_for(pseudo_element)));
+}
+
+// Every node the style engine hears of gets an identity as it connects, so handing one out and
+// giving it up again are paid per element. The directory is a slab: an identity names a slot and
+// the generation the slot was at when it was handed out, so an identity outliving its node never
+// names the node that takes the slot next. Freed slots are taken again oldest first, which spreads
+// the generations over every slot, and an identity stays within what a JavaScript number holds
+// exactly, as the ones handed to devtools and WebDriver clients are read. Slot 0 names no node, so
+// a node holds 0 until it is named, and ends the list of free slots.
+static constexpr u32 max_node_directory_generation = (1u << 21) - 1;
+
+struct NodeDirectorySlot {
+    GC::RawPtr<Node> node;
+    u32 generation { 0 };
+    // The free slot freed after this one, while this one is free.
+    u32 next_free { 0 };
+};
+
+static Vector<NodeDirectorySlot>& node_directory()
+{
+    static NeverDestroyed<Vector<NodeDirectorySlot>> directory { Vector<NodeDirectorySlot> { NodeDirectorySlot {} } };
     return *directory;
 }
 
-static UniqueNodeID allocate_unique_id(Node& node)
+// The ends of the list of free slots, oldest first.
+static u32 s_oldest_free_node_directory_slot;
+static u32 s_newest_free_node_directory_slot;
+
+static u32 allocate_node_directory_slot(Node& node)
 {
-    auto id = s_next_unique_id;
-    ++s_next_unique_id;
-    node_directory().set(id, node);
-    return id;
+    auto& directory = node_directory();
+    u32 index = s_oldest_free_node_directory_slot;
+    if (index != 0) {
+        s_oldest_free_node_directory_slot = directory[index].next_free;
+        if (s_oldest_free_node_directory_slot == 0)
+            s_newest_free_node_directory_slot = 0;
+    } else {
+        index = directory.size();
+        directory.append({});
+    }
+    auto& slot = directory[index];
+    // A generation is never zero, so neither is an identity.
+    slot.generation = (slot.generation % max_node_directory_generation) + 1;
+    slot.node = &node;
+    return index;
 }
 
-static void deallocate_unique_id(UniqueNodeID node_id)
+static UniqueNodeID unique_id_of_node_directory_slot(u32 index)
 {
-    if (!node_directory().remove(node_id))
-        VERIFY_NOT_REACHED();
+    return (static_cast<i64>(node_directory()[index].generation) << 32) | index;
+}
+
+static void free_node_directory_slot(u32 index)
+{
+    auto& directory = node_directory();
+    directory[index].node = nullptr;
+    directory[index].next_free = 0;
+    if (s_newest_free_node_directory_slot != 0)
+        directory[s_newest_free_node_directory_slot].next_free = index;
+    else
+        s_oldest_free_node_directory_slot = index;
+    s_newest_free_node_directory_slot = index;
 }
 
 Node* Node::from_unique_id(UniqueNodeID unique_id)
 {
-    return node_directory().get(unique_id);
+    auto index = static_cast<u32>(unique_id.value() & 0xffffffff);
+    auto generation = static_cast<u32>(unique_id.value() >> 32);
+    auto const& directory = node_directory();
+    if (index >= directory.size() || directory[index].generation != generation)
+        return nullptr;
+    return directory[index].node.ptr();
 }
 
-Node::Node(JS::Realm& realm, Document& document, NodeType type)
-    : EventTarget(realm)
+Node::Node(Document& document, NodeType type)
+    : EventTarget()
     , m_document(&document)
+    , m_root(this)
     , m_type(type)
-    , m_unique_id(allocate_unique_id(*this))
 {
     // A Document is its own shadow-including root, so it is always connected.
     if (type == NodeType::DOCUMENT_NODE)
         m_is_connected = true;
-}
-
-Node::Node(Document& document, NodeType type)
-    : Node(document.realm(), document, type)
-{
 }
 
 Node::~Node() = default;
@@ -140,54 +217,143 @@ CSS::UserSelect Node::user_select_used_value() const
         element = flat_tree_parent_element();
     }
 
-    if (!element || !element->computed_values())
+    auto const* values = element ? element->style_group<CSS::ComputedValues::MiscResetValues>() : nullptr;
+    if (!values)
         return CSS::UserSelect::None;
 
     // The used value is the same as the computed value, except:
-    auto computed_value = element->computed_values()->user_select();
+    auto computed_value = static_cast<CSS::UserSelect>(values->user_select);
 
-    // 1. on editable elements where the used value is always 'contain' regardless of the computed value
-
-    // 2. when the computed value is 'auto', in which case the used value is one of the other values as defined below
-
-    // For the purpose of this specification, an editable element is either an editing host or a mutable form control with
-    // textual content, such as textarea.
     auto* form_control = as_if<HTML::FormAssociatedTextControlElement>(*element);
-    // FIXME: Check if this needs to exclude input elements with types such as color or range, and if so, which ones exactly.
     if (element->is_editing_host() || (form_control && form_control->text_control_to_html_element().is_mutable()))
         return CSS::UserSelect::Contain;
 
     if (computed_value != CSS::UserSelect::Auto)
         return computed_value;
 
-    // The used value of 'auto' is determined as follows:
-
-    // - On the '::before' and '::after' pseudo-elements, the used value is 'none'
-    // NOTE: Pseudo-elements are handled by Layout::Node::user_select_used_value().
-
-    // - If the element is an editable element, the used value is 'contain'
-    // NOTE: We already handled this above.
-
     if (auto parent_element = element->element_to_inherit_style_from({})) {
         auto parent_used_value = parent_element->user_select_used_value();
-
-        // - Otherwise, if the used value of user-select on the parent of this element is 'all', the used value is 'all'
-        if (parent_used_value == CSS::UserSelect::All)
-            return CSS::UserSelect::All;
-
-        // - Otherwise, if the used value of user-select on the parent of this element is 'none', the used value is 'none'
-        if (parent_used_value == CSS::UserSelect::None)
-            return CSS::UserSelect::None;
+        if (parent_used_value == CSS::UserSelect::All || parent_used_value == CSS::UserSelect::None)
+            return parent_used_value;
     }
 
-    // - Otherwise, the used value is 'text'
     return CSS::UserSelect::Text;
+}
+
+Node::RareData::~RareData() = default;
+
+void Node::RareData::visit_edges(Cell::Visitor& visitor)
+{
+    visitor.visit(child_nodes);
+    visitor.visit(children);
+    if (registered_observer_list)
+        visitor.visit(*registered_observer_list);
+}
+
+void Node::register_html_collection_with_valid_cache(HTMLCollection& collection)
+{
+    auto& collections = ensure_rare_data().html_collections_with_valid_caches;
+    if (!collections)
+        collections = make<HTMLCollectionCacheRegistration::List>();
+    collections->append(collection.m_cache_registration);
+}
+
+void Node::invalidate_html_collection_caches_in_ancestors(ChildrenChangedMetadata::AffectsElements affects_elements)
+{
+    if (affects_elements == ChildrenChangedMetadata::AffectsElements::No || !document().has_valid_html_collection_caches())
+        return;
+
+    for (auto* ancestor = this; ancestor; ancestor = ancestor->parent()) {
+        if (!ancestor->m_rare_data || !ancestor->m_rare_data->html_collections_with_valid_caches)
+            continue;
+
+        GC::RootVector<GC::Ref<HTMLCollection>> collections;
+        for (auto& registration : *ancestor->m_rare_data->html_collections_with_valid_caches)
+            collections.append(registration.collection());
+        for (auto& collection : collections)
+            collection->invalidate_cache_for_tree_mutation(*this);
+    }
+}
+
+void Node::invalidate_html_collection_caches_in_ancestors_for_attribute_change(HTMLCollectionCacheRegistration::AttributeInvalidationTypes invalidation_types)
+{
+    auto& element = as<Element>(*this);
+    for (auto* ancestor = this; ancestor; ancestor = ancestor->parent()) {
+        if (!ancestor->m_rare_data || !ancestor->m_rare_data->html_collections_with_valid_caches)
+            continue;
+
+        GC::RootVector<GC::Ref<HTMLCollection>> collections;
+        for (auto& registration : *ancestor->m_rare_data->html_collections_with_valid_caches)
+            collections.append(registration.collection());
+        for (auto& collection : collections)
+            collection->invalidate_cache_for_attribute_change(element, invalidation_types);
+    }
+}
+
+static Node::ChildrenChangedMetadata::AffectsElements mutation_affects_elements(ReadonlySpan<GC::Ref<Node>> nodes)
+{
+    for (auto const& node : nodes) {
+        if (is<Element>(*node))
+            return Node::ChildrenChangedMetadata::AffectsElements::Yes;
+    }
+    return Node::ChildrenChangedMetadata::AffectsElements::No;
+}
+
+static Node::ChildrenChangedMetadata::AffectsElements mutation_affects_elements(Node& node)
+{
+    return is<Element>(node) ? Node::ChildrenChangedMetadata::AffectsElements::Yes : Node::ChildrenChangedMetadata::AffectsElements::No;
+}
+
+size_t Node::RareData::external_memory_size() const
+{
+    if (!registered_observer_list)
+        return 0;
+    return JS::vector_external_memory_size(*registered_observer_list);
+}
+
+OwnPtr<Node::RareData> Node::create_rare_data() const
+{
+    return make<RareData>();
+}
+
+Node::RareData& Node::ensure_rare_data() const
+{
+    if (!m_rare_data)
+        m_rare_data = create_rare_data();
+    return *m_rare_data;
 }
 
 void Node::finalize()
 {
     Base::finalize();
-    deallocate_unique_id(m_unique_id);
+    if (m_node_directory_slot)
+        free_node_directory_slot(m_node_directory_slot);
+}
+
+UniqueNodeID Node::unique_id() const
+{
+    if (!m_node_directory_slot)
+        m_node_directory_slot = allocate_node_directory_slot(const_cast<Node&>(*this));
+    return unique_id_of_node_directory_slot(m_node_directory_slot);
+}
+
+Optional<UniqueNodeID> Node::unique_id_if_assigned() const
+{
+    if (!m_node_directory_slot)
+        return {};
+    return unique_id_of_node_directory_slot(m_node_directory_slot);
+}
+
+Optional<String> Node::webdriver_node_id() const
+{
+    if (!m_rare_data)
+        return {};
+    return m_rare_data->webdriver_node_id;
+}
+
+void Node::set_webdriver_node_id(String node_id) const
+{
+    ensure_rare_data().webdriver_node_id = move(node_id);
 }
 
 void Node::visit_edges(Cell::Visitor& visitor)
@@ -195,18 +361,16 @@ void Node::visit_edges(Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     TreeNode::visit_edges(visitor);
     visitor.visit(m_document);
-    visitor.visit(m_child_nodes);
-
-    if (m_registered_observer_list) {
-        visitor.visit(*m_registered_observer_list);
-    }
+    visitor.visit(m_root);
+    if (m_rare_data)
+        m_rare_data->visit_edges(visitor);
 }
 
 size_t Node::external_memory_size() const
 {
     auto size = Base::external_memory_size();
-    if (m_registered_observer_list)
-        size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(*m_registered_observer_list));
+    if (m_rare_data)
+        size = JS::saturating_add_external_memory_size(size, m_rare_data->external_memory_size());
     return size;
 }
 
@@ -217,14 +381,14 @@ Utf16String Node::base_uri() const
     return utf16_string_from_url_ascii(document().base_url().to_string());
 }
 
-HTML::HTMLAnchorElement const* Node::enclosing_link_element() const
+HTML::HTMLHyperlinkElementUtils const* Node::enclosing_link_element() const
 {
     for (auto* node = this; node; node = node->parent()) {
-        auto const* anchor_element = as_if<HTML::HTMLAnchorElement>(*node);
-        if (!anchor_element)
+        auto const* element = as_if<Element>(*node);
+        if (!element)
             continue;
-        if (anchor_element->has_attribute(HTML::AttributeNames::href))
-            return anchor_element;
+        if (auto const* hyperlink = element->created_hyperlink())
+            return hyperlink;
     }
     return nullptr;
 }
@@ -310,13 +474,49 @@ WebIDL::ExceptionOr<void> Node::set_text_content(Optional<Utf16String> const& ma
 
     // Otherwise, do nothing.
 
-    if (is_connected()) {
-        invalidate_style(StyleInvalidationReason::NodeSetTextContent);
+    auto is_boxless_style_element = (is_html_style_element() || is_svg_style_element()) && !has_layout_box();
+    if (is_connected() && !is_boxless_style_element)
         set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeSetTextContent);
-    }
 
-    document().bump_dom_tree_version();
+    bump_dom_tree_version();
     return {};
+}
+
+// The node holding the version counters of the tree a node is in: its document while connected, otherwise its root.
+// A lone node that cannot have children heads a tree nothing can be cached on, so it holds no counters.
+static ParentNode* tree_version_holder(Node const& node)
+{
+    if (node.is_connected())
+        return const_cast<Document*>(&node.document());
+    return const_cast<ParentNode*>(as_if<ParentNode>(node.root()));
+}
+
+static u64 s_last_tree_version = 0;
+
+u64 Node::dom_tree_version() const
+{
+    auto const* holder = tree_version_holder(*this);
+    return holder ? holder->m_dom_tree_version : 0;
+}
+
+u64 Node::character_data_version() const
+{
+    auto const* holder = tree_version_holder(*this);
+    return holder ? holder->m_character_data_version : 0;
+}
+
+void Node::bump_dom_tree_version()
+{
+    // NB: Inserted or moved content can enter a selection without moving its boundary points.
+    document().set_needs_selection_style_update();
+    if (auto* holder = tree_version_holder(*this))
+        holder->m_dom_tree_version = ++s_last_tree_version;
+}
+
+void Node::bump_character_data_version()
+{
+    if (auto* holder = tree_version_holder(*this))
+        holder->m_character_data_version = ++s_last_tree_version;
 }
 
 // https://dom.spec.whatwg.org/#dom-node-normalize
@@ -384,37 +584,31 @@ WebIDL::ExceptionOr<void> Node::normalize()
         while (current_node && current_node->is_exclusive_text()) {
             // 1. For each live range whose start node is currentNode, add length to its start offset and set its start
             //    node to node.
-            for (auto& range : Range::live_ranges()) {
-                if (range->start_container() == current_node) {
-                    range->increase_start_offset(length);
-                    range->set_start_node(node);
-                }
-            }
-
             // 2. For each live range whose end node is currentNode, add length to its end offset and set its end node
             //    to node.
-            for (auto& range : Range::live_ranges()) {
-                if (range->end_container() == current_node) {
-                    range->increase_end_offset(length);
-                    range->set_end_node(node);
-                }
-            }
-
             // 3. For each live range whose start node is currentNode’s parent and start offset is currentNode’s index,
             //    set its start node to node and its start offset to length.
-            for (auto& range : Range::live_ranges()) {
-                if (range->start_container() == current_node->parent() && range->start_offset() == current_node->index()) {
-                    range->set_start_node(node);
-                    range->set_start_offset(length);
-                }
-            }
-
             // 4. For each live range whose end node is currentNode’s parent and end offset is currentNode’s index, set
             //    its end node to node and its end offset to length.
-            for (auto& range : Range::live_ranges()) {
-                if (range->end_container() == current_node->parent() && range->end_offset() == current_node->index()) {
-                    range->set_end_node(node);
-                    range->set_end_offset(length);
+            // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
+            auto* current_node_parent = current_node->parent();
+            auto current_node_index = current_node->index();
+            for (auto& range : document().live_ranges()) {
+                if (range.start_container().ptr() == current_node) {
+                    range.increase_start_offset(length);
+                    range.set_start_node(node);
+                }
+                if (range.end_container().ptr() == current_node) {
+                    range.increase_end_offset(length);
+                    range.set_end_node(node);
+                }
+                if (range.start_container().ptr() == current_node_parent && range.start_offset() == current_node_index) {
+                    range.set_start_node(node);
+                    range.set_start_offset(length);
+                }
+                if (range.end_container().ptr() == current_node_parent && range.end_offset() == current_node_index) {
+                    range.set_end_node(node);
+                    range.set_end_offset(length);
                 }
             }
 
@@ -490,39 +684,34 @@ CSS::StyleScope& Node::style_scope()
     return document().style_scope();
 }
 
-void Node::for_each_style_scope_which_may_observe_the_node(Function<void(CSS::StyleScope&)> const& callback)
+void Node::record_style_environment_change()
 {
-    HashTable<CSS::StyleScope*> visited_scopes;
-    auto visit = [&](CSS::StyleScope& scope) {
-        if (visited_scopes.set(&scope) != AK::HashSetResult::InsertedNewEntry)
-            return;
-        callback(scope);
-    };
+    document().bump_style_environment_version();
 
-    visit(style_scope());
-
-    if (auto* element = as_if<Element>(*this)) {
-        if (auto shadow_root = element->shadow_root())
-            visit(shadow_root->style_scope());
+    if (is_document()) {
+        document().style_computer().style_engine().record_environment_change();
+        return;
     }
 
-    for (auto* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
-        visit(ancestor->style_scope());
-        if (auto* element = as_if<Element>(*ancestor)) {
-            if (auto shadow_root = element->shadow_root())
-                visit(shadow_root->style_scope());
-        }
+    // A shadow root has no style of its own, so a caller naming one means the scope it heads. An
+    // element names its own environment input; StyleEngine routes any consequences of its changed
+    // facts separately.
+    // The environment version this bumped is a published document input, so what these rows need
+    // is a drive against the new one, which the engine can do for itself. What the host knows that
+    // the engine does not is only WHICH nodes to drive, and that is what the reaction carries.
+    if (is_element()) {
+        auto& element = static_cast<Element&>(*this);
+        document().style_computer().style_engine().record_derived_element_style_input_change(element.style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
+        return;
     }
-}
 
-void Node::invalidate_style(StyleInvalidationReason reason)
-{
-    CSS::Invalidation::invalidate_node_style(*this, reason);
-}
-
-void Node::invalidate_style(StyleInvalidationReason reason, Vector<CSS::InvalidationSet::Property> const& properties, StyleInvalidationOptions options)
-{
-    CSS::Invalidation::invalidate_node_style_for_properties(*this, reason, properties, options);
+    for_each_shadow_including_inclusive_descendant([](Node& descendant) {
+        auto* element = as_if<Element>(descendant);
+        if (!element)
+            return TraversalDecision::Continue;
+        element->document().style_computer().style_engine().record_derived_element_style_input_change(element->style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
+        return TraversalDecision::Continue;
+    });
 }
 
 Utf16String Node::child_text_content() const
@@ -570,7 +759,7 @@ bool Node::is_closed_shadow_hidden_from(Node const& b) const
         return false;
 
     // - A’s root is a shadow root whose mode is "closed" or A’s root’s host is closed-shadow-hidden from B.
-    if (a_root.is_shadow_root() && static_cast<ShadowRoot const&>(a_root).mode() == Bindings::ShadowRootMode::Closed)
+    if (a_root.is_shadow_root() && static_cast<ShadowRoot const&>(a_root).mode() == ShadowRootMode::Closed)
         return true;
     if (a_root.is_document_fragment() && static_cast<DocumentFragment const&>(a_root).host()->is_closed_shadow_hidden_from(b))
         return true;
@@ -578,43 +767,50 @@ bool Node::is_closed_shadow_hidden_from(Node const& b) const
     return false;
 }
 
+bool Node::is_tracked_by_style_engine() const
+{
+    return is_connected() && document().style_engine_tracks_tree();
+}
+
 // https://html.spec.whatwg.org/multipage/infrastructure.html#browsing-context-connected
 bool Node::is_browsing_context_connected() const
 {
     // A node is browsing-context connected when it is connected and its shadow-including root's browsing context is non-null.
-    return is_connected() && shadow_including_root().document().browsing_context();
+    // NB: A connected node's shadow-including root is its node document.
+    return is_connected() && document().browsing_context();
 }
 
 // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity
-WebIDL::ExceptionOr<void> Node::ensure_pre_insert_validity(JS::Realm& realm, GC::Ref<Node> node, GC::Ptr<Node> child, ChildrenToExclude children_to_exclude) const
+WebIDL::ExceptionOr<void> Node::ensure_pre_insertion_validity(GC::Ref<Node> node, GC::Ptr<Node> child, bool exclude_all_children) const
 {
     // 1. If parent is not a Document, DocumentFragment, or Element node, then throw a "HierarchyRequestError" DOMException.
     if (!is<Document>(this) && !is<DocumentFragment>(this) && !is<Element>(this))
-        return WebIDL::HierarchyRequestError::create(realm, "Can only insert into a document, document fragment or element"_utf16);
+        return WebIDL::HierarchyRequestError::create("Can only insert into a document, document fragment or element"_utf16);
 
     // 2. If node is a host-including inclusive ancestor of parent, then throw a "HierarchyRequestError" DOMException.
     if (node->is_host_including_inclusive_ancestor_of(*this))
-        return WebIDL::HierarchyRequestError::create(realm, "New node is an ancestor of this node"_utf16);
+        return WebIDL::HierarchyRequestError::create("New node is an ancestor of this node"_utf16);
 
     // 3. If child is non-null and its parent is not parent, then throw a "NotFoundError" DOMException.
     if (child && child->parent() != this)
-        return WebIDL::NotFoundError::create(realm, "This node is not the parent of the given child"_utf16);
+        return WebIDL::NotFoundError::create("This node is not the parent of the given child"_utf16);
 
     // FIXME: All the following "Invalid node type for insertion" messages could be more descriptive.
     // 4. If node is not a DocumentFragment, DocumentType, Element, or CharacterData node, then throw a "HierarchyRequestError" DOMException.
-    if (!is<DocumentFragment>(*node) && !is<DocumentType>(*node) && !is<Element>(*node) && !is<CharacterData>(*node))
-        return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+    if (!is<DocumentFragment>(*node) && !is<DocumentType>(*node) && !is<Element>(*node) && !is<Text>(*node) && !is<Comment>(*node) && !is<ProcessingInstruction>(*node) && !is<CDATASection>(*node))
+        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
+
+    // 5. If either node is a Text node and parent is a document, or node is a doctype and parent is not a document, then throw a "HierarchyRequestError" DOMException.
+    if ((is<Text>(*node) && is<Document>(this)) || (is<DocumentType>(*node) && !is<Document>(this)))
+        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
 
     auto children_to_exclude_contains = [&](Node const& candidate) {
-        switch (children_to_exclude) {
-        case ChildrenToExclude::None:
-            return false;
-        case ChildrenToExclude::Child:
-            return child.ptr() == &candidate;
-        case ChildrenToExclude::AllChildren:
-            return candidate.parent() == this;
-        }
-        VERIFY_NOT_REACHED();
+        // replaceChildren() validates against a parent whose existing children
+        // will all be removed. Ordinary insertion (including Range.insertNode)
+        // must still reject a second doctype/element even when the reference
+        // child happens to be that same node.
+        (void)candidate;
+        return exclude_all_children;
     };
 
     auto has_element_child_not_excluded = [&] {
@@ -645,7 +841,7 @@ WebIDL::ExceptionOr<void> Node::ensure_pre_insert_validity(JS::Realm& realm, GC:
     if (!is<Document>(*this)) {
         // 1. If node is a doctype, then throw a "HierarchyRequestError" DOMException.
         if (is<DocumentType>(*node))
-            return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+            return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
 
         // 2. Return.
         return {};
@@ -653,7 +849,7 @@ WebIDL::ExceptionOr<void> Node::ensure_pre_insert_validity(JS::Realm& realm, GC:
 
     // 6. If node is a Text node, then throw a "HierarchyRequestError" DOMException.
     if (is<Text>(*node))
-        return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
 
     // 7. If node is a CharacterData node, then return.
     if (is<CharacterData>(*node))
@@ -664,7 +860,7 @@ WebIDL::ExceptionOr<void> Node::ensure_pre_insert_validity(JS::Realm& realm, GC:
         // 1. If node has more than one element child or has a Text node child, then throw a "HierarchyRequestError" DOMException.
         auto node_element_child_count = document_fragment->child_element_count();
         if (node_element_child_count > 1 || node->has_child_of_type<Text>())
-            return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+            return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
 
         // 2. If node has no element child, then return.
         if (node_element_child_count == 0)
@@ -681,7 +877,7 @@ WebIDL::ExceptionOr<void> Node::ensure_pre_insert_validity(JS::Realm& realm, GC:
         if (has_element_child_not_excluded()
             || (child && child->has_following_node_of_type_in_tree_order<DocumentType>())
             || (is<DocumentType>(child.ptr()) && !children_to_exclude_contains(*child))) {
-            return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+            return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
         }
 
         // 2. Return.
@@ -699,7 +895,7 @@ WebIDL::ExceptionOr<void> Node::ensure_pre_insert_validity(JS::Realm& realm, GC:
     if (has_doctype_child_not_excluded()
         || (child && child->has_preceding_node_of_type_in_tree_order<Element>())
         || (!child && has_element_child_not_excluded())) {
-        return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
     }
 
     return {};
@@ -713,11 +909,15 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
         history->notify_dom_mutation();
 
     // 1. Let nodes be node’s children, if node is a DocumentFragment node; otherwise « node ».
-    Vector<GC::Root<Node>> nodes;
-    if (is<DocumentFragment>(*node))
-        nodes = node->children_as_vector();
-    else
-        nodes.append(GC::make_root(*node));
+    // OPTIMIZATION: A single node needs no vector allocation. Keep fragment children in their original vector.
+    GC::RootVector<GC::Ref<Node>> fragment_children;
+    ReadonlySpan<GC::Ref<Node>> nodes;
+    if (is<DocumentFragment>(*node)) {
+        fragment_children = node->children_as_vector();
+        nodes = fragment_children;
+    } else {
+        nodes = { &node, 1 };
+    }
 
     // 2. Let count be nodes’s size.
     auto count = nodes.size();
@@ -726,6 +926,17 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
     if (count == 0)
         return;
 
+    // OPTIMIZATION: Geometry reads defer replayable selector facts, but a tree mutation changes
+    //               authoritative relationships. Consume that style-change boundary while the old
+    //               tree is still intact.
+    document().flush_deferred_style_change_event();
+    if (&node->document() != &document())
+        node->document().flush_deferred_style_change_event();
+
+    auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
+    if (document().has_valid_html_collection_caches())
+        affects_elements = mutation_affects_elements(nodes);
+
     // 4. If node is a DocumentFragment node:
     if (is<DocumentFragment>(*node)) {
         // 1. Remove its children with suppressObservers set to true.
@@ -733,25 +944,102 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
 
         // 2. Queue a tree mutation record for node with « », nodes, null, and null.
         // NOTE: This step intentionally does not pay attention to suppressObservers.
-        node->queue_tree_mutation_record({}, nodes, nullptr, nullptr);
+        node->queue_tree_mutation_record({}, fragment_children, nullptr, nullptr);
     }
 
+    insert_nodes_before(nodes, child, suppress_observers, node, affects_elements);
+}
+
+// https://dom.spec.whatwg.org/#concept-node-insert
+void Node::adjust_live_ranges_for_insertion(Node& child, size_t count)
+{
+    // 1. For each live range whose start node is parent and start offset is greater than child’s index:
+    //    increase its start offset by count.
+    // 2. For each live range whose end node is parent and end offset is greater than child’s index:
+    //    increase its end offset by count.
+    // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
+    auto child_index = child.index();
+    for (auto& range : document().live_ranges()) {
+        if (range.start_container().ptr() == this && range.start_offset() > child_index)
+            range.increase_start_offset(count);
+        if (range.end_container().ptr() == this && range.end_offset() > child_index)
+            range.increase_end_offset(count);
+    }
+}
+
+// https://dom.spec.whatwg.org/#concept-node-insert
+void Node::insert_node_into_children(GC::Ref<Node> node, GC::Ptr<Node> child)
+{
+    // 1. Adopt node into parent’s node document.
+    document().adopt_node_steps(node);
+
+    // 2. If child is null, then append node to parent’s children.
+    // 3. Otherwise, insert node into parent’s children before child’s index.
+    insert_before_impl(node, child);
+
+    // 4. If parent is a shadow host whose shadow root’s slot assignment is "named" and node is a slottable, then
+    //    assign a slot for node.
+    if (auto* element = as_if<DOM::Element>(*this)) {
+        auto is_named_shadow_host = element->is_shadow_host()
+            && element->shadow_root()->slot_assignment() == SlotAssignmentMode::Named;
+
+        if (is_named_shadow_host && node->is_slottable())
+            assign_a_slot(node->as_slottable());
+    }
+
+    // 5. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
+    //    signal a slot change for parent.
+    if (auto* this_slot_element = as_if<HTML::HTMLSlotElement>(*this); this_slot_element && root().is_shadow_root()) {
+        if (this_slot_element->assigned_nodes_internal().is_empty())
+            signal_a_slot_change(*this_slot_element);
+    }
+
+    // AD-HOC: Register any slot elements in the inserted subtree with the shadow root’s slot registry
+    //         before running assign_slottables_for_a_tree, so the registry is up-to-date.
+    if (auto* shadow_root = as_if<ShadowRoot>(node->root())) {
+        node->for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
+            shadow_root->register_slot(slot);
+            return TraversalDecision::Continue;
+        });
+    }
+
+    // 6. Run assign slottables for a tree with node’s root.
+    assign_slottables_for_a_tree(node->root());
+}
+
+// https://dom.spec.whatwg.org/#concept-node-insert
+template<typename Nodes>
+static void run_post_connection_steps(Nodes const& nodes)
+{
+    // 10. Let staticNodeList be a list of nodes, initially « ».
+    // NOTE: We collect all nodes before calling the post-connection steps on any one of them, instead of calling the
+    //       post-connection steps while we’re traversing the node tree. This is because the post-connection steps can
+    //       modify the tree’s structure, making live traversal unsafe, possibly leading to the post-connection steps
+    //       being called multiple times on the same node.
+    GC::ConservativeVector<GC::Ref<Node>, 1> static_node_list;
+
+    // 11. For each node of nodes, in tree order:
+    for (auto& node : nodes) {
+        // 1. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree
+        //    order: append inclusiveDescendant to staticNodeList.
+        node->for_each_shadow_including_inclusive_descendant([&static_node_list](Node& inclusive_descendant) {
+            static_node_list.append(inclusive_descendant);
+            return TraversalDecision::Continue;
+        });
+    }
+
+    // 12. For each node of staticNodeList: if node is connected, then run the post-connection steps with node.
+    for (auto& node : static_node_list) {
+        if (node->is_connected())
+            node->post_connection();
+    }
+}
+
+void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements affects_elements)
+{
     // 5. If child is non-null:
-    if (child) {
-        // 1. For each live range whose start node is parent and start offset is greater than child’s index:
-        //    increase its start offset by count.
-        for (auto& range : Range::live_ranges()) {
-            if (range->start_container() == this && range->start_offset() > child->index())
-                range->increase_start_offset(count);
-        }
-
-        // 2. For each live range whose end node is parent and end offset is greater than child’s index:
-        //    increase its end offset by count.
-        for (auto& range : Range::live_ranges()) {
-            if (range->end_container() == this && range->end_offset() > child->index())
-                range->increase_end_offset(count);
-        }
-    }
+    if (child)
+        adjust_live_ranges_for_insertion(*child, nodes.size());
 
     // 6. Let previousSibling be child’s previous sibling or parent’s last child if child is null.
     GC::Ptr<Node> previous_sibling;
@@ -763,46 +1051,15 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
     // 7. For each node in nodes, in tree order:
     // FIXME: In tree order
     for (auto& node_to_insert : nodes) {
-        // 1. Adopt node into parent’s node document.
-        document().adopt_node(*node_to_insert);
+        insert_node_into_children(*node_to_insert, child);
 
-        // 2. If child is null, then append node to parent’s children.
-        if (!child)
-            append_child_impl(*node_to_insert);
-        // 3. Otherwise, insert node into parent’s children before child’s index.
-        else
-            insert_before_impl(*node_to_insert, child);
+        // And a subtree holding the focused or hovered node brings `:focus-within` and `:hover` to
+        // the chain it lands under.
+        CSS::Invalidation::invalidate_style_after_subtree_place_changed(*node_to_insert, nullptr);
 
-        // 4. If parent is a shadow host whose shadow root’s slot assignment is "named" and node is a slottable, then
-        //    assign a slot for node.
-        if (auto* element = as_if<DOM::Element>(*this)) {
-            auto is_named_shadow_host = element->is_shadow_host()
-                && element->shadow_root()->slot_assignment() == Bindings::SlotAssignmentMode::Named;
+        CSS::record_subtree_connecting(*node_to_insert);
 
-            if (is_named_shadow_host && node_to_insert->is_slottable())
-                assign_a_slot(node_to_insert->as_slottable());
-        }
-
-        // 5. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
-        //    signal a slot change for parent.
-        if (auto* this_slot_element = as_if<HTML::HTMLSlotElement>(*this); this_slot_element && root().is_shadow_root()) {
-            if (this_slot_element->assigned_nodes_internal().is_empty())
-                signal_a_slot_change(*this_slot_element);
-        }
-
-        // AD-HOC: Register any slot elements in the inserted subtree with the shadow root’s slot registry
-        //         before running assign_slottables_for_a_tree, so the registry is up-to-date.
-        if (auto* shadow_root = as_if<ShadowRoot>(node_to_insert->root())) {
-            node_to_insert->for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
-                shadow_root->register_slot(slot);
-                return TraversalDecision::Continue;
-            });
-        }
-
-        // 6. Run assign slottables for a tree with node’s root.
-        assign_slottables_for_a_tree(node_to_insert->root());
-
-        node_to_insert->invalidate_style(StyleInvalidationReason::NodeInsertBefore);
+        SubtreeInsertionScope subtree_insertion_scope { *this };
 
         // 7. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
         node_to_insert->for_each_shadow_including_inclusive_descendant([&](Node& inclusive_descendant) {
@@ -823,10 +1080,8 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
 
                 // 2. If inclusiveDescendant is custom, then enqueue a custom element callback reaction with
                 //    inclusiveDescendant, callback name "connectedCallback", and « ».
-                if (element->is_custom()) {
-                    GC::RootVector<JS::Value> empty_arguments;
-                    element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::connectedCallback, move(empty_arguments));
-                }
+                if (element->is_custom())
+                    element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::connectedCallback);
 
                 // 3. Otherwise, try to upgrade inclusiveDescendant.
                 else {
@@ -854,58 +1109,98 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
     }
 
     // 9. Run the children changed steps for parent.
-    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Inserted, node };
+    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Inserted, metadata_node, affects_elements };
     children_changed(metadata);
+    invalidate_html_collection_caches_in_ancestors(affects_elements);
 
-    // 10. Let staticNodeList be a list of nodes, initially « ».
-    // NOTE: We collect all nodes before calling the post-connection steps on any one of them, instead of calling the
-    //       post-connection steps while we’re traversing the node tree. This is because the post-connection steps can
-    //       modify the tree’s structure, making live traversal unsafe, possibly leading to the post-connection steps
-    //       being called multiple times on the same node.
-    GC::RootVector<GC::Ref<Node>> static_node_list;
+    // OPTIMIZATION: Disconnected subtrees cannot have post-connection steps to run. If any root is connected,
+    //               collect all nodes, since a callback could connect one of the initially detached subtrees.
+    if (any_of(nodes, [](auto const& node) { return node->is_connected(); }))
+        run_post_connection_steps(nodes);
 
-    // 11. For each node of nodes, in tree order:
-    for (auto& node : nodes) {
-        // 1. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree
-        //    order: append inclusiveDescendant to staticNodeList.
-        node->for_each_shadow_including_inclusive_descendant([&static_node_list](Node& inclusive_descendant) {
-            static_node_list.append(inclusive_descendant);
-            return TraversalDecision::Continue;
-        });
-    }
-
-    // 12. For each node of staticNodeList: if node is connected, then run the post-connection steps with node.
-    for (auto& node : static_node_list) {
-        if (node->is_connected())
-            node->post_connection();
-    }
-
-    if (is_connected()) {
+    auto is_boxless_style_element = (is_html_style_element() || is_svg_style_element()) && !has_layout_box();
+    if (is_connected() && !is_boxless_style_element) {
         // NB: Called during DOM insertion, layout is not up to date.
-        if (auto* element = as_if<Element>(*this); element && element->computed_values() && element->computed_values()->display().is_contents() && parent_element()) {
+        if (auto* element = as_if<Element>(*this); element && element->has_style() && CSS::display_from_ffi_display(element->style_group<CSS::ComputedValues::BoxValues>()->display).is_contents() && parent_element()) {
             parent_element()->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBeforeWithDisplayContents);
         }
         set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
+        for (auto& inserted_node : nodes) {
+            auto inserted_subtree_already_needs_layout_tree_update = inserted_node->needs_layout_tree_update() || inserted_node->child_needs_layout_tree_update();
+            inserted_node->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
+
+            // An inserted subtree may already need a layout tree update, for example after being adopted from another
+            // document. Setting the same value again is coalesced, so explicitly propagate it through its new parent.
+            if (inserted_subtree_already_needs_layout_tree_update)
+                set_child_needs_layout_tree_update(true);
+        }
     }
 
-    // AD-HOC: invalidate the ordinal of the first list_item of the list_owner of the child node, if any.
-    if (child && child->is_element())
-        static_cast<Element*>(child.ptr())->maybe_invalidate_ordinals_for_list_owner();
-    else if (this->is_element() && !this->is_html_ol_ul_menu_element())
-        static_cast<Element*>(this)->maybe_invalidate_ordinals_for_list_owner();
-    // NOTE: If the child node is null and the parent node is an ol, ul or menu element then:
-    //       the new node will be the first in the list of a potential list owner and it will not have
-    //       an ordinal value (default from constructor).
-    // FIXME: This will not work if the child or the parent is not an element. Is insert_before even possible in this situation?
+    // AD-HOC: An inserted list item can renumber the list-item counter for its list owner's whole list.
+    //         Appending to a forward counter does not change any existing counter value.
+    for (auto& inserted_node : nodes) {
+        if (inserted_node->is_html_li_element()) {
+            auto& list_item = static_cast<Element&>(*inserted_node);
+            if (!final_direct_list_item_does_not_renumber_existing_content(list_item))
+                list_item.schedule_list_item_renumber_for_list_owner();
+            break;
+        }
+    }
 
-    document().bump_dom_tree_version();
+    bump_dom_tree_version();
+}
+
+// https://dom.spec.whatwg.org/#concept-node-insert
+void Node::parser_insert_before(GC::Ref<Node> node, GC::Ptr<Node> child)
+{
+    // AD-HOC: The insertion of one node the parser has just created into a tree the style engine does not track.
+    //         Script can hold such a tree, so observers, live ranges, collection caches and the post-connection steps
+    //         are served, but style, layout and custom element reactions have nothing to do until the tree is tracked.
+
+    VERIFY(!is_tracked_by_style_engine());
+
+    // 5. If child is non-null:
+    if (child)
+        adjust_live_ranges_for_insertion(*child, 1);
+
+    // 6. Let previousSibling be child’s previous sibling or parent’s last child if child is null.
+    GC::Ptr<Node> previous_sibling = child ? child->previous_sibling() : last_child();
+
+    // 7. For each node in nodes, in tree order:
+    insert_node_into_children(node, child);
+
+    // 7. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
+    //    1. Run the insertion steps with inclusiveDescendant.
+    //    2. If inclusiveDescendant is not connected, then continue.
+    node->for_each_shadow_including_inclusive_descendant([](Node& inclusive_descendant) {
+        inclusive_descendant.inserted();
+        return TraversalDecision::Continue;
+    });
+
+    // 8. If suppressObservers is false, then queue a tree mutation record for parent with nodes, « », previousSibling,
+    //    and child.
+    // OPTIMIZATION: Without an observer of tree mutations, the record is never queued.
+    if (document().has_mutation_observers_of_type(MutationType::childList) || document().page().listen_for_dom_mutations())
+        queue_tree_mutation_record({ &node, 1 }, {}, previous_sibling.ptr(), child.ptr());
+
+    // 9. Run the children changed steps for parent.
+    auto affects_elements = mutation_affects_elements(*node);
+    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Inserted, node, affects_elements };
+    children_changed(metadata);
+    invalidate_html_collection_caches_in_ancestors(affects_elements);
+
+    // OPTIMIZATION: Disconnected subtrees cannot have post-connection steps to run.
+    if (is_connected())
+        run_post_connection_steps(Array { node });
+
+    bump_dom_tree_version();
 }
 
 // https://dom.spec.whatwg.org/#concept-node-pre-insert
 WebIDL::ExceptionOr<GC::Ref<Node>> Node::pre_insert(GC::Ref<Node> node, GC::Ptr<Node> child)
 {
-    // 1. Ensure pre-insert validity given node, parent, child, and « ».
-    TRY(ensure_pre_insert_validity(realm(), node, child, ChildrenToExclude::None));
+    // 1. Ensure pre-insertion validity of node into parent before child.
+    TRY(ensure_pre_insertion_validity(node, child));
 
     // 2. Let referenceChild be child.
     auto reference_child = child;
@@ -933,7 +1228,7 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::pre_remove(GC::Ref<Node> child)
 {
     // 1. If child’s parent is not parent, then throw a "NotFoundError" DOMException.
     if (child->parent() != this)
-        return WebIDL::NotFoundError::create(realm(), "Child does not belong to this node"_utf16);
+        return WebIDL::NotFoundError::create("Child does not belong to this node"_utf16);
 
     // 2. Remove child.
     child->remove();
@@ -962,29 +1257,418 @@ void Node::live_range_pre_remove()
     auto index = this->index();
 
     // 4. For each live range whose start node is an inclusive descendant of node, set its start to (parent, index).
-    for (auto* range : Range::live_ranges()) {
-        if (range->start_container()->is_inclusive_descendant_of(*this))
-            MUST(range->set_start(*parent, index));
-    }
-
     // 5. For each live range whose end node is an inclusive descendant of node, set its end to (parent, index).
-    for (auto* range : Range::live_ranges()) {
-        if (range->end_container()->is_inclusive_descendant_of(*this))
-            MUST(range->set_end(*parent, index));
-    }
-
     // 6. For each live range whose start node is parent and start offset is greater than index, decrease its start
     //    offset by 1.
-    for (auto* range : Range::live_ranges()) {
-        if (range->start_container() == parent && range->start_offset() > index)
-            range->decrease_start_offset(1);
+    // 7. For each live range whose end node is parent and end offset is greater than index, decrease its end offset by 1.
+    // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
+    for (auto& range : document().live_ranges()) {
+        if (range.start_container()->is_inclusive_descendant_of(*this))
+            MUST(range.set_start(*parent, index));
+        if (range.end_container()->is_inclusive_descendant_of(*this))
+            MUST(range.set_end(*parent, index));
+        if (range.start_container().ptr() == parent && range.start_offset() > index)
+            range.decrease_start_offset(1);
+        if (range.end_container().ptr() == parent && range.end_offset() > index)
+            range.decrease_end_offset(1);
+    }
+}
+
+void Node::live_range_pre_remove_all_children()
+{
+    for (auto& range : document().live_ranges()) {
+        if (range.start_container().ptr() == this) {
+            range.set_start_offset(0);
+        } else if (is_ancestor_of(range.start_container())) {
+            MUST(range.set_start(*this, 0));
+        }
+        if (range.end_container().ptr() == this) {
+            range.set_end_offset(0);
+        } else if (is_ancestor_of(range.end_container())) {
+            MUST(range.set_end(*this, 0));
+        }
+    }
+}
+
+void Node::run_node_iterator_pre_removing_steps()
+{
+    document().for_each_node_iterator([&](NodeIterator& node_iterator) {
+        node_iterator.run_pre_removing_steps(*this);
+    });
+}
+
+static bool node_contributes_to_layout_tree(Node const& node)
+{
+    if (node.has_layout_box())
+        return true;
+
+    auto const* element = as_if<Element>(node);
+    return element && element->has_style()
+        && CSS::display_from_ffi_display(element->style_group<CSS::ComputedValues::BoxValues>()->display).is_contents();
+}
+
+// Which kind of box a detached child is. DOM removal reads it from the child's style; a style
+// change that stopped generating the box has already swapped the style, so it names the level.
+enum class DetachedBoxLevel {
+    FromStyle,
+    Block,
+    AtomicInline,
+};
+
+static bool can_detach_layout_subtree_for_removal(Node const& node, Node const& parent, DetachedBoxLevel box_level = DetachedBoxLevel::FromStyle)
+{
+    auto const* layout_node = as_if<Layout::NodeWithStyle>(node.unsafe_layout_node());
+    auto const* parent_layout_node = parent.unsafe_layout_node();
+    if (!layout_node || !parent_layout_node)
+        return false;
+    if (CSS::subtree_affects_generated_content_state(node))
+        return false;
+
+    // OPTIMIZATION: Absolutely positioned boxes do not participate in their DOM parent's inline or block formatting
+    //               structure, even when they are attached to an ancestor containing block. Removing them cannot
+    //               disturb anonymous wrappers or sibling box levels.
+    auto const* element = as_if<Element>(node);
+    if (element && element->rendered_in_top_layer())
+        return false;
+    if (layout_node->position() == CSS::Positioning::Absolute) {
+        if (parent.is_html_body_element())
+            return true;
+        auto const* containing_block = layout_node->containing_block();
+        if (containing_block && containing_block->dom_node() == &parent)
+            return true;
     }
 
-    // 7. For each live range whose end node is parent and end offset is greater than index, decrease its end offset by 1.
-    for (auto* range : Range::live_ranges()) {
-        if (range->end_container() == parent && range->end_offset() > index)
-            range->decrease_end_offset(1);
+    if (layout_node->parent() != parent_layout_node)
+        return false;
+
+    if (layout_node->is_out_of_flow())
+        return false;
+
+    auto const* parent_with_style = as_if<Layout::NodeWithStyle>(parent_layout_node);
+    if (!parent_with_style)
+        return false;
+
+    auto sibling_is_direct_layout_child = [&](Node const* sibling) {
+        if (!sibling)
+            return true;
+        if (auto const* sibling_layout_node = sibling->unsafe_layout_node())
+            return sibling_layout_node->parent() == parent_layout_node;
+        auto const* sibling_element = as_if<Element>(*sibling);
+        return !sibling_element || !sibling_element->has_style()
+            || !CSS::display_from_ffi_display(sibling_element->style_group<CSS::ComputedValues::BoxValues>()->display).is_contents();
+    };
+    if (!sibling_is_direct_layout_child(node.previous_sibling())
+        && !sibling_is_direct_layout_child(node.next_sibling())) {
+        return false;
     }
+
+    auto parent_display = parent_with_style->display();
+    if (parent_display.is_flex_inside() || parent_display.is_grid_inside())
+        return true;
+
+    // Direct block children and in-flow atomic inline children can be detached without changing
+    // anonymous wrapper structure. Other box kinds still rebuild the parent so tree fixup can
+    // reconstruct any affected wrappers.
+    if ((parent_display.is_flow_inside() || parent_display.is_flow_root_inside())
+        && !parent_layout_node->children_are_inline()) {
+        if (auto previous_layout_sibling = layout_node->previous_sibling(); previous_layout_sibling && previous_layout_sibling->is_anonymous()) {
+            if (auto next_layout_sibling = layout_node->next_sibling(); next_layout_sibling && next_layout_sibling->is_anonymous())
+                return false;
+        }
+        // Once only anonymous wrappers would remain, a full rebuild would place their inline
+        // content directly in the parent instead.
+        bool an_anonymous_inline_wrapper_remains = false;
+        bool an_in_flow_block_level_sibling_remains = false;
+        for (auto const* sibling = parent_layout_node->first_child(); sibling; sibling = sibling->next_sibling()) {
+            if (sibling == layout_node)
+                continue;
+            if (auto const* sibling_with_style = as_if<Layout::NodeWithStyle>(*sibling); sibling_with_style && sibling_with_style->is_out_of_flow())
+                continue;
+            if (sibling->is_anonymous() && sibling->children_are_inline())
+                an_anonymous_inline_wrapper_remains = true;
+            else
+                an_in_flow_block_level_sibling_remains = true;
+        }
+        if (an_anonymous_inline_wrapper_remains && !an_in_flow_block_level_sibling_remains)
+            return false;
+        if (box_level == DetachedBoxLevel::FromStyle)
+            return layout_node->display().is_block_outside();
+        return box_level == DetachedBoxLevel::Block;
+    }
+    if (!parent_layout_node->children_are_inline())
+        return false;
+    if (box_level == DetachedBoxLevel::FromStyle)
+        return layout_node->is_inline_block();
+    return box_level == DetachedBoxLevel::AtomicInline;
+}
+
+bool Node::can_detach_layout_subtree_in_place(Node const& node, Node const& parent, bool box_is_block_level)
+{
+    return can_detach_layout_subtree_for_removal(node, parent, box_is_block_level ? DetachedBoxLevel::Block : DetachedBoxLevel::AtomicInline);
+}
+
+bool Node::list_item_box_change_renumbers_list(Element const& list_item)
+{
+    return !final_direct_list_item_does_not_renumber_existing_content(list_item);
+}
+
+// Pins the style record of the box `node`, or its pseudo-element of kind `pseudo_element`, is bound to, for its
+// readers once the node leaves the document. The row is found by the node's StyleNodeID, so no layout node is made
+// just to pin it.
+static void pin_bound_box_style_record_for_detachment(Node& node, Optional<CSS::PseudoElement> pseudo_element = {})
+{
+    auto* arena = node.document().layout_node_arena_if_created();
+    if (!arena)
+        return;
+    auto generated_for = pseudo_element.has_value() ? Layout::Node::encode_generated_for(*pseudo_element) : 0;
+    Layout::RustFFI::layout_arena_pin_bound_box_style_record_for_detachment(arena->handle(), Layout::Node::style_node_of(&node).value(), generated_for);
+}
+
+class RemovalStyleRecordPins {
+public:
+    explicit RemovalStyleRecordPins(CSS::StyleComputer const& style_computer)
+        : m_style_computer(style_computer)
+    {
+    }
+
+    ~RemovalStyleRecordPins()
+    {
+        release_dom_style_records();
+    }
+
+    void pin_style_records_before_removal(Node& node, bool was_connected)
+    {
+        if (!was_connected)
+            return;
+        node.for_each_shadow_including_inclusive_descendant([&](Node& inclusive_descendant) {
+            pin_bound_box_style_record_for_detachment(inclusive_descendant);
+
+            if (auto* element = as_if<Element>(inclusive_descendant)) {
+                pin_dom_style_record(element->style_record_identity());
+                element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement type, SyntheticPseudoElement& pseudo_element) {
+                    pin_bound_box_style_record_for_detachment(*element, type);
+                    pin_dom_style_record(pseudo_element.style_record_identity());
+                });
+            }
+
+            return TraversalDecision::Continue;
+        });
+    }
+
+    void pin_style_records_after_removal(Node& node, bool was_connected)
+    {
+        if (was_connected)
+            return;
+        // Detached subtrees do not need DOM-held record pins, but layout nodes can still outlive removing steps and
+        // keep their detachment pins.
+        node.for_each_shadow_including_inclusive_descendant([](Node& inclusive_descendant) {
+            pin_bound_box_style_record_for_detachment(inclusive_descendant);
+
+            if (auto* element = as_if<Element>(inclusive_descendant)) {
+                element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement type, SyntheticPseudoElement&) {
+                    pin_bound_box_style_record_for_detachment(*element, type);
+                });
+            }
+
+            return TraversalDecision::Continue;
+        });
+    }
+
+    void release_dom_style_records()
+    {
+        for (auto style_record_identity : m_dom_style_record_pins)
+            m_style_computer->unpin_style_record(style_record_identity);
+        m_dom_style_record_pins.clear();
+    }
+
+private:
+    void pin_dom_style_record(CSS::StyleRecordID style_record_identity)
+    {
+        if (!style_record_identity)
+            return;
+        m_style_computer->pin_style_record(style_record_identity);
+        m_dom_style_record_pins.append(style_record_identity);
+    }
+
+    GC::Ref<CSS::StyleComputer const> m_style_computer;
+    Vector<CSS::StyleRecordID, 16> m_dom_style_record_pins;
+};
+
+bool Node::schedule_list_item_renumber_for_removal()
+{
+    auto* element = as_if<Element>(*this);
+    if (!element)
+        return false;
+    auto style = element->computed_style();
+    // A removed list item can renumber the list-item counter for its list owner's whole list. Removing the final item
+    // from a forward counter does not change any surviving counter value.
+    if ((is_html_li_element() || (style && style->display().is_list_item()))
+        && !final_direct_list_item_does_not_renumber_existing_content(*element)) {
+        element->schedule_list_item_renumber_for_list_owner();
+        return true;
+    }
+    return false;
+}
+
+void Node::report_removal_to_style_engine(Node& parent)
+{
+    // A text or comment node leaving connects no element to record a delta from, but it can
+    // leave its parent empty, and `:empty` is about the parent.
+    if (!is<Element>(*this)) {
+        if (auto* parent_element = as_if<Element>(parent)) {
+            auto const* text = as_if<Text>(*this);
+            CSS::record_element_emptiness_changed(*parent_element, *this, text && !text->data().is_empty(), false);
+        }
+    }
+
+    // NB: Recorded here rather than in removed_from(), because StyleEngine's tree delta carries
+    //     the old relations and this is the last point at which they are still readable.
+    CSS::record_subtree_disconnecting(*this);
+}
+
+void Node::update_layout_tree_for_removal(Node& parent, LayoutSubtreeRemoval removal, AncestorsMayHaveFirstLetter ancestors_may_have_first_letter)
+{
+    // A display: contents element has no principal layout node of its own, but removing it also removes
+    // all of its children's boxes from the parent's layout subtree.
+    if (!node_contributes_to_layout_tree(*this))
+        return;
+
+    if (ancestors_may_have_first_letter == AncestorsMayHaveFirstLetter::Yes) {
+        if (auto* first_letter_owner = first_letter_owner_for_layout_subtree_from(parent)) {
+            first_letter_owner->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+            return;
+        }
+    }
+
+    if (removal == LayoutSubtreeRemoval::DetachInPlace && can_detach_layout_subtree_for_removal(*this, parent)) {
+        auto* layout_node = unsafe_layout_node();
+        auto const* removed_box = as_if<Layout::NodeWithStyle>(layout_node);
+        auto* parent_box = parent.unsafe_layout_node();
+        bool const parent_contains_removed_abspos_box = removed_box && removed_box->position() == CSS::Positioning::Absolute
+            && parent_box && removed_box->containing_block() == parent_box;
+        if (parent_contains_removed_abspos_box)
+            Layout::RustFFI::render_state_note_contained_abspos_child_removal(parent_box->document_host(), Layout::Node::slot_id(parent_box), Layout::Node::slot_id(layout_node));
+        layout_node->for_each_in_inclusive_subtree([](Layout::Node& node) {
+            node.clear_committed_box();
+            return TraversalDecision::Continue;
+        });
+        layout_node->prepare_subtree_for_detach_from_layout_tree();
+        VERIFY(Layout::destroy_layout_subtree(*layout_node));
+        if (auto* parent_layout_node = parent.unsafe_layout_node(); !parent_layout_node->has_children())
+            parent_layout_node->set_children_are_inline(false);
+        if (parent_contains_removed_abspos_box) {
+            // No layout commit follows, so do what one would have done for the box that left.
+            document().set_needs_accumulated_visual_contexts_update(true);
+            document().schedule_scroll_container_resnap();
+            document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::PaintCommandsAndHitTestList);
+            return;
+        }
+        parent.set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate);
+        return;
+    }
+
+    parent.set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+}
+
+// The layout nodes a removal leaves for the parent's rebuild stop being the removed nodes' layout nodes once the style
+// engine retires their StyleNodeIDs, so anything the removal does to them has to happen before.
+void Node::detach_remaining_layout_nodes_for_removal()
+{
+    auto* arena = document().layout_node_arena_if_created();
+    if (!arena)
+        return;
+    for_each_shadow_including_inclusive_descendant([&](Node& node) {
+        // The node's boxes, its pseudo-elements' and its top layer placement, are found by the node's StyleNodeID.
+        Layout::RustFFI::rust_detach_remaining_layout_rows_for_removal(arena->handle(), Layout::Node::style_node_of(&node).value());
+        return TraversalDecision::Continue;
+    });
+}
+
+void Node::assign_slottables_after_removal(Node& parent, Node& parent_root)
+{
+    if (auto assigned_slot = assigned_slot_for_node(*this))
+        assign_slottables(*assigned_slot);
+
+    if (auto* parent_slot_element = as_if<HTML::HTMLSlotElement>(parent); parent_slot_element && parent_root.is_shadow_root()) {
+        if (parent_slot_element->assigned_nodes_internal().is_empty())
+            signal_a_slot_change(*parent_slot_element);
+    }
+
+    if (auto* shadow_root = as_if<ShadowRoot>(parent_root)) {
+        Vector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots;
+        for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
+            // AD-HOC: Unregister slot from the shadow root's registry before assign_slottables_for_a_tree.
+            shadow_root->unregister_slot(slot);
+            descendant_slots.append(slot);
+            return TraversalDecision::Continue;
+        });
+
+        if (!descendant_slots.is_empty()) {
+            // 1. Run assign slottables for a tree with parent’s root.
+            assign_slottables_for_a_tree(parent_root);
+
+            // 2. Run assign slottables for a tree with node.
+            for (auto const& slot : descendant_slots)
+                assign_slottables(slot);
+        }
+    }
+}
+
+void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine)
+{
+    if (was_tracked_by_style_engine) {
+        if (auto* element = as_if<Element>(*this))
+            element->cancel_css_animations_and_transitions();
+    }
+    removed_from(IsSubtreeRoot::Yes, &parent, parent_root);
+
+    bool is_parent_connected = parent.is_connected();
+
+    if (auto* element = as_if<DOM::Element>(*this)) {
+        if (element->is_custom() && is_parent_connected)
+            element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::disconnectedCallback);
+    }
+
+    for_each_shadow_including_descendant([&](Node& descendant) {
+        if (was_tracked_by_style_engine) {
+            if (auto* element = as_if<Element>(descendant))
+                element->cancel_css_animations_and_transitions();
+        }
+
+        // 1. Run the removing steps with descendant, false, and parent.
+        descendant.removed_from(IsSubtreeRoot::No, &parent, parent_root);
+
+        // 2. If descendant is custom and isParentConnected is true, then enqueue a custom element callback reaction
+        //    with descendant, callback name "disconnectedCallback", and « ».
+        if (auto* element = as_if<DOM::Element>(descendant)) {
+            if (element->is_custom() && is_parent_connected)
+                element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::disconnectedCallback);
+        }
+
+        return TraversalDecision::Continue;
+    });
+}
+
+void Node::add_transient_registered_observers_for_removal(Node& parent)
+{
+    for (auto* inclusive_ancestor = &parent; inclusive_ancestor; inclusive_ancestor = inclusive_ancestor->parent()) {
+        auto* registered_observer_list = inclusive_ancestor->registered_observer_list();
+        if (!registered_observer_list)
+            continue;
+        for (auto& registered : *registered_observer_list) {
+            if (registered->options().subtree) {
+                auto transient_observer = TransientRegisteredObserver::create(registered->observer(), registered->options(), registered);
+                add_registered_observer(move(transient_observer));
+                registered->observer()->add_transient_registered_node({}, *this);
+            }
+        }
+    }
+}
+
+void Node::queue_tree_mutation_record_for_removal(Node& parent, GC::Ptr<Node> old_previous_sibling, GC::Ptr<Node> old_next_sibling)
+{
+    GC::Ref<Node> removed_node = *this;
+    parent.queue_tree_mutation_record({}, { &removed_node, 1 }, old_previous_sibling.ptr(), old_next_sibling.ptr());
 }
 
 // https://dom.spec.whatwg.org/#concept-node-remove
@@ -1000,14 +1684,18 @@ void Node::remove(bool suppress_observers)
     // 2. Assert: parent is non-null.
     VERIFY(parent);
 
+    document().flush_deferred_style_change_event();
+    bool const was_connected = is_connected();
+    bool const was_tracked_by_style_engine = is_tracked_by_style_engine();
+    if (was_connected)
+        document().page().keyboard_scroll_dom_tree_changed(*this);
+
     // 3. Run the live range pre-remove steps, given node.
     live_range_pre_remove();
 
     // 4. For each NodeIterator object iterator whose root’s node document is node’s node document:
     //    run the NodeIterator pre-removing steps given node and iterator.
-    document().for_each_node_iterator([&](NodeIterator& node_iterator) {
-        node_iterator.run_pre_removing_steps(*this);
-    });
+    run_node_iterator_pre_removing_steps();
 
     // 5. Let oldPreviousSibling be node’s previous sibling.
     GC::Ptr<Node> old_previous_sibling = previous_sibling();
@@ -1015,128 +1703,120 @@ void Node::remove(bool suppress_observers)
     // 6. Let oldNextSibling be node’s next sibling.
     GC::Ptr<Node> old_next_sibling = next_sibling();
 
-    // AD-HOC: invalidate the ordinal of the first list_item of the list_owner of the removed node, if any.
-    if (is_element()) {
-        auto* this_element = static_cast<Element*>(this);
-        this_element->maybe_invalidate_ordinals_for_list_owner(this_element);
-    }
+    schedule_list_item_renumber_for_removal();
 
-    if (is_connected()) {
-        // Since the tree structure is about to change, we need to invalidate both style and layout.
-        // In the future, we should find a way to only invalidate the parts that actually need it.
-        invalidate_style(StyleInvalidationReason::NodeRemove);
-
-        // NOTE: If we didn’t have a layout node before, rebuilding the layout tree isn’t gonna give us one
-        //       after we’ve been removed from the DOM.
-        // NB: Called during DOM removal, layout is not up to date.
-        if (unsafe_layout_node())
-            parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+    RemovalStyleRecordPins removal_style_record_pins { document().style_computer() };
+    removal_style_record_pins.pin_style_records_before_removal(*this, was_tracked_by_style_engine);
+    if (was_tracked_by_style_engine) {
+        // A suppressed-observer removal may be the first half of a compound mutation that immediately reinserts
+        // this node. Keep the old parent on the conservative rebuild path so the later insertion can relocate it.
+        auto layout_subtree_removal = suppress_observers ? LayoutSubtreeRemoval::RebuildParent : LayoutSubtreeRemoval::DetachInPlace;
+        // Layout goes first, while the removed nodes still have the StyleNodeIDs the style engine retires.
+        update_layout_tree_for_removal(*parent, layout_subtree_removal, AncestorsMayHaveFirstLetter::Yes);
+        detach_remaining_layout_nodes_for_removal();
+        report_removal_to_style_engine(*parent);
     }
 
     // 7. Remove node from its parent’s children.
     parent->remove_child_impl(*this);
 
     // 8. If node is assigned, then run assign slottables for node’s assigned slot.
-    if (auto assigned_slot = assigned_slot_for_node(*this))
-        assign_slottables(*assigned_slot);
-
-    auto& parent_root = parent->root();
-
     // 9. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
     //    signal a slot change for parent.
-    if (auto* parent_slot_element = as_if<HTML::HTMLSlotElement>(parent); parent_slot_element && parent_root.is_shadow_root()) {
-        if (parent_slot_element->assigned_nodes_internal().is_empty())
-            signal_a_slot_change(*parent_slot_element);
-    }
-
     // 10. If node has an inclusive descendant that is a slot, then:
-    auto has_descendent_slot = false;
-    auto* shadow_root = as_if<ShadowRoot>(parent_root);
+    auto& parent_root = parent->root();
+    assign_slottables_after_removal(*parent, parent_root);
 
-    for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
-        has_descendent_slot = true;
-        if (!shadow_root)
-            return TraversalDecision::Break;
-        // AD-HOC: Unregister slot from the shadow root's registry before assign_slottables_for_a_tree.
-        shadow_root->unregister_slot(slot);
-        return TraversalDecision::Continue;
-    });
-
-    if (has_descendent_slot) {
-        // 1. Run assign slottables for a tree with parent’s root.
-        assign_slottables_for_a_tree(parent_root);
-
-        // 2. Run assign slottables for a tree with node.
-        assign_slottables_for_a_tree(*this);
-    }
+    removal_style_record_pins.pin_style_records_after_removal(*this, was_connected);
 
     // 11. Run the removing steps with node, true, and parent.
-    removed_from(IsSubtreeRoot::Yes, parent, parent_root);
-
     // 12. Let isParentConnected be parent’s connected.
-    bool is_parent_connected = parent->is_connected();
-
     // 13. If node is custom and isParentConnected is true, then enqueue a custom element callback reaction with node,
     //     callback name "disconnectedCallback", and an empty argument list.
-    // Spec Note: It is intentional for now that custom elements do not get parent passed.
-    //            This might change in the future if there is a need.
-    if (auto* element = as_if<DOM::Element>(*this)) {
-        if (element->is_custom() && is_parent_connected) {
-            GC::RootVector<JS::Value> empty_arguments;
-            element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::disconnectedCallback, move(empty_arguments));
-        }
-    }
-
     // 14. For each shadow-including descendant descendant of node, in shadow-including tree order:
-    for_each_shadow_including_descendant([&](Node& descendant) {
-        // 1. Run the removing steps with descendant, false, and parent.
-        descendant.removed_from(IsSubtreeRoot::No, parent, parent_root);
+    run_removing_steps(*parent, parent_root, was_tracked_by_style_engine);
 
-        // 2. If descendant is custom and isParentConnected is true, then enqueue a custom element callback reaction
-        //    with descendant, callback name "disconnectedCallback", and « ».
-        if (auto* element = as_if<DOM::Element>(descendant)) {
-            if (element->is_custom() && is_parent_connected) {
-                GC::RootVector<JS::Value> empty_arguments;
-                element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::disconnectedCallback, move(empty_arguments));
-            }
-        }
+    removal_style_record_pins.release_dom_style_records();
 
-        return TraversalDecision::Continue;
-    });
+    // A subtree holding the focused or hovered node takes `:focus-within` and `:hover` out of the
+    // chain it hung off. Nothing about any element in that chain moved, so it has to be told.
+    CSS::Invalidation::invalidate_style_after_subtree_place_changed(*this, parent);
 
     // 15. For each inclusive ancestor inclusiveAncestor of parent, and then for each registered of inclusiveAncestor’s
     //     registered observer list, if registered’s options["subtree"] is true, then append a new transient registered
     //     observer whose observer is registered’s observer, options is registered’s options, and source is registered
     //     to node’s registered observer list.
-    for (auto* inclusive_ancestor = parent; inclusive_ancestor; inclusive_ancestor = inclusive_ancestor->parent()) {
-        if (!inclusive_ancestor->m_registered_observer_list)
-            continue;
-        for (auto& registered : *inclusive_ancestor->m_registered_observer_list) {
-            if (registered->options().subtree) {
-                auto transient_observer = TransientRegisteredObserver::create(registered->observer(), registered->options(), registered);
-                add_registered_observer(move(transient_observer));
-            }
-        }
-    }
+    add_transient_registered_observers_for_removal(*parent);
 
     // 16. If suppressObservers is false, then queue a tree mutation record for parent with « », « node »,
     //     oldPreviousSibling, and oldNextSibling.
-    if (!suppress_observers) {
-        parent->queue_tree_mutation_record({}, { *this }, old_previous_sibling.ptr(), old_next_sibling.ptr());
-    }
+    if (!suppress_observers)
+        queue_tree_mutation_record_for_removal(*parent, old_previous_sibling, old_next_sibling);
 
     // 17. Run the children changed steps for parent.
-    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Removal, *this };
+    auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
+    if (document().has_valid_html_collection_caches())
+        affects_elements = mutation_affects_elements(*this);
+    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Removal, *this, affects_elements };
     parent->children_changed(metadata);
+    parent->invalidate_html_collection_caches_in_ancestors(affects_elements);
 
-    document().bump_dom_tree_version();
+    parent->bump_dom_tree_version();
+
+    // The removed node heads a tree of its own again. Anything cached on it from the last time it did must not survive
+    // the changes made under it while it was part of another tree, which were counted against that tree.
+    bump_dom_tree_version();
 }
 
 // https://dom.spec.whatwg.org/#concept-node-replace
 WebIDL::ExceptionOr<GC::Ref<Node>> Node::replace_child(GC::Ref<Node> node, GC::Ref<Node> child)
 {
-    // 1. Ensure pre-insert validity given node, parent, child, and « child ».
-    TRY(ensure_pre_insert_validity(realm(), node, child, ChildrenToExclude::Child));
+    // 1. If parent is not a Document, DocumentFragment, or Element node, then throw a "HierarchyRequestError"
+    //    DOMException.
+    if (!is<Document>(this) && !is<DocumentFragment>(this) && !is<Element>(this))
+        return WebIDL::HierarchyRequestError::create("Can only insert into a document, document fragment or element"_utf16);
+
+    // 2. If node is a host-including inclusive ancestor of parent, then throw a "HierarchyRequestError" DOMException.
+    if (node->is_host_including_inclusive_ancestor_of(*this))
+        return WebIDL::HierarchyRequestError::create("New node is an ancestor of this node"_utf16);
+
+    // 3. If child’s parent is not parent, then throw a "NotFoundError" DOMException.
+    if (child->parent() != this)
+        return WebIDL::NotFoundError::create("This node is not the parent of the given child"_utf16);
+
+    // FIXME: All the following "Invalid node type for insertion" messages could be more descriptive.
+
+    // 4. If node is not a DocumentFragment, DocumentType, Element, or CharacterData node, then throw a "HierarchyRequestError" DOMException.
+    if (!is<DocumentFragment>(*node) && !is<DocumentType>(*node) && !is<Element>(*node) && !is<Text>(*node) && !is<Comment>(*node) && !is<ProcessingInstruction>(*node))
+        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
+
+    // 5. If either node is a Text node and parent is a document, or node is a doctype and parent is not a document, then throw a "HierarchyRequestError" DOMException.
+    if ((is<Text>(*node) && is<Document>(this)) || (is<DocumentType>(*node) && !is<Document>(this)))
+        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
+
+    // If parent is a document, and any of the statements below, switched on the interface node implements, are true, then throw a "HierarchyRequestError" DOMException.
+    if (is<Document>(this)) {
+        // DocumentFragment
+        if (is<DocumentFragment>(*node)) {
+            // If node has more than one element child or has a Text node child.
+            // Otherwise, if node has one element child and either parent has an element child that is not child or a doctype is following child.
+            auto node_element_child_count = as<DocumentFragment>(*node).child_element_count();
+            if ((node_element_child_count > 1 || node->has_child_of_type<Text>())
+                || (node_element_child_count == 1 && (first_child_of_type<Element>() != child.ptr() || child->has_following_node_of_type_in_tree_order<DocumentType>()))) {
+                return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
+            }
+        } else if (is<Element>(*node)) {
+            // Element
+            // parent has an element child that is not child or a doctype is following child.
+            if (first_child_of_type<Element>() != child.ptr() || child->has_following_node_of_type_in_tree_order<DocumentType>())
+                return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
+        } else if (is<DocumentType>(*node)) {
+            // DocumentType
+            // parent has a doctype child that is not child, or an element is preceding child.
+            if (first_child_of_type<DocumentType>() != child.ptr() || child->has_preceding_node_of_type_in_tree_order<Element>())
+                return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
+        }
+    }
 
     // 7. Let referenceChild be child’s next sibling.
     GC::Ptr<Node> reference_child = child->next_sibling();
@@ -1149,24 +1829,24 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::replace_child(GC::Ref<Node> node, GC::R
     GC::Ptr<Node> previous_sibling = child->previous_sibling();
 
     // 10. Let removedNodes be the empty set.
-    Vector<GC::Root<Node>> removed_nodes;
+    GC::RootVector<GC::Ref<Node>> removed_nodes;
 
     // 11. If child’s parent is non-null:
     // NOTE: The above can only be false if child is node.
     if (child->parent()) {
         // 1. Set removedNodes to « child ».
-        removed_nodes.append(GC::make_root(*child));
+        removed_nodes.append(child);
 
         // 2. Remove child with suppressObservers set to true.
         child->remove(true);
     }
 
     // 12. Let nodes be node’s children if node is a DocumentFragment node; otherwise « node ».
-    Vector<GC::Root<Node>> nodes;
+    GC::RootVector<GC::Ref<Node>> nodes;
     if (is<DocumentFragment>(*node))
         nodes = node->children_as_vector();
     else
-        nodes.append(GC::make_root(*node));
+        nodes.append(node);
 
     // AD-HOC: Since removing the child may have executed arbitrary code, we have to verify
     //         the sanity of inserting `node` before `reference_child` again, as well as
@@ -1177,7 +1857,7 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::replace_child(GC::Ref<Node> node, GC::R
     }
 
     // 14. Queue a tree mutation record for parent with nodes, removedNodes, previousSibling, and referenceChild.
-    queue_tree_mutation_record(move(nodes), move(removed_nodes), previous_sibling.ptr(), reference_child.ptr());
+    queue_tree_mutation_record(nodes, removed_nodes, previous_sibling.ptr(), reference_child.ptr());
 
     // 15. Return child.
     return child;
@@ -1193,7 +1873,7 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_node(GC::Ptr<Document> document, 
         document = m_document;
 
     // 1. Assert: node is not a document or node is document.
-    VERIFY(!is_document() || this == document);
+    VERIFY(!is_document() || this == document.ptr());
 
     // 2. Let copy be the result of cloning a single node given node, document, and fallbackRegistry.
     auto copy = TRY(clone_single_node(*document, fallback_registry));
@@ -1255,35 +1935,33 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_node(GC::Ptr<Document> document, 
 // https://dom.spec.whatwg.org/#move
 WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
 {
-    auto& realm = new_parent.realm();
-
     // 1. If newParent’s shadow-including root is not the same as node’s shadow-including root, then throw a "HierarchyRequestError" DOMException.
     if (&new_parent.shadow_including_root() != &shadow_including_root())
-        return WebIDL::HierarchyRequestError::create(realm, "New parent is not in the same shadow tree"_utf16);
+        return WebIDL::HierarchyRequestError::create("New parent is not in the same shadow tree"_utf16);
 
     // NOTE: This has the side effect of ensuring that a move is only performed if newParent’s connected is node’s connected.
 
     // 2. If node is a host-including inclusive ancestor of newParent, then throw a "HierarchyRequestError" DOMException.
     if (is_host_including_inclusive_ancestor_of(new_parent))
-        return WebIDL::HierarchyRequestError::create(realm, "New parent is an ancestor of this node"_utf16);
+        return WebIDL::HierarchyRequestError::create("New parent is an ancestor of this node"_utf16);
 
     // 3. If child is non-null and its parent is not newParent, then throw a "NotFoundError" DOMException.
     if (child && child->parent() != &new_parent)
-        return WebIDL::NotFoundError::create(realm, "Child does not belong to the new parent"_utf16);
+        return WebIDL::NotFoundError::create("Child does not belong to the new parent"_utf16);
 
     // 4. If node is not an Element or a CharacterData node, then throw a "HierarchyRequestError" DOMException.
     if (!is<Element>(*this) && !is<CharacterData>(*this))
-        return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
 
     // 5. If node is a Text node and newParent is a document, then throw a "HierarchyRequestError" DOMException.
     if (is<Text>(*this) && is<Document>(new_parent))
-        return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
 
     // 6. If newParent is a document, node is an Element node, and either newParent has an element child, child is a doctype,
     //    or child is non-null and a doctype is following child then throw a "HierarchyRequestError" DOMException.
     if (is<Document>(new_parent) && is<Element>(*this)) {
         if (new_parent.has_child_of_type<Element>() || is<DocumentType>(child) || (child && child->has_following_node_of_type_in_tree_order<DocumentType>()))
-            return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+            return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
     }
 
     // 7. Let oldParent be node’s parent.
@@ -1291,7 +1969,26 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
 
     // 8. Assert: oldParent is non-null.
     VERIFY(old_parent);
-    bool const is_same_parent_move = old_parent == &new_parent;
+
+    if (is_connected() && old_parent != &new_parent)
+        document().page().keyboard_scroll_dom_tree_changed(*this);
+    document().flush_deferred_style_change_event();
+
+    auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
+    if (document().has_valid_html_collection_caches())
+        affects_elements = mutation_affects_elements(*this);
+
+    struct PreviousReadWriteState {
+        GC::Ptr<Element> element;
+        bool value;
+    };
+    GC::ConservativeVector<PreviousReadWriteState> previous_read_write_states;
+    if (old_parent->in_editable_subtree() != new_parent.in_editable_subtree()) {
+        for_each_in_inclusive_subtree_of_type<Element>([&](Element& element) {
+            previous_read_write_states.append({ element, SelectorMatching::element_matches_state(element, CSS::PseudoClass::ReadWrite) });
+            return TraversalDecision::Continue;
+        });
+    }
 
     // 9. Run the live range pre-remove steps, given node.
     live_range_pre_remove();
@@ -1308,19 +2005,27 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
     // 12. Let oldNextSibling be node’s next sibling.
     auto* old_next_sibling = next_sibling();
 
-    if (old_parent->is_connected()) {
-        // Since the tree structure is about to change, we need to invalidate both style and layout.
-        // In the future, we should find a way to only invalidate the parts that actually need it.
-        if (is_same_parent_move)
-            CSS::Invalidation::invalidate_style_after_same_parent_move(*this, StyleInvalidationReason::NodeRemove);
-        else
-            invalidate_style(StyleInvalidationReason::NodeRemove);
+    // A move keeps the element's identity, so nothing disconnects and nothing connects to say its
+    // relations changed. Remember where it was, which has to happen here: step 13 takes the node out
+    // of its old parent's children, and once it has there is nothing left to read the old place off.
+    auto* const moved_element = as_if<Element>(*this);
+    // The parent a move starts from can be a shadow root, which the style engine holds a node for:
+    // taking only the element would tell it the element crossed out of the tree, and the child list
+    // it left would keep naming it as its first child.
+    GC::Ptr<Node> const moved_from_parent = moved_element ? moved_element->parent() : nullptr;
+    GC::Ptr<Element> const moved_from_previous = moved_element ? moved_element->previous_element_sibling() : nullptr;
+    GC::Ptr<Element> const moved_from_next = moved_element ? moved_element->next_element_sibling() : nullptr;
 
-        // NOTE: If we didn’t have a layout node before, rebuilding the layout tree isn’t gonna give us one
-        //       after we’ve been removed from the DOM.
+    if (old_parent->is_connected()) {
+        // NOTE: If we did not contribute to the layout tree before, rebuilding it will not create a box
+        //       after we have been removed from the DOM.
         // NB: Called during DOM node move, layout is not up to date.
-        if (unsafe_layout_node())
-            old_parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+        if (node_contributes_to_layout_tree(*this)) {
+            if (auto* first_letter_owner = first_letter_owner_for_layout_subtree_from(*old_parent))
+                first_letter_owner->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+            else
+                old_parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+        }
     }
 
     // 13. Remove node from oldParent’s children.
@@ -1338,40 +2043,38 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
     }
 
     // 16. If node has an inclusive descendant that is a slot:
-    auto has_descendent_slot = false;
-    auto* shadow_root = as_if<ShadowRoot>(old_parent_root);
+    if (auto* shadow_root = as_if<ShadowRoot>(old_parent_root)) {
+        Vector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots;
+        for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
+            // AD-HOC: Unregister slot from the shadow root's registry before assign_slottables_for_a_tree.
+            shadow_root->unregister_slot(slot);
+            descendant_slots.append(slot);
+            return TraversalDecision::Continue;
+        });
 
-    for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
-        has_descendent_slot = true;
-        if (!shadow_root)
-            return TraversalDecision::Break;
-        // AD-HOC: Unregister slot from the shadow root's registry before assign_slottables_for_a_tree.
-        shadow_root->unregister_slot(slot);
-        return TraversalDecision::Continue;
-    });
+        if (!descendant_slots.is_empty()) {
+            // 1. Run assign slottables for a tree with oldParent’s root.
+            assign_slottables_for_a_tree(old_parent_root);
 
-    if (has_descendent_slot) {
-        // 1. Run assign slottables for a tree with oldParent’s root.
-        assign_slottables_for_a_tree(old_parent_root);
-
-        // 2. Run assign slottables for a tree with node.
-        assign_slottables_for_a_tree(*this);
+            // 2. Run assign slottables for a tree with node.
+            for (auto const& slot : descendant_slots)
+                assign_slottables(slot);
+        }
     }
 
     // 17. If child is non-null:
     if (child) {
         // 1. For each live range whose start node is newParent and start offset is greater than child’s index:
         //    increase its start offset by 1.
-        for (auto& range : Range::live_ranges()) {
-            if (range->start_container() == &new_parent && range->start_offset() > child->index())
-                range->increase_start_offset(1);
-        }
-
         // 2. For each live range whose end node is newParent and end offset is greater than child’s index:
         //    increase its end offset by 1.
-        for (auto& range : Range::live_ranges()) {
-            if (range->end_container() == &new_parent && range->end_offset() > child->index())
-                range->increase_end_offset(1);
+        // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
+        auto child_index = child->index();
+        for (auto& range : new_parent.document().live_ranges()) {
+            if (range.start_container().ptr() == &new_parent && range.start_offset() > child_index)
+                range.increase_start_offset(1);
+            if (range.end_container().ptr() == &new_parent && range.end_offset() > child_index)
+                range.increase_end_offset(1);
         }
     }
 
@@ -1387,14 +2090,29 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
         new_parent.insert_before_impl(*this, child);
     }
 
-    if (is_same_parent_move)
-        CSS::Invalidation::invalidate_style_after_same_parent_move(*this, StyleInvalidationReason::NodeInsertBefore);
-    else
-        // NB: Unlike a regular insertion, a moved node keeps state such as focus, so use a distinct reason that
-        //     keeps the conservative pseudo-class handling in :has() invalidation.
-        invalidate_style(StyleInvalidationReason::NodeMove);
+    CSS::record_node_moved_in_dom_order(*this, *old_parent);
+    if (moved_element)
+        CSS::record_element_moved(*moved_element, moved_from_parent.ptr(), moved_from_previous.ptr(), moved_from_next.ptr());
+    else if (is<CharacterData>(*this)) {
+        auto const* text = as_if<Text>(*this);
+        auto counts_for_emptiness = text && !text->data().is_empty();
+        if (auto* old_parent_element = as_if<Element>(*old_parent); old_parent_element && old_parent_element->is_connected())
+            CSS::record_element_emptiness_changed(*old_parent_element, *this, counts_for_emptiness, false);
+        if (auto* new_parent_element = as_if<Element>(new_parent); new_parent_element && new_parent_element->is_connected())
+            CSS::record_element_emptiness_changed(*new_parent_element, *this, false, counts_for_emptiness);
+        if (text) {
+            if (auto* old_parent_element = as_if<Element>(*old_parent); old_parent_element && old_parent_element->is_connected())
+                CSS::Invalidation::invalidate_style_after_text_change_under(*old_parent_element);
+            if (auto* new_parent_element = as_if<Element>(new_parent); new_parent_element && new_parent_element != old_parent)
+                CSS::Invalidation::invalidate_style_after_text_change_under(*new_parent_element);
+        }
+    }
     if (is_connected()) {
+        auto moved_subtree_already_needs_layout_tree_update = needs_layout_tree_update() || child_needs_layout_tree_update();
+        set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
         new_parent.set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
+        if (moved_subtree_already_needs_layout_tree_update)
+            new_parent.set_child_needs_layout_tree_update(true);
     }
 
     // 21. If newParent is a shadow host whose shadow root’s slot assignment is "named" and node is a slottable, then assign a slot for node.
@@ -1403,7 +2121,7 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
         auto& new_parent_element = static_cast<Element&>(new_parent);
 
         auto is_named_shadow_host = new_parent_element.is_shadow_host()
-            && new_parent_element.shadow_root()->slot_assignment() == Bindings::SlotAssignmentMode::Named;
+            && new_parent_element.shadow_root()->slot_assignment() == SlotAssignmentMode::Named;
 
         if (is_named_shadow_host && this_element.is_slottable())
             assign_a_slot(this_element.as_slottable());
@@ -1427,6 +2145,8 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
     // 23. Run assign slottables for a tree with node’s root.
     assign_slottables_for_a_tree(root());
 
+    CSS::Invalidation::invalidate_style_after_subtree_place_changed(*this, moved_from_parent);
+
     // 24. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
     for_each_shadow_including_inclusive_descendant([this, &new_parent, old_parent](Node& inclusive_descendant) {
         // 1. Let isSubtreeRoot be true if inclusiveDescendant is node; otherwise false.
@@ -1441,21 +2161,33 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
         // 3. If inclusiveDescendant is custom and newParent is connected, then enqueue a custom element callback
         //    reaction with inclusiveDescendant, callback name "connectedMoveCallback", and « ».
         if (auto* element = as_if<DOM::Element>(inclusive_descendant)) {
-            if (element->is_custom() && new_parent.is_connected()) {
-                GC::RootVector<JS::Value> empty_arguments;
-                element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::connectedMoveCallback, move(empty_arguments));
-            }
+            if (element->is_custom() && new_parent.is_connected())
+                element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::connectedMoveCallback);
         }
         return TraversalDecision::Continue;
     });
 
+    for (auto const& state : previous_read_write_states)
+        CSS::Invalidation::invalidate_style_after_read_write_state_change(*state.element, state.value);
+
     // 25. Queue a tree mutation record for oldParent with « », « node », oldPreviousSibling, and oldNextSibling.
-    old_parent->queue_tree_mutation_record({}, { *this }, old_previous_sibling, old_next_sibling);
+    GC::Ref<Node> moved_node = *this;
+    old_parent->queue_tree_mutation_record({}, { &moved_node, 1 }, old_previous_sibling, old_next_sibling);
 
     // 26. Queue a tree mutation record for newParent with « node », « », newPreviousSibling, and child.
-    new_parent.queue_tree_mutation_record({ *this }, {}, new_previous_sibling, child);
+    new_parent.queue_tree_mutation_record({ &moved_node, 1 }, {}, new_previous_sibling, child);
 
-    document().bump_dom_tree_version();
+    old_parent->invalidate_html_collection_caches_in_ancestors(affects_elements);
+    new_parent.invalidate_html_collection_caches_in_ancestors(affects_elements);
+
+    // NB: A move runs no children changed steps, which is where an <html> element publishes which child is the body.
+    for (auto* parent : { old_parent, &new_parent }) {
+        if (auto* html_element = as_if<HTML::HTMLHtmlElement>(*parent))
+            html_element->publish_body_construction_facts();
+    }
+
+    old_parent->bump_dom_tree_version();
+    new_parent.bump_dom_tree_version();
 
     return {};
 }
@@ -1487,23 +2219,11 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_single_node(Document& document, G
         auto element_copy = TRY(DOM::create_element(document, element->local_name(), element->namespace_uri(), element->prefix(), element->is_value(), false, registry));
 
         // 5. For each attribute of node’s attribute list:
-        Optional<WebIDL::Exception> maybe_exception;
-        element->for_each_attribute([&](Attr const& attr) {
+        element->for_each_attribute([&](QualifiedName const& name, Utf16View value) {
             // 1. Let copyAttribute be the result of cloning a single node given attribute, document, and null.
-            auto copy_attribute_or_error = attr.clone_single_node(document, nullptr);
-            if (copy_attribute_or_error.is_error()) {
-                maybe_exception = copy_attribute_or_error.release_error();
-                return;
-            }
-
-            auto copy_attribute = copy_attribute_or_error.release_value();
-
             // 2. Append copyAttribute to copy.
-            element_copy->append_attribute(as<Attr>(*copy_attribute));
+            element_copy->append_attribute(name, Utf16String::from_utf16(value));
         });
-
-        if (maybe_exception.has_value())
-            return *maybe_exception;
 
         copy = move(element_copy);
     }
@@ -1517,11 +2237,11 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_single_node(Document& document, G
             auto document_copy = [&] -> GC::Ref<Document> {
                 switch (document_.document_type()) {
                 case Document::Type::XML:
-                    return XMLDocument::create(realm(), document_.url());
+                    return XMLDocument::create(document.page(), document.relevant_global_event_target(), document_.url());
                 case Document::Type::HTML:
-                    return HTML::HTMLDocument::create(realm(), document_.url());
+                    return HTML::HTMLDocument::create(document.page(), document.relevant_global_event_target(), document_.url());
                 default:
-                    return Document::create(realm(), document_.url());
+                    return Document::create(document.page(), document.relevant_global_event_target(), document_.url());
                 }
             }();
 
@@ -1544,7 +2264,7 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_single_node(Document& document, G
         } else if (is_document_type()) {
             // -> DocumentType
             auto& document_type = as<DocumentType>(*this);
-            auto document_type_copy = realm().create<DocumentType>(document);
+            auto document_type_copy = DocumentType::create(document);
 
             // Set copy’s name, public ID, and system ID to those of node.
             document_type_copy->set_name(document_type.name());
@@ -1564,9 +2284,9 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_single_node(Document& document, G
             copy = [&]() -> GC::Ref<Text> {
                 switch (type()) {
                 case NodeType::TEXT_NODE:
-                    return realm().create<Text>(document, text.data());
+                    return Text::create(document, text.data());
                 case NodeType::CDATA_SECTION_NODE:
-                    return realm().create<CDATASection>(document, text.data());
+                    return CDATASection::create(document, text.data());
                 default:
                     VERIFY_NOT_REACHED();
                 }
@@ -1576,20 +2296,21 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_single_node(Document& document, G
             auto& comment = as<Comment>(*this);
 
             // Set copy’s data to that of node.
-            auto comment_copy = realm().create<Comment>(document, comment.data());
+            auto comment_copy = Comment::create(document, comment.data());
             copy = move(comment_copy);
         } else if (is<ProcessingInstruction>(this)) {
             // -> ProcessingInstruction
             auto& processing_instruction = as<ProcessingInstruction>(*this);
 
             // Set copy’s target and data to those of node.
-            auto processing_instruction_copy = realm().create<ProcessingInstruction>(document, processing_instruction.data(), processing_instruction.target());
+            auto processing_instruction_copy = ProcessingInstruction::create(document, processing_instruction.data(), processing_instruction.target());
             copy = move(processing_instruction_copy);
         }
         // -> Otherwise
         //    Do nothing.
         else if (is<DocumentFragment>(this)) {
-            copy = realm().create<DocumentFragment>(document);
+            auto document_fragment_copy = DocumentFragment::create(document);
+            copy = move(document_fragment_copy);
         } else {
             dbgln("Missing code for cloning a '{}' node. Please add it to Node::clone_single_node()", class_name());
             VERIFY_NOT_REACHED();
@@ -1612,11 +2333,11 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_single_node(Document& document, G
 }
 
 // https://dom.spec.whatwg.org/#dom-node-clonenode
-WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_node_binding(bool subtree)
+WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_node(bool subtree)
 {
     // 1. If this is a shadow root, then throw a "NotSupportedError" DOMException.
     if (is<ShadowRoot>(*this))
-        return WebIDL::NotSupportedError::create(realm(), "Cannot clone shadow root"_utf16);
+        return WebIDL::NotSupportedError::create("Cannot clone shadow root"_utf16);
 
     // 2. Return the result of cloning a node given this with subtree set to subtree.
     return clone_node(nullptr, subtree);
@@ -1632,31 +2353,16 @@ void Node::set_document(Document& document)
     if (m_document.ptr() == &document)
         return;
 
+    // A layout node belongs to its document's layout node arena, so the node let go of any before it moves.
+    VERIFY(!m_has_layout_box && !m_has_committed_box);
+
     auto& old_document = *m_document;
-    bool const node_needs_style_update = needs_style_update();
-    bool const subtree_needs_style_update = entire_subtree_needs_style_update();
-    bool const descendants_need_style_update = child_needs_style_update();
     m_document = &document;
 
-    if (auto* animatable = as_if<Animations::Animatable>(*this))
-        animatable->on_document_changed(old_document, document);
-
-    if (node_needs_style_update) {
-        // NOTE: We unset and reset the "needs style update" flag here.
-        //       This ensures that there's a pending style update in the new document
-        //       that will eventually assign some style to this node if needed.
-        set_needs_style_update(false);
-        set_needs_style_update(true);
-    }
-
-    if (subtree_needs_style_update || descendants_need_style_update) {
-        // These broader dirty flags stay set across adoption, but the new ancestor chain has never seen them
-        // propagate. Re-mark ancestors so style update still descends into this adopted subtree.
-        for (auto* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
-            if (ancestor->m_child_needs_style_update)
-                break;
-            ancestor->m_child_needs_style_update = true;
-        }
+    if (auto* element = as_if<Element>(*this)) {
+        if (element->style_uses_if_css_function() || element->style_uses_custom_function() || element->style_depends_on_viewport_metrics())
+            document.add_element_with_viewport_dependent_style(*element);
+        element->on_document_changed(old_document, document);
     }
 }
 
@@ -1686,6 +2392,10 @@ void Node::recompute_editable_subtree_flags_and_repaint()
         // display list, so a flip must invalidate the recorded output.
         if (node.recompute_editable_subtree_flag())
             node.set_needs_repaint();
+        // Whether an element is an editing host is one of the facts a layout row is built with, which the style
+        // mirror holds for the tree build. Only contenteditable and designMode move it, and both reach here.
+        if (auto* element = as_if<Element>(node))
+            CSS::record_element_construction_facts(*element);
         // Editing-host status and the empty-text fragment behavior of text nodes are
         // stamped into layout NodeData at layout node construction; contenteditable and
         // designMode changes reach here without a layout tree rebuild, so the stamps must
@@ -1693,6 +2403,7 @@ void Node::recompute_editable_subtree_flags_and_repaint()
         // did not, hence unconditionally for every node. A flipped stamp changes geometry
         // (an editing host gains a minimum block size, an empty editable text node gains
         // a zero-width fragment), so the affected node also needs a relayout.
+        node.publish_dom_paint_facts();
         if (auto* layout_node = node.unsafe_layout_node()) {
             auto is_editing_host = node.is_editing_host();
             if (layout_node->is_editing_host() != is_editing_host) {
@@ -1706,6 +2417,7 @@ void Node::recompute_editable_subtree_flags_and_repaint()
         }
         return TraversalDecision::Continue;
     });
+    document().page().keyboard_scroll_editability_changed(document());
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#editable
@@ -1791,26 +2503,6 @@ GC::Ptr<Node> Node::editing_host()
     return {};
 }
 
-void Node::set_layout_node(Badge<Layout::Node>, Layout::Node& layout_node)
-{
-    m_layout_node = layout_node;
-}
-
-void Node::clear_layout_node_and_paintable(Badge<Document>)
-{
-    if (m_layout_node)
-        m_layout_node->prepare_for_detach_from_layout_tree();
-    m_layout_node = nullptr;
-    m_paintable = nullptr;
-}
-
-void Node::detach_layout_node(Badge<Layout::LayoutTreeBuilderAccess>)
-{
-    if (m_layout_node)
-        m_layout_node->prepare_for_detach_from_layout_tree();
-    m_layout_node = nullptr;
-}
-
 EventTarget* Node::get_parent(Event const&)
 {
     // A node’s get the parent algorithm, given an event, returns the node’s assigned slot, if node is assigned;
@@ -1833,6 +2525,7 @@ static bool is_structural_boundary_self_rebuild_reason(SetNeedsLayoutTreeUpdateR
     case SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData:
     case SetNeedsLayoutTreeUpdateReason::ElementSetInnerHTML:
     case SetNeedsLayoutTreeUpdateReason::ShadowRootSetInnerHTML:
+    case SetNeedsLayoutTreeUpdateReason::SlotAssignmentChange:
     // The box of an element that entered the top layer leaves the parent's subtree,
     // which is a child-list change.
     case SetNeedsLayoutTreeUpdateReason::TopLayerMembershipChange:
@@ -1842,14 +2535,98 @@ static bool is_structural_boundary_self_rebuild_reason(SetNeedsLayoutTreeUpdateR
     }
 }
 
+// The identity the layout arena files this node's layout tree update marks under. Only an element, a text node, the
+// document and a shadow root ever reach the build as something that keeps or gets a box, and the style mirror names
+// each of them once it tracks the tree; a comment, a doctype or a processing instruction it never names.
+static CSS::StyleNodeID mirror_identity_of(Node const& node)
+{
+    if (auto const* element = as_if<Element>(node))
+        return element->style_node_id();
+    if (auto const* text = as_if<Text>(node))
+        return text->style_node_id();
+    if (auto const* shadow_root = as_if<ShadowRoot>(node))
+        return shadow_root->style_node_id();
+    if (auto const* document = as_if<Document>(node))
+        return document->style_node_id();
+    return {};
+}
+
+// A document that has made no layout arena has made no layout tree update mark either.
+static void* layout_tree_update_marks_of(Document const& document)
+{
+    auto* arena = document.layout_node_arena_if_created();
+    return arena ? arena->handle() : nullptr;
+}
+
+bool Node::needs_layout_tree_update() const
+{
+    auto identity = mirror_identity_of(*this);
+    auto* marks = layout_tree_update_marks_of(document());
+    return identity != 0 && marks && Layout::RustFFI::layout_arena_needs_layout_tree_update(marks, identity.value());
+}
+
+u8 Node::layout_tree_update_reuse_reasons() const
+{
+    auto identity = mirror_identity_of(*this);
+    auto* marks = layout_tree_update_marks_of(document());
+    if (identity == 0 || !marks)
+        return 0;
+    return Layout::RustFFI::layout_arena_layout_tree_update_reuse_reasons(marks, identity.value());
+}
+
+bool Node::child_needs_layout_tree_update() const
+{
+    auto identity = mirror_identity_of(*this);
+    auto* marks = layout_tree_update_marks_of(document());
+    return identity != 0 && marks && Layout::RustFFI::layout_arena_child_needs_layout_tree_update(marks, identity.value());
+}
+
+void Node::set_child_needs_layout_tree_update(bool value)
+{
+    if (auto identity = mirror_identity_of(*this); identity != 0)
+        (void)Layout::RustFFI::layout_arena_set_child_needs_layout_tree_update(document().layout_node_arena().handle(), identity.value(), value);
+}
+
+// The identity the invalidation journal names a node's box by, or none if the node has no box. Retiring a node's
+// identity unbinds its box and clears its box presence, so a node with a box always has one.
+static NodeIdentity identity_of_box_owner(Node const& node)
+{
+    if (!node.has_layout_box())
+        return {};
+    auto identity = NodeIdentity::of(node);
+    VERIFY(identity);
+    return identity;
+}
+
 void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReason reason)
 {
-    if (m_needs_layout_tree_update == value)
+    // A layout tree update mark names a node by its identity in the style mirror, so a node the mirror has not named
+    // has nowhere to hold one. That is every node a build can produce nothing for, whose mutation has already dirtied
+    // its parent, and of the rest only a node in a document whose tree the style engine does not track, or one whose
+    // subtree is still arriving, which the insertion that names it marks.
+    auto identity = mirror_identity_of(*this);
+    if (identity == 0)
         return;
-    m_needs_layout_tree_update = value;
+
+    if (value && reason == SetNeedsLayoutTreeUpdateReason::NodeInsertBefore) {
+        if (auto* first_letter_owner = first_letter_owner_for_layout_subtree_from(*this); first_letter_owner && first_letter_owner != this)
+            first_letter_owner->set_needs_layout_tree_update(true, reason);
+    }
+
+    u8 reuse_reason = 0;
+    if (value && reason == SetNeedsLayoutTreeUpdateReason::NodeInsertBefore)
+        reuse_reason = ChildListInsertion;
+    else if (value && reason == SetNeedsLayoutTreeUpdateReason::PseudoElementChange)
+        reuse_reason = PseudoElementChange;
+    // NB: Every pending reason must permit reuse. Once a full rebuild is requested, later
+    //     incremental changes cannot narrow it again. The arena folds both, and answers whether
+    //     this mark was a transition, which is what the widenings below hang off.
+    auto* marks = value ? document().layout_node_arena().handle() : layout_tree_update_marks_of(document());
+    if (!marks || !Layout::RustFFI::layout_arena_merge_layout_tree_update_mark(marks, identity.value(), value, reuse_reason))
+        return;
 
     if constexpr (UPDATE_LAYOUT_DEBUG) {
-        if (m_needs_layout_tree_update) {
+        if (value) {
             // NOTE: We check some conditions here to avoid debug spam in documents that don't do layout.
             auto navigable = this->navigable();
             bool any_ancestor_needs_layout_tree_update = false;
@@ -1859,7 +2636,7 @@ void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReas
                     break;
                 }
             }
-            if (!any_ancestor_needs_layout_tree_update && navigable && navigable->active_document() == &document()) {
+            if (!any_ancestor_needs_layout_tree_update && navigable && navigable->active_document().ptr() == &document()) {
                 dbgln("Need tree update ({}): {}", to_string(reason), debug_description());
             }
         }
@@ -1872,78 +2649,92 @@ void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReas
             host->set_needs_layout_tree_update(value, reason);
     }
 
-    if (m_needs_layout_tree_update) {
+    if (value) {
         document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
 
+        bool const document_has_top_layer_elements = !document().top_layer_elements().is_empty();
+        auto is_rendered_top_layer_element = [&](Node& node) {
+            if (!document_has_top_layer_elements)
+                return false;
+            auto* element = as_if<Element>(node);
+            return element && element->rendered_in_top_layer();
+        };
+        bool update_is_inside_top_layer_member = is_rendered_top_layer_element(*this);
         for (auto* ancestor = flat_tree_parent(); ancestor; ancestor = ancestor->flat_tree_parent()) {
-            if (ancestor->m_child_needs_layout_tree_update)
+            if (!update_is_inside_top_layer_member && is_rendered_top_layer_element(*ancestor))
+                update_is_inside_top_layer_member = true;
+            auto ancestor_identity = mirror_identity_of(*ancestor);
+            // An ancestor the style mirror has not named is on no path the build walks by identity.
+            if (ancestor_identity == 0)
+                continue;
+            if (Layout::RustFFI::layout_arena_set_child_needs_layout_tree_update(marks, ancestor_identity.value(), true))
                 break;
-            ancestor->m_child_needs_layout_tree_update = true;
         }
+        if (update_is_inside_top_layer_member)
+            document().set_child_needs_layout_tree_update(true);
+
+        // A <mask>, <clipPath>, or <pattern> is laid out as a resource box under each element that references it,
+        // not at its own DOM position. So a layout tree change inside one must rebuild those referencing subtrees.
+        for (auto* node = is_svg_element() ? this : parent(); node && node->is_svg_element(); node = node->parent())
+            static_cast<SVG::SVGElement&>(*node).mark_resource_box_referencing_elements_for_content_change();
 
         // If this is an element with display: contents, we need to propagate the layout tree update to the parent.
         if (auto* element = as_if<Element>(*this)) {
-            if (element->computed_values() && element->computed_values()->display().is_contents()) {
+            if (element->has_style() && CSS::display_from_ffi_display(element->style_group<CSS::ComputedValues::BoxValues>()->display).is_contents()) {
                 if (auto parent_element = element->parent_or_shadow_host_element()) {
                     parent_element->set_needs_layout_tree_update(true, reason);
                 }
             }
         }
 
-        // NB: Propagating layout invalidation, layout is not up to date.
-        if (auto layout_node = this->unsafe_layout_node()) {
-            if (!layout_node->parent() && !layout_node->is_viewport())
-                document().partial_relayout_invalidation().record_escape(PartialRelayoutEscapeReason::DirtyDomNodeHasDetachedLayoutNode);
-
-            bool registered_boundary_self_rebuild = false;
-            if (auto* box = as_if<Layout::Box>(layout_node); box
-                && is_structural_boundary_self_rebuild_reason(reason)
-                && box->is_partial_relayout_boundary()) {
-                box->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate, Layout::LayoutUpdatePropagation::BoundarySelfOnly);
-                registered_boundary_self_rebuild = true;
-            } else {
-                layout_node->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate);
-            }
-
-            // If the layout node has an anonymous parent, rebuild from the nearest non-anonymous ancestor.
-            // A boundary that registered itself for a structural change skips this escalation: a child-list
-            // mutation cannot change its own box kind, so replacing its box in place cannot require
-            // restructuring the surrounding anonymous siblings.
-            // FIXME: This is not optimal, and we should figure out how to rebuild a smaller part of the tree.
-            if (!registered_boundary_self_rebuild && layout_node->parent() && layout_node->parent()->is_anonymous()) {
-                auto* ancestor = layout_node->parent();
-                while (ancestor && ancestor->is_anonymous())
-                    ancestor = ancestor->parent();
-                if (ancestor)
-                    ancestor->dom_node()->set_needs_layout_tree_update(true, reason);
-            }
-        }
+        if (auto identity = identity_of_box_owner(*this))
+            document().invalidation_journal().note_needs_layout_tree_update(identity, reason);
         // NB: A dirty node with no layout node needs no escape tracking: rebuilding it either
         //     still produces no layout node, or the change is covered by the escalations
-        //     above, which mark a node whose layout node classifies it in the ancestor walk.
+        //     in apply_layout_tree_update_mark(), which mark a node whose layout node classifies
+        //     it in the ancestor walk.
     }
 }
 
-void Node::set_needs_style_update(bool value)
+void Node::apply_layout_tree_update_mark(Layout::Node& layout_node, SetNeedsLayoutTreeUpdateReason reason)
 {
-    if (m_needs_style_update == value)
-        return;
-    m_needs_style_update = value;
+    auto classification = Layout::RustFFI::layout_arena_classify_layout_tree_update(
+        layout_node.arena_handle(), Layout::Node::slot_id(&layout_node),
+        is_structural_boundary_self_rebuild_reason(reason));
 
-    if (m_needs_style_update) {
-        document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
+    if (classification.marks_partial_relayout_boundary_self_only) {
+        layout_node.set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate, Layout::LayoutUpdatePropagation::BoundarySelfOnly);
+    } else if (reason == SetNeedsLayoutTreeUpdateReason::NodeInsertBefore) {
+        // What an insertion invalidates depends on the boxes it attaches, which only the layout tree build knows.
+        Layout::RustFFI::render_state_defer_child_list_insertion_layout_update(layout_node.document_host(), Layout::Node::slot_id(&layout_node));
+    } else {
+        layout_node.set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate, Layout::LayoutUpdatePropagation::ThroughAncestors);
+    }
 
-        document().record_style_invalidation();
-        for (auto* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
-            if (ancestor->m_child_needs_style_update)
-                break;
-            ancestor->m_child_needs_style_update = true;
-        }
+    // FIXME: Escalating a rebuild past anonymous parents is not optimal, and we should
+    //        figure out how to rebuild a smaller part of the tree.
+    if (classification.escalates_past_anonymous_parents) {
+        // The document has no style node of its own; it is named by 0.
+        auto ancestor = classification.escalation_target_style_node == 0
+            ? NodeIdentity::of_document()
+            : NodeIdentity::of_style_node(CSS::StyleNodeID { classification.escalation_target_style_node });
+        document().commit_messages().note_needs_layout_tree_update(ancestor, reason);
     }
 }
 
 void Node::post_connection()
 {
+}
+
+// Whether a node sits inside a blocking wheel event handler is inherited from its parents, so a
+// node that arrives somewhere new has to derive it again. Both walks that bring a node somewhere
+// new visit shadow-including inclusive descendants in tree order, so each node's parent has
+// already settled by the time this runs for it, and one step per node is enough.
+static void derive_inside_blocking_wheel_event_handler_state_after_tree_change(Node& node)
+{
+    if (!node.document().may_have_blocking_wheel_event_listener())
+        return;
+    (void)node.update_inside_blocking_wheel_event_handler_state();
 }
 
 void Node::inserted()
@@ -1956,74 +2747,145 @@ void Node::inserted()
     else if (parent())
         m_is_connected = parent()->is_connected();
 
+    if (is_connected())
+        document().page().keyboard_scroll_dom_tree_changed(*this);
     recompute_editable_subtree_flag();
-    update_inside_blocking_wheel_event_handler_state();
-    set_needs_style_update(true);
+    derive_inside_blocking_wheel_event_handler_state_after_tree_change(*this);
+
+    // Text an element clones into its shadow tree from its own insertion steps is not covered by a
+    // subtree arrival either, so it takes its identity here.
+    if (auto* text = as_if<Text>(*this); text && text->style_node_id() == 0)
+        CSS::record_text_connected(*text);
+
+    if (auto* element = as_if<Element>(*this)) {
+        // The content an element clones into its shadow tree from its own insertion steps lands under
+        // a root that connects only when this walk reaches it, so no subtree arrival covered it.
+        if (element->style_node_id() == 0)
+            CSS::record_element_connected(*element);
+        if (is<HTML::HTMLSlotElement>(*element)) {
+            if (auto parent = element->parent_element())
+                CSS::Invalidation::invalidate_style_after_text_change_under(*parent);
+        }
+    } else if (auto* shadow_root = as_if<ShadowRoot>(*this)) {
+        // The root gave up its place in the style tree when it disconnected, and the insertion steps
+        // reach it after its host, so this is where it can retake it.
+        CSS::record_shadow_root_connected(*shadow_root);
+    } else if (auto* parent = as_if<Element>(parent_node())) {
+        // A text or comment node connects no element, so no tree delta carries it. It still decides
+        // whether its parent is empty, and `:empty` is about the parent.
+        auto const* text = as_if<Text>(*this);
+        CSS::record_element_emptiness_changed(*parent, *this, false, text && !text->data().is_empty());
+
+        // A dir=auto ancestor resolves its direction from the text under it, and this text is now
+        // part of that answer.
+        if (text)
+            CSS::Invalidation::invalidate_style_after_text_change_under(*parent);
+    }
+
+    // Inertness, editability and the wheel handler state are all inherited, so a node that arrives somewhere new
+    // holds what its new place gives it. The identity it publishes them under was taken above.
+    publish_dom_paint_facts();
+
+    // A node can also arrive in the shadow tree of a text control that is already focused, which is the one other
+    // inherited state a row is built with. Only the nodes of the focused control's own shadow tree hold it.
+    if (auto focused_area = document().focused_area(); is<HTML::FormAssociatedTextControlElement>(focused_area.ptr())) {
+        if (auto* shadow_root = as_if<ShadowRoot>(root()); shadow_root && shadow_root->host() == focused_area.ptr())
+            Layout::publish_is_in_focused_text_control(*this);
+    }
 }
 
-void Node::clear_layout_node_paintable()
+void Node::removed_from(IsSubtreeRoot, Node* old_parent, Node&)
 {
-    if (!m_layout_node)
-        return;
+    // The text is out of the tree now, so a dir=auto ancestor that was reading it resolves to
+    // something else. This has to happen after the removal, unlike the emptiness the removal steps
+    // publish, because what a direction resolves to cannot be stated without walking the text.
+    if (is<Text>(*this)) {
+        if (auto* parent = as_if<Element>(old_parent); parent && parent->is_connected())
+            CSS::Invalidation::invalidate_style_after_text_change_under(*parent);
+    }
+    if (is<HTML::HTMLSlotElement>(*this)) {
+        if (auto* parent = as_if<Element>(old_parent); parent && parent->is_connected())
+            CSS::Invalidation::invalidate_style_after_text_change_under(*parent);
+    }
 
-    m_layout_node->clear_paintable();
-}
-
-void Node::removed_from(IsSubtreeRoot, Node*, Node&)
-{
     m_is_connected = false;
     m_in_editable_subtree = false;
-    m_inside_blocking_wheel_event_handler = false;
-    clear_layout_node_paintable();
-    // A top layer element's box is a viewport child rather than part of the parent's box
-    // subtree, so the parent rebuild triggered by this removal can never detach it.
-    if (m_layout_node) {
-        if (auto* top_layer_placement = m_layout_node->topmost_layout_node_of_top_layer_placement()) {
-            top_layer_placement->prepare_subtree_for_detach_from_layout_tree();
-            top_layer_placement->remove();
-        }
-    }
-    m_layout_node = nullptr;
-    m_paintable = nullptr;
-
-    if (auto* element = as_if<Element>(*this))
-        element->clear_synthetic_pseudo_element_layout_nodes(Badge<Node> {});
 }
 
 // https://dom.spec.whatwg.org/#concept-node-move-ext
 void Node::moved_from(IsSubtreeRoot, GC::Ptr<Node>)
 {
+    // Reordering body elements within the same parent can change the default keyboard event target.
+    if (is_html_body_element() || is_html_frameset_element())
+        document().page().keyboard_scroll_dom_tree_changed(*this);
     recompute_editable_subtree_flag();
-    update_inside_blocking_wheel_event_handler_state();
+    derive_inside_blocking_wheel_event_handler_state_after_tree_change(*this);
+    publish_dom_paint_facts();
 }
 
 static bool is_root_wheel_event_target(Node const& node)
 {
+    if (node.is_document())
+        return true;
+    if (!node.is_element())
+        return false;
     auto& document = node.document();
-    return &node == &document || &node == document.document_element() || &node == document.body();
+    if (&node == document.document_element())
+        return true;
+    if (!node.is_html_body_element() && !node.is_html_frameset_element())
+        return false;
+    return &node == document.body();
 }
 
-void Node::update_inside_blocking_wheel_event_handler_state()
+bool Node::update_inside_blocking_wheel_event_handler_state()
 {
+    bool const was_inside_blocking_wheel_event_handler = m_inside_blocking_wheel_event_handler;
     m_inside_blocking_wheel_event_handler = false;
-    if (auto* parent = parent_or_shadow_host_node())
+    if (auto* parent = parent_or_shadow_host()) {
+        // A shadow root may not have derived its state since its host's changed, so it derives it first.
+        if (is<ShadowRoot>(*parent))
+            parent->update_inside_blocking_wheel_event_handler_state();
         m_inside_blocking_wheel_event_handler = parent->inside_blocking_wheel_event_handler();
+    }
 
     if (!m_inside_blocking_wheel_event_handler && !is_root_wheel_event_target(*this) && has_blocking_wheel_event_listener())
         m_inside_blocking_wheel_event_handler = true;
+
+    bool const flipped = was_inside_blocking_wheel_event_handler != m_inside_blocking_wheel_event_handler;
+    if (flipped)
+        publish_dom_paint_facts();
+    return flipped;
+}
+
+static void set_needs_repaint_of_top_layer_boxes(Element& element, Layout::Node const* layout_node_repainted_by_caller)
+{
+    if (auto* layout_node = element.unsafe_layout_node(); layout_node && layout_node != layout_node_repainted_by_caller)
+        Painting::set_needs_repaint_in_subtree(*layout_node);
+    if (auto* backdrop_layout_node = element.pseudo_element_unsafe_layout_node(CSS::PseudoElement::Backdrop))
+        Painting::set_needs_repaint_in_subtree(*backdrop_layout_node);
 }
 
 void Node::update_inside_blocking_wheel_event_handler_state_for_subtree()
 {
     if (is_root_wheel_event_target(*this)) {
-        update_inside_blocking_wheel_event_handler_state();
+        (void)update_inside_blocking_wheel_event_handler_state();
         return;
     }
 
-    for_each_shadow_including_inclusive_descendant([](Node& node) {
-        node.update_inside_blocking_wheel_event_handler_state();
+    auto* subtree_layout_node = unsafe_layout_node();
+    bool any_descendant_flipped_blocking_wheel_state = false;
+    for_each_shadow_including_inclusive_descendant([&](Node& node) {
+        if (!node.update_inside_blocking_wheel_event_handler_state())
+            return TraversalDecision::Continue;
+        any_descendant_flipped_blocking_wheel_state = true;
+        if (auto* element = as_if<Element>(node); element && element->rendered_in_top_layer())
+            set_needs_repaint_of_top_layer_boxes(*element, subtree_layout_node);
+        else if (!subtree_layout_node)
+            node.set_needs_repaint();
         return TraversalDecision::Continue;
     });
+    if (any_descendant_flipped_blocking_wheel_state && subtree_layout_node)
+        Painting::set_needs_repaint_in_subtree(*subtree_layout_node);
 }
 
 ParentNode* Node::parent_or_shadow_host()
@@ -2049,11 +2911,8 @@ Element* Node::parent_or_shadow_host_element()
 ParentNode* Node::flat_tree_parent()
 {
     // If we're assigned to a slot, that slot is our flat tree parent.
-    if (is_slottable()) {
-        auto& slottable = as_slottable().visit([](auto& node) -> SlottableMixin& { return *node; });
-        if (auto slot = slottable.assigned_slot())
-            return slot;
-    }
+    if (auto slot = assigned_slot_for_node(*this))
+        return slot.ptr();
 
     // Otherwise, this is the parent or shadow host.
     return parent_or_shadow_host();
@@ -2086,30 +2945,149 @@ Slottable Node::as_slottable()
 
 GC::Ref<NodeList> Node::child_nodes()
 {
-    if (!m_child_nodes) {
-        m_child_nodes = LiveNodeList::create(realm(), *this, LiveNodeList::Scope::Children, [](auto&) {
+    auto& child_nodes = ensure_rare_data().child_nodes;
+    if (!child_nodes) {
+        child_nodes = LiveNodeList::create(*this, LiveNodeList::Scope::Children, [](auto&) {
             return true;
         });
     }
-    return *m_child_nodes;
+    return *child_nodes;
 }
 
-Vector<GC::Root<Node>> Node::children_as_vector() const
+GC::RootVector<GC::Ref<Node>> Node::children_as_vector() const
 {
-    Vector<GC::Root<Node>> nodes;
+    GC::RootVector<GC::Ref<Node>> nodes;
 
     for_each_child([&](auto& child) {
-        nodes.append(GC::make_root(child));
+        nodes.append(child);
         return IterationDecision::Continue;
     });
 
     return nodes;
 }
 
+// https://dom.spec.whatwg.org/#concept-node-remove
 void Node::remove_all_children(bool suppress_observers)
 {
-    while (GC::Ptr<Node> child = first_child())
-        child->remove(suppress_observers);
+    // AD-HOC: The remove algorithm for each child in tree order. The steps that concern only the parent run once for
+    //         all of the children, as noted under each.
+
+    if (!has_children())
+        return;
+
+    // NB: Mutations during a recorded editing command must go through the Editing proxy functions.
+    if (auto history = document().editing_history_if_exists())
+        history->notify_dom_mutation();
+
+    document().flush_deferred_style_change_event();
+    bool const was_connected = is_connected();
+    bool const was_tracked_by_style_engine = is_tracked_by_style_engine();
+
+    // 1. Let parent be node’s parent
+    // NB: This node is the parent of every child removed here.
+
+    // 2. Assert: parent is non-null.
+    // NB: The parent is this node, so there is nothing to check.
+    auto& parent_root = root();
+
+    // 3. Run the live range pre-remove steps, given node.
+    // NB: Run once for all of the children before any is removed. Each child is the first child when its turn comes,
+    //     and the steps for every child together leave each boundary point that was in a child or on this node at
+    //     (this, 0). Nothing that runs between the removals can observe a live range.
+    live_range_pre_remove_all_children();
+
+    // Whether a removed box carries an ancestor's first letter is only a question when an ancestor has one.
+    auto ancestors_may_have_first_letter = AncestorsMayHaveFirstLetter::No;
+    if (was_tracked_by_style_engine) {
+        for (auto const* ancestor = this; ancestor; ancestor = ancestor->parent_or_shadow_host_node()) {
+            auto const* element = as_if<Element>(*ancestor);
+            if (element && element->has_style(CSS::PseudoElement::FirstLetter)) {
+                ancestors_may_have_first_letter = AncestorsMayHaveFirstLetter::Yes;
+                break;
+            }
+        }
+    }
+    bool const track_affected_elements = document().has_valid_html_collection_caches();
+    auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
+    bool const a_child_holds_a_propagating_state_source = CSS::Invalidation::descendants_hold_a_propagating_state_source(*this);
+    // Every child has the same list owner, so the first child that renumbers it answers for all of them.
+    bool list_owner_renumber_scheduled = false;
+
+    while (GC::Ptr<Node> child = first_child()) {
+        if (was_connected)
+            document().page().keyboard_scroll_dom_tree_changed(*child);
+
+        // 4. For each NodeIterator object iterator whose root’s node document is node’s node document:
+        //    run the NodeIterator pre-removing steps given node and iterator.
+        child->run_node_iterator_pre_removing_steps();
+
+        // 5. Let oldPreviousSibling be node’s previous sibling.
+        // NB: The child removed is always the first, so oldPreviousSibling is always null.
+
+        // 6. Let oldNextSibling be node’s next sibling.
+        GC::Ptr<Node> old_next_sibling = child->next_sibling();
+
+        if (track_affected_elements && mutation_affects_elements(*child) == ChildrenChangedMetadata::AffectsElements::Yes)
+            affects_elements = ChildrenChangedMetadata::AffectsElements::Yes;
+
+        if (!list_owner_renumber_scheduled)
+            list_owner_renumber_scheduled = child->schedule_list_item_renumber_for_removal();
+
+        RemovalStyleRecordPins removal_style_record_pins { document().style_computer() };
+        removal_style_record_pins.pin_style_records_before_removal(*child, was_tracked_by_style_engine);
+        if (was_tracked_by_style_engine) {
+            child->update_layout_tree_for_removal(*this, LayoutSubtreeRemoval::RebuildParent, ancestors_may_have_first_letter);
+            child->detach_remaining_layout_nodes_for_removal();
+            child->report_removal_to_style_engine(*this);
+        }
+
+        // 7. Remove node from its parent’s children.
+        remove_child_impl(*child);
+
+        // 8. If node is assigned, then run assign slottables for node’s assigned slot.
+        // 9. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
+        //    signal a slot change for parent.
+        // 10. If node has an inclusive descendant that is a slot, then:
+        child->assign_slottables_after_removal(*this, parent_root);
+
+        removal_style_record_pins.pin_style_records_after_removal(*child, was_connected);
+
+        // 11. Run the removing steps with node, true, and parent.
+        // 12. Let isParentConnected be parent’s connected.
+        // 13. If node is custom and isParentConnected is true, then enqueue a custom element callback reaction with
+        //     node, callback name "disconnectedCallback", and an empty argument list.
+        // 14. For each shadow-including descendant descendant of node, in shadow-including tree order:
+        child->run_removing_steps(*this, parent_root, was_tracked_by_style_engine);
+
+        removal_style_record_pins.release_dom_style_records();
+
+        if (a_child_holds_a_propagating_state_source)
+            CSS::Invalidation::invalidate_style_after_subtree_place_changed(*child, this);
+
+        // 15. For each inclusive ancestor inclusiveAncestor of parent, and then for each registered of
+        //     inclusiveAncestor’s registered observer list, if registered’s options["subtree"] is true, then append a
+        //     new transient registered observer whose observer is registered’s observer, options is registered’s
+        //     options, and source is registered to node’s registered observer list.
+        child->add_transient_registered_observers_for_removal(*this);
+
+        // 16. If suppressObservers is false, then queue a tree mutation record for parent with « », « node »,
+        //     oldPreviousSibling, and oldNextSibling.
+        if (!suppress_observers)
+            child->queue_tree_mutation_record_for_removal(*this, nullptr, old_next_sibling);
+
+        // 17. Run the children changed steps for parent.
+        // NB: Run once after the last child has left. No script can run between two removals, so the runs in between
+        //     would only redo work on children that are about to leave.
+
+        child->bump_dom_tree_version();
+    }
+
+    // 17. Run the children changed steps for parent.
+    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::AllChildrenRemoved, *this, affects_elements };
+    children_changed(metadata);
+    invalidate_html_collection_caches_in_ancestors(affects_elements);
+
+    bump_dom_tree_version();
 }
 
 // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
@@ -2288,15 +3266,16 @@ void Node::serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>& obje
             }
         }
 
-        if (paintable_box()) {
-            MUST(object.add("display"sv, paintable_box()->computed_values().display().to_string()));
-            if (paintable_box()->could_be_scrolled_by_wheel_event()) {
+        auto const* layout_node = this->layout_node();
+        if (layout_node && Painting::has_committed_box(*layout_node)) {
+            MUST(object.add("display"sv, Painting::display(*layout_node).to_string()));
+            if (Painting::could_be_scrolled_by_wheel_event(*layout_node)) {
                 MUST(object.add("scrollable"sv, true));
             }
-            if (!paintable_box()->is_visible()) {
+            if (!Painting::is_visible(*layout_node)) {
                 MUST(object.add("invisible"sv, true));
             }
-            if (paintable_box()->has_stacking_context()) {
+            if (Painting::has_stacking_context(*layout_node)) {
                 MUST(object.add("stackingContext"sv, true));
             }
         }
@@ -2310,7 +3289,7 @@ void Node::serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>& obje
         MUST(object.add("data"sv, static_cast<DOM::Comment const&>(*this).data().utf16_view()));
     } else if (is_shadow_root()) {
         MUST(object.add("type"sv, "shadow-root"));
-        MUST(object.add("mode"sv, static_cast<DOM::ShadowRoot const&>(*this).mode() == Bindings::ShadowRootMode::Open ? "open"sv : "closed"sv));
+        MUST(object.add("mode"sv, static_cast<DOM::ShadowRoot const&>(*this).mode() == ShadowRootMode::Open ? "open"sv : "closed"sv));
     }
 
     MUST((object.add("visible"sv, !!layout_node())));
@@ -2387,7 +3366,7 @@ void Node::replace_all(GC::Ptr<Node> node)
     auto removed_nodes = children_as_vector();
 
     // 2. Let addedNodes be the empty set.
-    Vector<GC::Root<Node>> added_nodes;
+    GC::RootVector<GC::Ref<Node>> added_nodes;
 
     // 3. If node is a DocumentFragment node, then set addedNodes to node’s children.
     if (node && is<DocumentFragment>(*node)) {
@@ -2395,7 +3374,7 @@ void Node::replace_all(GC::Ptr<Node> node)
     }
     // 4. Otherwise, if node is non-null, set addedNodes to « node ».
     else if (node) {
-        added_nodes.append(GC::make_root(*node));
+        added_nodes.append(*node);
     }
 
     // 5. Remove all parent’s children, in tree order, with suppressObservers set to true.
@@ -2408,8 +3387,28 @@ void Node::replace_all(GC::Ptr<Node> node)
     // 7. If either addedNodes or removedNodes is not empty, then queue a tree mutation record for parent with
     //    addedNodes, removedNodes, null, and null.
     if (!added_nodes.is_empty() || !removed_nodes.is_empty()) {
-        queue_tree_mutation_record(move(added_nodes), move(removed_nodes), nullptr, nullptr);
+        queue_tree_mutation_record(added_nodes, removed_nodes, nullptr, nullptr);
     }
+}
+
+void Node::replace_all(GC::RootVector<GC::Ref<Node>> added_nodes)
+{
+    if (auto history = document().editing_history_if_exists())
+        history->notify_dom_mutation();
+
+    auto removed_nodes = children_as_vector();
+
+    document().flush_deferred_style_change_event();
+    auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
+    if (document().has_valid_html_collection_caches())
+        affects_elements = mutation_affects_elements(added_nodes.span());
+
+    remove_all_children(true);
+    if (!added_nodes.is_empty())
+        insert_nodes_before(added_nodes, nullptr, true, *this, affects_elements);
+
+    if (!added_nodes.is_empty() || !removed_nodes.is_empty())
+        queue_tree_mutation_record(added_nodes, removed_nodes, nullptr, nullptr);
 }
 
 void Node::string_replace_all(Utf16View string)
@@ -2417,7 +3416,7 @@ void Node::string_replace_all(Utf16View string)
     GC::Ptr<Node> node;
 
     if (!string.is_empty())
-        node = realm().create<Text>(document(), Utf16String::from_utf16(string));
+        node = Text::create(document(), Utf16String::from_utf16(string));
 
     replace_all(node);
 }
@@ -2430,7 +3429,7 @@ void Node::string_replace_all(Utf16String string)
 
     // 2. If string is not the empty string, then set node to a new Text node whose data is string and node document is parent’s node document.
     if (!string.is_empty())
-        node = realm().create<Text>(document(), move(string));
+        node = Text::create(document(), move(string));
 
     // 3. Replace all with node within parent.
     replace_all(node);
@@ -2467,30 +3466,31 @@ WebIDL::ExceptionOr<void> Node::unsafely_set_html(Variant<GC::Ref<Element>, GC::
     // 7. Let fragment be the result of invoking the HTML fragment parsing algorithm given target, html, true, and scriptingMode.
     auto fragment = TRY(HTML::HTMLParser::parse_html_fragment(target, html, HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes));
 
-    // 9. Replace all with fragment within target.
-    target.visit([&](auto node) {
-        node->replace_all(fragment);
-    });
+    // 2. Let fragment be a new DocumentFragment whose node document is contextElement’s node document.
+    // The parser already produced the fragment.
+
+    // Replace all with fragment within target.
+    target.visit([&](auto node) { node->replace_all(fragment); });
 
     return {};
 }
 
 // https://dom.spec.whatwg.org/#dom-node-issamenode
-bool Node::is_same_node(Node const* other_node) const
+bool Node::is_same_node(GC::Ptr<Node const> other_node) const
 {
     // The isSameNode(otherNode) method steps are to return true if otherNode is this; otherwise false.
-    return this == other_node;
+    return GC::Ref { *this } == other_node;
 }
 
 // https://dom.spec.whatwg.org/#dom-node-isequalnode
-bool Node::is_equal_node(Node const* other_node) const
+bool Node::is_equal_node(GC::Ptr<Node const> other_node) const
 {
     // The isEqualNode(otherNode) method steps are to return true if otherNode is non-null and this equals otherNode; otherwise false.
     if (!other_node)
         return false;
 
     // Fast path for testing a node against itself.
-    if (this == other_node)
+    if (GC::Ref { *this } == other_node)
         return true;
 
     // A node A equals a node B if all of the following conditions are true:
@@ -2522,8 +3522,8 @@ bool Node::is_equal_node(Node const* other_node) const
             return false;
         // If A is an element, each attribute in its attribute list equals an attribute in B’s attribute list.
         bool has_same_attributes = true;
-        this_element.for_each_attribute([&](auto const& attribute) {
-            if (other_element.get_attribute_ns(attribute.namespace_uri(), attribute.local_name()) != attribute.value())
+        this_element.for_each_attribute([&](QualifiedName const& name, Utf16View value) {
+            if (other_element.get_attribute_ns(name.namespace_(), name.local_name()) != value)
                 has_same_attributes = false;
         });
         if (!has_same_attributes)
@@ -2603,7 +3603,7 @@ Vector<Utf16FlyString> Node::get_in_scope_prefixes() const
     add_prefix("xml"_utf16_fly_string);
     add_prefix("xmlns"_utf16_fly_string);
 
-    Element const* current = nullptr;
+    GC::Ptr<Element const> current;
 
     if (is<Element>(*this)) {
         current = static_cast<Element const*>(this);
@@ -2625,7 +3625,7 @@ Vector<Utf16FlyString> Node::get_in_scope_prefixes() const
 
         if (auto attributes = current->attributes()) {
             for (size_t i = 0; i < attributes->length(); ++i) {
-                auto const* attr = attributes->item(i);
+                auto attr = attributes->item(i);
                 if (attr->namespace_uri() != Web::Namespace::XMLNS)
                     continue;
 
@@ -2855,14 +3855,19 @@ bool Node::in_a_document_tree() const
 }
 
 // https://dom.spec.whatwg.org/#dom-node-getrootnode
-GC::Ref<Node> Node::get_root_node(Bindings::GetRootNodeOptions const& options)
+GC::Ref<Node> Node::get_root_node(RootNodeComposed composed)
 {
     // The getRootNode(options) method steps are to return this’s shadow-including root if options["composed"] is true;
-    if (options.composed)
+    if (composed == RootNodeComposed::Yes)
         return shadow_including_root();
 
     // otherwise this’s root.
     return root();
+}
+
+GC::Ref<Node> Node::get_root_node(Bindings::GetRootNodeOptions const& options)
+{
+    return get_root_node(options.composed ? RootNodeComposed::Yes : RootNodeComposed::No);
 }
 
 Utf16String Node::debug_description() const
@@ -2896,38 +3901,53 @@ size_t Node::length() const
 
 Layout::Node const* Node::layout_node() const
 {
-    if (m_layout_node)
+    auto const* layout_node = unsafe_layout_node();
+    if (layout_node)
         VERIFY(document().layout_is_up_to_date());
-    return m_layout_node;
+    return layout_node;
 }
 
 Layout::Node* Node::layout_node()
 {
-    if (m_layout_node)
-        VERIFY(document().layout_is_up_to_date());
-    return m_layout_node;
+    return const_cast<Layout::Node*>(static_cast<Node const*>(this)->layout_node());
 }
 
-void Node::set_paintable(WeakPtr<Painting::Paintable> paintable)
+// A node's layout node is the one the arena has bound to its StyleNodeID. The document has no StyleNodeID; it is
+// bound to a viewport. Any other node without one has no layout node, which needs no question to the arena.
+Layout::Node const* Node::unsafe_layout_node() const
 {
-    m_paintable = paintable;
-}
-
-void Node::clear_paintable()
-{
-    m_paintable = nullptr;
+    auto* arena = m_document->layout_node_arena_if_created();
+    if (!arena)
+        return nullptr;
+    return NodeIdentity::of(*this).bound_layout_node(*arena);
 }
 
 void Node::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list)
 {
-    if (auto* layout_node = unsafe_layout_node()) {
-        if (auto* text_node = as_if<Layout::TextNode>(*layout_node)) {
-            text_node->set_needs_repaint(should_invalidate_display_list);
-            return;
-        }
-        if (auto paintable = layout_node->paintable())
-            paintable->set_needs_repaint(should_invalidate_display_list);
-    }
+    // A node without a box has nothing to repaint.
+    if (auto identity = identity_of_box_owner(*this))
+        document().invalidation_journal().note_needs_repaint(identity, should_invalidate_display_list);
+}
+
+// The facts are published under the node's identity in the style mirror, for the rows the build has yet to stamp,
+// and journalled for the box the node already has. Neither half needs the node to have a box: the build reads the
+// published answer for a node that gains one.
+void Node::publish_dom_paint_facts()
+{
+    auto& document = this->document();
+    auto facts = Layout::Node::dom_paint_facts_of(this);
+    // A document where nothing is ever inert, editable or inside a wheel handler publishes nothing, which keeps a
+    // node's arrival free there. The flag is set before the first fact is published, so a later drop back to none is
+    // still published.
+    if (facts == 0 && !document.may_have_dom_paint_facts())
+        return;
+    if (facts != 0)
+        document.set_may_have_dom_paint_facts();
+    auto style_node = is_document() ? document.style_node_id() : Layout::Node::style_node_of(this);
+    if (style_node.value() != 0)
+        document.style_computer().style_engine().set_node_dom_paint_facts(style_node, facts);
+    if (auto identity = identity_of_box_owner(*this))
+        document.invalidation_journal().note_dom_paint_facts(identity, facts);
 }
 
 void Node::set_needs_layout_update(SetNeedsLayoutReason reason)
@@ -2937,61 +3957,23 @@ void Node::set_needs_layout_update(SetNeedsLayoutReason reason)
 
 void Node::set_needs_layout_update(SetNeedsLayoutReason reason, Layout::LayoutUpdatePropagation propagation)
 {
-    if (auto* node = unsafe_layout_node()) {
-        node->set_needs_layout_update(reason, propagation);
-        document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
-    }
-}
-
-RefPtr<Painting::Paintable const> Node::paintable() const
-{
-    if (m_paintable)
-        VERIFY(document().layout_is_up_to_date());
-    return m_paintable.strong_ref();
-}
-
-RefPtr<Painting::Paintable> Node::paintable()
-{
-    if (m_paintable)
-        VERIFY(document().layout_is_up_to_date());
-    return m_paintable.strong_ref();
-}
-
-RefPtr<Painting::Paintable const> Node::unsafe_paintable() const
-{
-    return m_paintable.strong_ref();
-}
-
-RefPtr<Painting::Paintable> Node::unsafe_paintable()
-{
-    return m_paintable.strong_ref();
-}
-
-RefPtr<Painting::Paintable const> Node::paintable_box() const
-{
-    return paintable();
-}
-
-RefPtr<Painting::Paintable> Node::paintable_box()
-{
-    return paintable();
-}
-
-RefPtr<Painting::Paintable const> Node::unsafe_paintable_box() const
-{
-    return m_paintable.strong_ref();
-}
-
-RefPtr<Painting::Paintable> Node::unsafe_paintable_box()
-{
-    return m_paintable.strong_ref();
+    // A node without a box has nothing to mark.
+    auto identity = identity_of_box_owner(*this);
+    if (!identity)
+        return;
+    document().invalidation_journal().note_needs_layout_update(identity, reason, propagation);
+    document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
 }
 
 // https://dom.spec.whatwg.org/#queue-a-mutation-record
-void Node::queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value, Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling)
+void Node::queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value, ReadonlySpan<GC::Ref<Node>> added_nodes, ReadonlySpan<GC::Ref<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling)
 {
     auto& document = this->document();
     auto& page = document.page();
+
+    // OPTIMIZATION: Without an observer of this type in the document, interestedObservers stays empty.
+    if (!document.has_mutation_observers_of_type(type) && !page.listen_for_dom_mutations())
+        return;
 
     // NOTE: We defer garbage collection until the end of the scope, since we can't safely use MutationObserver* as a hashmap key otherwise.
     // FIXME: This is a total hack.
@@ -3004,9 +3986,10 @@ void Node::queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlySt
     // 2. Let nodes be the inclusive ancestors of target.
     // 3. For each node of nodes, and then for each registered of node’s registered observer list:
     for (auto* node = this; node; node = node->parent()) {
-        if (!node->m_registered_observer_list)
+        auto* registered_observer_list = node->registered_observer_list();
+        if (!registered_observer_list)
             continue;
-        for (auto& registered_observer : *node->m_registered_observer_list) {
+        for (auto& registered_observer : *registered_observer_list) {
             // 1. Let options be registered’s options.
             auto& options = registered_observer->options();
 
@@ -3026,12 +4009,12 @@ void Node::queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlySt
                 auto mutation_observer = registered_observer->observer();
 
                 // 2. If interestedObservers[mo] does not exist, then set interestedObservers[mo] to null.
-                if (!interested_observers.contains(mutation_observer))
-                    interested_observers.set(mutation_observer, {});
+                if (!interested_observers.contains(mutation_observer.ptr()))
+                    interested_observers.set(mutation_observer.ptr(), {});
 
                 // 3. If either type is "attributes" and options["attributeOldValue"] is true, or type is "characterData" and options["characterDataOldValue"] is true, then set interestedObservers[mo] to oldValue.
                 if ((type == MutationType::attributes && options.attribute_old_value.has_value() && options.attribute_old_value.value()) || (type == MutationType::characterData && options.character_data_old_value.has_value() && options.character_data_old_value.value()))
-                    interested_observers.set(mutation_observer, old_value);
+                    interested_observers.set(mutation_observer.ptr(), old_value);
             }
         }
     }
@@ -3040,14 +4023,14 @@ void Node::queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlySt
     if (interested_observers.is_empty() && !page.listen_for_dom_mutations())
         return;
 
-    auto added_nodes_list = StaticNodeList::create(realm(), move(added_nodes));
-    auto removed_nodes_list = StaticNodeList::create(realm(), move(removed_nodes));
+    auto added_nodes_list = StaticNodeList::create(added_nodes);
+    auto removed_nodes_list = StaticNodeList::create(removed_nodes);
 
     // 4. For each observer → mappedOldValue of interestedObservers:
     for (auto& [observer, mapped_old_value] : interested_observers) {
         // 1. Let record be a new MutationRecord object with its type set to type, target set to target, attributeName set to name, attributeNamespace set to namespace, oldValue set to mappedOldValue,
         //    addedNodes set to addedNodes, removedNodes set to removedNodes, previousSibling set to previousSibling, and nextSibling set to nextSibling.
-        auto record = MutationRecord::create(realm(), type, *this, added_nodes_list, removed_nodes_list, previous_sibling, next_sibling, attribute_name, attribute_namespace, mapped_old_value);
+        auto record = MutationRecord::create(type, *this, added_nodes_list, removed_nodes_list, previous_sibling, next_sibling, attribute_name, attribute_namespace, mapped_old_value);
 
         // 2. Enqueue record to observer’s record queue.
         observer->enqueue_record({}, move(record));
@@ -3057,7 +4040,7 @@ void Node::queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlySt
     }
 
     // 5. Queue a mutation observer microtask.
-    Bindings::queue_mutation_observer_microtask();
+    queue_mutation_observer_microtask(HTML::relevant_similar_origin_window_agent(*this));
 
     // AD-HOC: Notify the UI if it is interested in DOM mutations (i.e. for DevTools).
     if (page.listen_for_dom_mutations())
@@ -3065,13 +4048,22 @@ void Node::queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlySt
 }
 
 // https://dom.spec.whatwg.org/#queue-a-tree-mutation-record
-void Node::queue_tree_mutation_record(Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling)
+void Node::queue_tree_mutation_record(ReadonlySpan<GC::Ref<Node>> added_nodes, ReadonlySpan<GC::Ref<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling)
 {
     // 1. Assert: either addedNodes or removedNodes is not empty.
     VERIFY(added_nodes.size() > 0 || removed_nodes.size() > 0);
 
     // 2. Queue a mutation record of "childList" for target with null, null, null, addedNodes, removedNodes, previousSibling, and nextSibling.
-    queue_mutation_record(MutationType::childList, {}, {}, {}, move(added_nodes), move(removed_nodes), previous_sibling, next_sibling);
+    queue_mutation_record(MutationType::childList, {}, {}, {}, added_nodes, removed_nodes, previous_sibling, next_sibling);
+}
+
+// An element's attribute name filter holds those of its children.
+static void add_to_attribute_name_filter_of_parent(Node& parent, Node const& child)
+{
+    auto* parent_element = as_if<Element>(parent);
+    auto const* child_element = as_if<Element>(child);
+    if (parent_element && child_element)
+        parent_element->add_to_subtree_attribute_name_filter(child_element->subtree_attribute_name_filter());
 }
 
 void Node::append_child_impl(GC::Ref<Node> node)
@@ -3082,6 +4074,10 @@ void Node::append_child_impl(GC::Ref<Node> node)
         return;
 
     TreeNode::append_child(node);
+    node->set_root_for_subtree(root());
+    if (auto count = node->m_associated_animation_count_in_subtree)
+        change_associated_animation_count_in_subtree(count);
+    add_to_attribute_name_filter_of_parent(*this, node);
 }
 
 void Node::insert_before_impl(GC::Ref<Node> node, GC::Ptr<Node> child)
@@ -3089,11 +4085,73 @@ void Node::insert_before_impl(GC::Ref<Node> node, GC::Ptr<Node> child)
     if (!child)
         return append_child_impl(move(node));
     TreeNode::insert_before(node, child);
+    if (node->is_element())
+        begin_child_index_generation();
+    node->set_root_for_subtree(root());
+    if (auto count = node->m_associated_animation_count_in_subtree)
+        change_associated_animation_count_in_subtree(count);
+    add_to_attribute_name_filter_of_parent(*this, node);
 }
 
 void Node::remove_child_impl(GC::Ref<Node> node)
 {
+    if (auto count = node->m_associated_animation_count_in_subtree)
+        change_associated_animation_count_in_subtree(-static_cast<i32>(count));
+    if (auto* element = as_if<Element>(*node)) {
+        if (element->next_sibling())
+            begin_child_index_generation();
+        element->forget_child_indices();
+    }
     TreeNode::remove_child(node);
+    node->set_root_for_subtree(node);
+}
+
+void Node::begin_child_index_generation()
+{
+    if (++m_child_index_generation != 0)
+        return;
+    // The generations have wrapped around, so no child may keep indices counted in the one that comes around again.
+    m_child_index_generation = 1;
+    for_each_child_of_type<Element>([](Element& child) {
+        child.forget_child_indices();
+        return IterationDecision::Continue;
+    });
+}
+
+void Node::add_children_explicitly_inherited_non_inherited_style_groups(u32 style_groups)
+{
+    bool const was_marked = m_children_explicitly_inherited_non_inherited_style_groups != 0;
+    m_children_explicitly_inherited_non_inherited_style_groups |= style_groups;
+    if (!was_marked)
+        publish_children_explicitly_inherit_mark();
+}
+
+void Node::publish_children_explicitly_inherit_mark()
+{
+    if (m_children_explicitly_inherited_non_inherited_style_groups == 0)
+        return;
+    // An element's or a shadow root's children are the ones that read it; the engine keeps no mark for anything else.
+    CSS::StyleNodeID style_node;
+    if (auto const* element = as_if<Element>(*this))
+        style_node = element->style_node_id();
+    else if (auto const* shadow_root = as_if<ShadowRoot>(*this))
+        style_node = shadow_root->style_node_id();
+    if (style_node != 0)
+        document().style_computer().style_engine().note_children_explicitly_inherit(style_node);
+}
+
+void Node::change_associated_animation_count_in_subtree(i32 delta)
+{
+    for (auto* node = this; node; node = node->parent_or_shadow_host())
+        node->m_associated_animation_count_in_subtree += delta;
+}
+
+void Node::set_root_for_subtree(Node& new_root)
+{
+    for_each_in_inclusive_subtree([&](Node& node) {
+        node.m_root = new_root;
+        return TraversalDecision::Continue;
+    });
 }
 
 void Node::build_accessibility_tree(AccessibilityTreeNode& parent)
@@ -3119,8 +4177,8 @@ void Node::build_accessibility_tree(AccessibilityTreeNode& parent)
             return;
 
         if (element->include_in_accessibility_tree()) {
-            auto current_node = AccessibilityTreeNode::create(&document(), this);
-            parent.append_child(current_node);
+            auto current_node = AccessibilityTreeNode::create(this);
+            parent.append_child(current_node.ptr());
             if (has_child_nodes()) {
                 for_each_child([&current_node](DOM::Node& child) {
                     child.build_accessibility_tree(*current_node);
@@ -3134,7 +4192,7 @@ void Node::build_accessibility_tree(AccessibilityTreeNode& parent)
             });
         }
     } else if (is_text()) {
-        parent.append_child(AccessibilityTreeNode::create(&document(), this));
+        parent.append_child(AccessibilityTreeNode::create(this).ptr());
         if (has_child_nodes()) {
             for_each_child([&parent](DOM::Node& child) {
                 child.build_accessibility_tree(parent);
@@ -3255,7 +4313,7 @@ ErrorOr<Utf16String> Node::name_or_description(NameOrDescription target, Documen
                     continue;
 
                 // a. Set the current node to the node referenced by the IDREF.
-                current_node = node;
+                current_node = node.ptr();
                 // b. Compute the text alternative of the current node beginning with step 2. Set the result to that text alternative.
                 auto result = TRY(node->name_or_description(target, document, visited_nodes));
                 // c. Append the result, with a space, to the accumulated text.
@@ -3310,7 +4368,7 @@ ErrorOr<Utf16String> Node::name_or_description(NameOrDescription target, Documen
                     // be trying to achieve that result by expressing specific steps for each particular type of form
                     // control. But what all that reduces/optimizes/simplifies down to is just, “skip over self”.
                     // https://github.com/w3c/aria/issues/2389
-                    if (node == this)
+                    if (node.ptr() == this)
                         continue;
 
                     if (node->is_element()) {
@@ -3467,19 +4525,10 @@ ErrorOr<Utf16String> Node::name_or_description(NameOrDescription target, Documen
 
             // FIXME: Do we need to update layout before checking this? If so we can avoid using the unsafe layout node
             //        getter here.
-            if (auto before = element->pseudo_element_unsafe_layout_node(CSS::PseudoElement::Before)) {
-                // NB: We know that content has a value since we set it immediately when creating a ::before pseudo
-                //     element node.
-                auto const& content = before->computed_values().content().value();
-
-                if (content.alt_text.has_value()) {
-                    total_accumulated_text.append(content.alt_text.value());
-                } else {
-                    for (auto const& item : content.data) {
-                        if (auto const* string = item.get_pointer<Utf16String>())
-                            total_accumulated_text.append(*string);
-                    }
-                }
+            if (element->pseudo_element_unsafe_layout_node(CSS::PseudoElement::Before)) {
+                // NB: The build that registers this box also resolves its content — and it stays put until the box is
+                //     rebuilt. So, a registered box in an up-to-date layout tree always has one.
+                total_accumulated_text.append(generated_content_accessible_text(*element, CSS::PseudoElement::Before));
             }
 
             // iii. Determine Child Nodes: Determine the rendered child nodes of the current node:
@@ -3496,7 +4545,9 @@ ErrorOr<Utf16String> Node::name_or_description(NameOrDescription target, Documen
             //    assigned nodes of the current node.
             if (auto const* slot_element = as_if<HTML::HTMLSlotElement>(element)) {
                 total_accumulated_text.append(element->text_content().value());
-                child_nodes = slot_element->assigned_nodes();
+                child_nodes.clear();
+                for (auto const& assigned_node : slot_element->assigned_nodes())
+                    child_nodes.append(*assigned_node);
             }
 
             // iv. Name From Each Child: For each rendered child node of the current node
@@ -3516,7 +4567,7 @@ ErrorOr<Utf16String> Node::name_or_description(NameOrDescription target, Documen
                     continue;
 
                 // a. Set the current node to the child node.
-                current_node = child_node;
+                current_node = child_node.ptr();
 
                 // b. Compute the text alternative of the current node beginning with step 2. Set the result to that text alternative.
                 auto result = MUST(current_node->name_or_description(target, document, visited_nodes, IsDescendant::Yes, should_compute_role));
@@ -3533,19 +4584,9 @@ ErrorOr<Utf16String> Node::name_or_description(NameOrDescription target, Documen
             // NOTE: See step ii.b above.
             // FIXME: Do we need to update layout before checking this? If so we can avoid using the unsafe layout node
             //        getter here.
-            if (auto after = element->pseudo_element_unsafe_layout_node(CSS::PseudoElement::After)) {
-                // NB: We know that content has a value since we set it immediately when creating an ::after pseudo
-                //     element node.
-                auto const& content = after->computed_values().content().value();
-
-                if (content.alt_text.has_value()) {
-                    total_accumulated_text.append(content.alt_text.value());
-                } else {
-                    for (auto& item : content.data) {
-                        if (auto const* string = item.get_pointer<Utf16String>())
-                            total_accumulated_text.append(*string);
-                    }
-                }
+            if (element->pseudo_element_unsafe_layout_node(CSS::PseudoElement::After)) {
+                // NB: See the ::before case above.
+                total_accumulated_text.append(generated_content_accessible_text(*element, CSS::PseudoElement::After));
             }
 
             // v. Return the accumulated text if it is not the empty string ("").
@@ -3566,14 +4607,10 @@ ErrorOr<Utf16String> Node::name_or_description(NameOrDescription target, Documen
     // cause traversal through element subtrees in way that’s necessary to check for descendants that are referenced by
     // aria-labelledby or aria-describedby and/or un-hidden. See the comment for substep A above.
     if (is_text() && (!parent_element() || (parent_element()->is_referenced() || !parent_element()->is_hidden() || !parent_element()->has_hidden_ancestor() || parent_element()->has_referenced_and_hidden_ancestor()))) {
-        if (layout_node()) {
-            Utf16StringBuilder builder;
-            Layout::TextOffsetMapping mapping { static_cast<DOM::Text const&>(*this) };
-            mapping.for_each_fragment([&](Layout::TextNode const& slice) {
-                builder.append(slice.text_for_rendering());
-            });
-            if (!builder.is_empty())
-                return builder.to_string();
+        if (auto const* text_node = as_if<Layout::TextNode>(layout_node())) {
+            auto text = text_node->rendered_text_for_dom(false);
+            if (!text.is_empty())
+                return text;
         }
         return text_content().value();
     }
@@ -3668,20 +4705,60 @@ Optional<Utf16View> Node::first_valid_id(Utf16View value, Document const& docume
 
 void Node::add_registered_observer(RegisteredObserver& registered_observer)
 {
-    if (!m_registered_observer_list)
-        m_registered_observer_list = make<Vector<GC::Ref<RegisteredObserver>>>();
-    m_registered_observer_list->append(registered_observer);
+    auto& registered_observer_list = ensure_rare_data().registered_observer_list;
+    if (!registered_observer_list)
+        registered_observer_list = make<Vector<GC::Ref<RegisteredObserver>>>();
+    registered_observer_list->append(registered_observer);
+    document().add_mutation_observer_types(registered_observer.options());
+}
+
+Vector<GC::Ref<RegisteredObserver>>* Node::registered_observer_list()
+{
+    return m_rare_data ? m_rare_data->registered_observer_list.ptr() : nullptr;
+}
+
+Vector<GC::Ref<RegisteredObserver>> const* Node::registered_observer_list() const
+{
+    return m_rare_data ? m_rare_data->registered_observer_list.ptr() : nullptr;
+}
+
+Element const* Node::first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor) const
+{
+    // NB: Look the boxes up only once an ancestor has ::first-letter style, so an insertion without such an ancestor
+    //     does not reach the layout tree here.
+    Optional<Layout::Node const*> layout_subtree_root;
+    for (auto const* ancestor = &inclusive_ancestor; ancestor; ancestor = ancestor->parent_or_shadow_host_node()) {
+        auto const* element = as_if<Element>(*ancestor);
+        if (!element || !element->has_style(CSS::PseudoElement::FirstLetter))
+            continue;
+
+        if (!layout_subtree_root.has_value())
+            layout_subtree_root = unsafe_layout_node();
+        if (!*layout_subtree_root)
+            return nullptr;
+
+        auto const* first_letter_layout_node = element->pseudo_element_unsafe_layout_node(CSS::PseudoElement::FirstLetter);
+        if (!first_letter_layout_node)
+            return element;
+        for (auto const* layout_ancestor = first_letter_layout_node; layout_ancestor; layout_ancestor = layout_ancestor->parent()) {
+            if (layout_ancestor == *layout_subtree_root)
+                return element;
+        }
+    }
+    return nullptr;
 }
 
 bool Node::has_inclusive_ancestor_with_display_none_ignoring_animations() const
 {
+    // NB: Only each ancestor's display matters here, so read it out of the record's box group
+    //     payload instead of materializing a full style record view.
+    auto const& style_engine = document().style_computer().style_engine();
     for (auto const* ancestor = this; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
-        if (!ancestor->is_element())
+        auto const* ancestor_element = as_if<Element>(ancestor);
+        if (!ancestor_element)
             continue;
-        auto const& ancestor_element = static_cast<Element const&>(*ancestor);
-        if (ancestor_element.computed_values() && ancestor_element.computed_values()->base_values().display().is_none()) {
+        if (CSS::style_record_display_is_none(style_engine, ancestor_element->style_record_identity()))
             return true;
-        }
     }
     return false;
 }

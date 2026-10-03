@@ -10,24 +10,41 @@
 #include <AK/Optional.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibImageDecoderClient/Client.h>
+#include <LibMediaClient/Client.h>
 #include <LibRequests/RequestClient.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/HTML/CrossProcessId.h>
+#include <LibRequests/RequestControlClient.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/Page/PageId.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Forward.h>
-#include <LibWebView/PrivateBrowsing.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebWorkerClient.h>
 
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+#    include <LibWasmCompilerClient/Client.h>
+#endif
+
 namespace WebView {
 
-WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsPrivate, u64 initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
+WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsPrivate, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
 
 WEBVIEW_API ErrorOr<NonnullRefPtr<ImageDecoderClient::Client>> launch_image_decoder_process();
+WEBVIEW_API ErrorOr<NonnullRefPtr<MediaClient::Client>> launch_media_server_process();
 WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process();
-WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::WebWorkerClient>> launch_web_worker_process(Web::Bindings::AgentType, IsPrivate, Web::HTML::WorkerAgentId);
-WEBVIEW_API ErrorOr<NonnullRefPtr<Requests::RequestClient>> launch_request_server_process();
+WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::WebWorkerClient>> launch_web_worker_process(Web::HTML::AgentType, IsPrivate, Web::HTML::WorkerAgentId);
+WEBVIEW_API ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process();
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+WEBVIEW_API ErrorOr<NonnullRefPtr<WasmCompilerClient::Client>> launch_wasm_compiler_process();
+#endif
 
-WEBVIEW_API ErrorOr<IPC::TransportHandle> connect_new_request_server_client(IsPrivate);
+// The new client uses the cookies of the given session. That must be the session of the process the client is for.
+WEBVIEW_API ErrorOr<IPC::TransportHandle> connect_new_request_server_client(BrowsingSession&);
 WEBVIEW_API ErrorOr<IPC::TransportHandle> connect_new_image_decoder_client();
+// Launches the MediaServer for a renderer if it has none, keeping its controller connection in the given slot, and
+// connects a new client to it.
+WEBVIEW_API ErrorOr<IPC::TransportHandle> connect_new_media_server_client(RefPtr<MediaClient::Client>& controller);
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+WEBVIEW_API ErrorOr<IPC::TransportHandle> connect_new_wasm_compiler_client();
+#endif
 
 }

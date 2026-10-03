@@ -18,7 +18,7 @@ fn compile_interpreter(architecture: Architecture) -> String {
             object_format: ObjectFormat::Elf,
         },
         has_jscvt: false,
-        enable_assertions: false,
+        enable_assertions: true,
     });
     compiler
         .compile(CompilationUnit {
@@ -63,4 +63,30 @@ fn compare_or_rebaseline(file_name: &str, assembly: &str) {
 fn interpreter_assembly_matches_snapshots() {
     compare_or_rebaseline("x86_64.S", &compile_interpreter(Architecture::X86_64));
     compare_or_rebaseline("aarch64.S", &compile_interpreter(Architecture::Aarch64));
+}
+
+#[test]
+fn keeps_helper_setup_out_of_the_hot_handler_region() {
+    for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+        let assembly = compile_interpreter(architecture);
+        let cold_start = assembly.find("asm_cold_handler_paths:").unwrap();
+        for handler in ["Exp", "ExpRhsInt32"] {
+            assert!(assembly.find(&format!("asm_handler_{handler}:")).unwrap() > cold_start);
+        }
+    }
+}
+
+#[test]
+fn keeps_assertion_traps_after_all_hot_and_cold_handlers() {
+    for (architecture, trap) in [(Architecture::X86_64, "    ud2"), (Architecture::Aarch64, "    brk")] {
+        let assembly = compile_interpreter(architecture);
+        let (hot, cold) = assembly.split_once("asm_cold_handler_paths:").unwrap();
+        assert!(!hot.contains(trap));
+        let (cold, traps) = cold.split_once("asm_assertion_failure_traps:").unwrap();
+        assert!(!cold.contains(trap));
+        assert!(traps.contains(trap));
+        assert!(!traps.contains("asm_handler_"));
+        assert!(hot.contains("assert_failure"));
+        assert!(!assembly.contains("assert_ok"));
+    }
 }

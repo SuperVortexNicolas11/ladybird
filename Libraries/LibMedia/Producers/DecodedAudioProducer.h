@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <AK/ConditionVariable.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
@@ -15,15 +17,17 @@
 #include <LibCore/Forward.h>
 #include <LibMedia/Audio/AudioConverter.h>
 #include <LibMedia/AudioBlock.h>
+#include <LibMedia/CodecID.h>
+#include <LibMedia/CodedFrame.h>
 #include <LibMedia/DecoderError.h>
+#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibMedia/Producers/AudioProducer.h>
+#include <LibMedia/SynchronizedWakeHandler.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 #include <LibThreading/Forward.h>
 
 namespace Media {
@@ -71,7 +75,12 @@ private:
         void set_wake_handler(PipelineWakeHandler);
 
         void start();
-        DecoderErrorOr<void> create_decoder();
+        DecoderErrorOr<void> create_decoder_for_frame(CodedFrame const&);
+        AudioDecoderSelection select_decoder_for_frame(CodedFrame const&, AudioDecoderSelection after = {}) const;
+        void replace_decoder_once_drained(CodedFrame const&);
+        DecoderErrorOr<void> receive_into_decoder(CodedFrame const&);
+        DecoderErrorOr<void> receive_coded_frame(CodedFrame const&);
+        DecoderErrorOr<bool> replace_drained_decoder();
         void release_decoder();
         void exit();
 
@@ -87,7 +96,7 @@ private:
         void flush_decoder();
         DecoderErrorOr<void> retrieve_next_block(AudioBlock&);
         bool handle_seek();
-        void resolve_seek(u32 seek_id, bool moved_position);
+        void resolve_seek(u32 seek_id);
         void push_data_and_decode_a_block();
 
         AudioProducerOutput peek();
@@ -96,7 +105,7 @@ private:
 
         void seek(AK::Duration timestamp);
 
-        [[nodiscard]] Sync::MutexLocker<Sync::Mutex> take_lock() const { return Sync::MutexLocker(m_mutex); }
+        [[nodiscard]] MutexLocker<Mutex> take_lock() const { return MutexLocker(m_mutex); }
         void wake() const { m_wait_condition.broadcast(); }
 
         AudioDecoder const& decoder() const { return *m_decoder; }
@@ -118,22 +127,25 @@ private:
 
         Core::EventLoop& m_main_thread_event_loop;
 
-        mutable Sync::Mutex m_mutex;
-        mutable Sync::ConditionVariable m_wait_condition { m_mutex };
+        mutable Mutex m_mutex;
+        mutable ConditionVariable m_wait_condition { m_mutex };
         RequestedState m_requested_state { RequestedState::None };
 
         AK::ThreadID m_decode_thread_id;
         NonnullRefPtr<Demuxer> m_demuxer;
         Track m_track;
+        CodecID m_decoder_codec_id { CodecID::Unknown };
+        AudioDecoderSelection m_decoder_selection;
+        AudioDecoderSelection m_decoder_that_failed_due_to_missing_features;
+        Optional<CodedFrame> m_frame_awaiting_decoder_replacement;
         OwnPtr<AudioDecoder> m_decoder;
         bool m_decoder_needs_keyframe_next_seek { false };
+        bool m_decoder_needs_codec_configuration_next_seek { true };
         NonnullOwnPtr<Audio::AudioConverter> m_converter;
         i64 m_last_output_frame { NumericLimits<i64>::min() };
 
         size_t m_queue_max_size { 8 };
         AudioQueue m_queue;
-        AK::Duration m_earliest_available_timestamp;
-        AK::Duration m_latest_available_timestamp;
         ErrorHandler m_error_handler;
         ReadBlockedChangeHandler m_read_blocked_change_handler;
         PipelineStatus m_current_halting_status { PipelineStatus::Pending };
@@ -142,7 +154,7 @@ private:
         Atomic<u32> m_seek_id { 0 };
         AK::Duration m_seek_timestamp;
 
-        PipelineWakeHandler m_wake_handler;
+        SynchronizedWakeHandler m_wake_handler;
         mutable bool m_downstream_needs_wake { true };
 
         AK::Duration const m_auto_suspend_idle_timeout;

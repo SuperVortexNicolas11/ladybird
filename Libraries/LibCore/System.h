@@ -76,12 +76,16 @@ CORE_API ErrorOr<sig_t> signal(int signal, sig_t handler);
 CORE_API ErrorOr<sighandler_t> signal(int signal, sighandler_t handler);
 #    endif
 CORE_API ErrorOr<struct stat> fstat(int fd);
-ErrorOr<struct stat> fstatat(int fd, StringView path, int flags);
+CORE_API ErrorOr<struct stat> fstatat(int fd, StringView path, int flags);
 ErrorOr<int> openat(int fd, StringView path, int options, mode_t mode = 0);
 CORE_API ErrorOr<int> fcntl(int fd, int command, ...);
 ErrorOr<void*> mmap(void* address, size_t, int protection, int flags, int fd, off_t, size_t alignment = 0, StringView name = {});
 ErrorOr<void> munmap(void* address, size_t);
-ErrorOr<int> anon_create(size_t size, int options);
+enum class AllowSealing {
+    No,
+    Yes,
+};
+CORE_API ErrorOr<int> anon_create(size_t size, int options, AllowSealing = AllowSealing::No);
 CORE_API ErrorOr<int> open(StringView path, int options, mode_t mode = 0);
 ErrorOr<void> ftruncate(int fd, off_t length);
 CORE_API ErrorOr<struct stat> stat(StringView path);
@@ -101,6 +105,7 @@ CORE_API ErrorOr<void> rmdir(StringView path);
 CORE_API ErrorOr<int> mkstemp(Span<char> pattern);
 CORE_API ErrorOr<void> fchmod(int fd, mode_t mode);
 CORE_API ErrorOr<void> rename(StringView old_path, StringView new_path);
+CORE_API ErrorOr<void> renameat(int old_directory_fd, StringView old_path, int new_directory_fd, StringView new_path);
 CORE_API ErrorOr<void> unlink(StringView path);
 CORE_API ErrorOr<void> utimensat(int fd, StringView path, struct timespec const times[2], int flag);
 CORE_API ErrorOr<void> access(StringView pathname, int mode, int flags = 0);
@@ -124,10 +129,21 @@ CORE_API ErrorOr<void> set_resource_limits(int resource, rlim_t limit);
 
 #endif
 
-CORE_API ErrorOr<void*> reserve_address_space(size_t size);
-CORE_API ErrorOr<void> commit_memory(void* address, size_t size);
-CORE_API ErrorOr<void> decommit_memory(void* address, size_t size);
+// Memory tags identify allocations in macOS VM diagnostics and are ignored on other platforms.
+enum class MemoryTag {
+    None,
+    GarbageCollector,
+};
+
+CORE_API ErrorOr<void*> reserve_address_space(size_t size, MemoryTag = MemoryTag::None);
+CORE_API ErrorOr<void*> allocate_anonymous_memory(size_t size, MemoryTag = MemoryTag::None);
+CORE_API ErrorOr<void> commit_memory(void* address, size_t size, MemoryTag = MemoryTag::None);
+CORE_API ErrorOr<void> protect_memory_readonly(void* address, size_t size);
+CORE_API ErrorOr<void> decommit_memory(void* address, size_t size, MemoryTag = MemoryTag::None);
 CORE_API ErrorOr<void> release_address_space(void* address, size_t size);
+
+// Used for placing a SharedArrayBuffer's cross-process shared memory inside the primitive storage cage.
+CORE_API ErrorOr<void> map_shared_memory_fixed(void* address, size_t size, int fd);
 
 CORE_API ErrorOr<void> close(int fd);
 CORE_API ErrorOr<int> dup(int source_fd);

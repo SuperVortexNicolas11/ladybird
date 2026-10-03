@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLHtmlElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/HTML/HTMLBodyElement.h>
+#include <LibWeb/HTML/HTMLFrameSetElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/Layout/Node.h>
 
@@ -22,10 +22,18 @@ HTMLHtmlElement::HTMLHtmlElement(DOM::Document& document, DOM::QualifiedName qua
 
 HTMLHtmlElement::~HTMLHtmlElement() = default;
 
-void HTMLHtmlElement::initialize(JS::Realm& realm)
+void HTMLHtmlElement::children_changed(ChildrenChangedMetadata const& metadata)
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLHtmlElement);
-    Base::initialize(realm);
+    Base::children_changed(metadata);
+    publish_body_construction_facts();
+}
+
+void HTMLHtmlElement::publish_body_construction_facts()
+{
+    for (auto* child = first_child(); child; child = child->next_sibling()) {
+        if (is<HTMLBodyElement>(*child) || is<HTMLFrameSetElement>(*child))
+            CSS::record_element_construction_facts(as<DOM::Element>(*child));
+    }
 }
 
 bool HTMLHtmlElement::should_use_body_background_properties() const
@@ -35,16 +43,24 @@ bool HTMLHtmlElement::should_use_body_background_properties() const
     // properties from the <body> element to the initial containing block, the viewport, or the canvas background, is
     // disabled. Notably, this affects:
     // - 'background' and its longhands (see CSS Backgrounds 3 § 2.11.2 The Canvas Background and the HTML <body> Element)
-    if (!computed_values()->contain().is_empty())
+    // NB: Called during rendering, reading style off the layout nodes.
+    auto has_containment = [](Layout::NodeWithStyle const& layout_node) {
+        return !layout_node.contain().is_empty();
+    };
+
+    auto const* layout_node = unsafe_layout_node();
+    if (!layout_node || has_containment(*layout_node))
         return false;
 
-    auto* body_element = first_child_of_type<HTML::HTMLBodyElement>();
-    if (body_element && !body_element->computed_values()->contain().is_empty())
+    auto const* body_element = first_child_of_type<HTML::HTMLBodyElement>();
+    if (!body_element)
+        return false;
+    auto const* body_layout_node = body_element->unsafe_layout_node();
+    if (!body_layout_node || has_containment(*body_layout_node))
         return false;
 
-    // NB: Called during rendering, reading background properties.
-    auto background_color = unsafe_layout_node()->computed_values().background_color();
-    auto const& background_layers = unsafe_layout_node()->background_layers();
+    auto background_color = layout_node->background_color();
+    auto const& background_layers = layout_node->background_layers();
 
     return !any_of(background_layers, [](auto const& layer) { return layer.background_image != nullptr; }) && background_color == Color::Transparent;
 }

@@ -37,6 +37,7 @@ public:
     static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_a_javascript_module_script(ByteString const& filename, Utf16View source, EnvironmentSettingsObject&, URL::URL base_url, size_t source_line_number = 1, ScriptRegistry::IsInlineSource = ScriptRegistry::IsInlineSource::No);
     static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_a_css_module_script(ByteString const& filename, Utf16View source, EnvironmentSettingsObject&);
     static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_a_json_module_script(ByteString const& filename, Utf16View source, EnvironmentSettingsObject&);
+    static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_a_text_module_script(ByteString const& filename, Utf16View text, EnvironmentSettingsObject&);
     static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_a_webassembly_module_script(ByteString const& filename, ByteBuffer body_bytes, EnvironmentSettingsObject&, URL::URL base_url);
 
     enum class PreventErrorReporting {
@@ -44,7 +45,7 @@ public:
         No
     };
 
-    WebIDL::Promise* run(PreventErrorReporting = PreventErrorReporting::No);
+    GC::Ptr<WebIDL::Promise> run(PreventErrorReporting = PreventErrorReporting::No);
 
     ModuleScriptRecord record() const { return m_record; }
 
@@ -53,6 +54,8 @@ protected:
     ModuleScript(Optional<URL::URL> base_url, ByteString filename, Utf16String display_filename, EnvironmentSettingsObject&);
 
 private:
+    static GC::Ref<ModuleScript> create_internal(Optional<URL::URL> base_url, ByteString const& filename, EnvironmentSettingsObject&);
+
     virtual bool is_module_script() const final { return true; }
     virtual void visit_edges(JS::Cell::Visitor&) override;
 

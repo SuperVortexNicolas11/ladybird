@@ -5,8 +5,7 @@
  */
 
 #include "CSSImageValue.h"
-#include <LibWeb/Bindings/CSSImageValue.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -15,20 +14,14 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSImageValue);
 
-GC::Ref<CSSImageValue> CSSImageValue::create(JS::Realm& realm, NonnullRefPtr<StyleValue const> source_value)
+GC::Ref<CSSImageValue> CSSImageValue::create(StyleValue const& source_value)
 {
-    return realm.create<CSSImageValue>(realm, move(source_value));
+    return GC::Heap::the().allocate<CSSImageValue>(source_value);
 }
 
-CSSImageValue::CSSImageValue(JS::Realm& realm, NonnullRefPtr<StyleValue const> source_value)
-    : CSSStyleValue(realm, move(source_value))
+CSSImageValue::CSSImageValue(StyleValue const& source_value)
+    : CSSStyleValue(source_value)
 {
-}
-
-void CSSImageValue::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSImageValue);
-    Base::initialize(realm);
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#stylevalue-serialization
@@ -62,7 +55,7 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleValue const>> CSSImageValue::create_an_in
     //            fresh CSSMathSum whose values internal slot contains only that part of value.
 
     //     Return the value.
-    return NonnullRefPtr { *source_value() };
+    return source_style_value().release_nonnull();
 }
 
 }

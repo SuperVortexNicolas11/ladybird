@@ -14,19 +14,21 @@
  */
 
 #include <AK/NeverDestroyed.h>
-#include <AK/Utf16StringBuilder.h>
+#include <LibGC/Heap.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibJS/Runtime/Date.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/RegExpObject.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/Bindings/HTMLInputElement.h>
-#include <LibWeb/Bindings/InputEvent.h>
-#include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/SelectorMatching.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
@@ -34,6 +36,7 @@
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/IDLEventListener.h>
+#include <LibWeb/DOM/Node.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
@@ -46,28 +49,26 @@
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
+#include <LibWeb/HTML/RadioButtonGroupRegistry.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/Infra/CharacterTypes.h>
-#include <LibWeb/Layout/BlockContainer.h>
-#include <LibWeb/Layout/CheckBox.h>
-#include <LibWeb/Layout/ImageBox.h>
-#include <LibWeb/Layout/RadioButton.h>
-#include <LibWeb/Layout/RangeInputBox.h>
-#include <LibWeb/Layout/TextInputBox.h>
-#include <LibWeb/MimeSniff/MimeType.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/MimeSniff/Resource.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/InputEvent.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
+#include <LibWebCommon/HTML/SelectedFile.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
+#include <LibWebCommon/MimeSniff/MimeType.h>
 
 namespace {
 
@@ -92,6 +93,19 @@ namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLInputElement);
 
+Layout::Node const* HTMLInputElement::image_provider_layout_node() const
+{
+    return unsafe_layout_node();
+}
+
+static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name, DOM::EventInit const& event_init = {})
+{
+    return DOM::Event::create(
+        event_name,
+        event_init,
+        HighResolutionTime::current_high_resolution_time(relevant_global_object(element)));
+}
+
 HTMLInputElement::HTMLInputElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))
 {
@@ -99,10 +113,15 @@ HTMLInputElement::HTMLInputElement(DOM::Document& document, DOM::QualifiedName q
 
 HTMLInputElement::~HTMLInputElement() = default;
 
-void HTMLInputElement::initialize(JS::Realm& realm)
+// `:user-valid` and `:user-invalid` turn on the first time the user has interacted with the
+// control, which no attribute and no value says. The style engine is told what the element now
+// holds rather than asking.
+void HTMLInputElement::set_user_validity(bool flag)
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLInputElement);
-    Base::initialize(realm);
+    if (m_user_validity == flag)
+        return;
+    m_user_validity = flag;
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
 }
 
 void HTMLInputElement::visit_edges(Cell::Visitor& visitor)
@@ -110,6 +129,7 @@ void HTMLInputElement::visit_edges(Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     visitor.visit(m_inner_text_element);
     visitor.visit(m_text_node);
+    visitor.visit(m_image_button_alt_text_node);
     visitor.visit(m_placeholder_element);
     visitor.visit(m_placeholder_text_node);
     visitor.visit(m_up_button_element);
@@ -118,6 +138,7 @@ void HTMLInputElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_file_button);
     visitor.visit(m_file_label);
     visitor.visit(m_legacy_pre_activation_behavior_checked_element_in_group);
+    visitor.visit(m_radio_button_group_registry);
     visitor.visit(m_selected_files);
     visitor.visit(m_slider_runnable_track);
     visitor.visit(m_slider_progress_element);
@@ -136,73 +157,38 @@ void HTMLInputElement::adopted_from(DOM::Document& old_document)
 void HTMLInputElement::set_being_activated(bool activated)
 {
     Base::set_being_activated(activated);
-    if (first_is_one_of(type_state(), TypeAttributeState::Checkbox, TypeAttributeState::RadioButton))
-        set_needs_repaint();
+    if (first_is_one_of(type_state(), TypeAttributeState::Checkbox, TypeAttributeState::RadioButton)) {
+        Painting::push_form_control_paint_facts(*this);
+        set_needs_repaint(InvalidateDisplayList::PaintCommands);
+    }
 }
 
-RefPtr<Layout::Node> HTMLInputElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+CSS::ElementBoxKind HTMLInputElement::box_kind() const
 {
-    if (type_state() == TypeAttributeState::Hidden)
-        return nullptr;
-
-    // NOTE: Image inputs are `appearance: none` per the default UA style,
-    //       but we still need to create an ImageBox for them, or no image will get loaded.
-    if (type_state() == TypeAttributeState::ImageButton) {
-        return make_ref_counted<Layout::ImageBox>(document(), *this, style, *this);
-    }
-
-    // https://drafts.csswg.org/css-ui/#appearance-switching
-    // This specification introduces the appearance property to provide some control over this behavior.
-    // In particular, using appearance: none allows authors to suppress the native appearance of widgets,
-    // giving them a primitive appearance where CSS can be used to restyle them.
-    if (style->appearance() == CSS::Appearance::None) {
-        return Element::create_layout_node_for_display_type(document(), style->display(), style, this);
-    }
-
     switch (type_state()) {
-
+    case TypeAttributeState::Hidden:
+        return CSS::ElementBoxKind::NoBox;
+    // NOTE: Image inputs are `appearance: none` per the default UA style, but they still need an image box, or no
+    //       image will get loaded.
+    case TypeAttributeState::ImageButton:
+        if (renders_as_alt_text() && !get_attribute_value(HTML::AttributeNames::alt).is_empty())
+            return CSS::ElementBoxKind::FromDisplay;
+        return CSS::ElementBoxKind::Image;
     case TypeAttributeState::SubmitButton:
     case TypeAttributeState::Button:
     case TypeAttributeState::ResetButton:
-        return make_ref_counted<Layout::BlockContainer>(document(), this, style);
+        return CSS::ElementBoxKind::InputButton;
     case TypeAttributeState::Checkbox:
-        return make_ref_counted<Layout::CheckBox>(document(), *this, style);
+        return CSS::ElementBoxKind::InputCheckBox;
     case TypeAttributeState::RadioButton:
-        return make_ref_counted<Layout::RadioButton>(document(), *this, style);
+        return CSS::ElementBoxKind::InputRadioButton;
     case TypeAttributeState::Range:
-        return make_ref_counted<Layout::RangeInputBox>(document(), *this, style);
+        return CSS::ElementBoxKind::InputRange;
     case TypeAttributeState::Color:
     case TypeAttributeState::FileUpload:
-        return Element::create_layout_node_for_display_type(document(), style->display(), style, this);
+        return CSS::ElementBoxKind::FromDisplay;
     default:
-        return make_ref_counted<Layout::TextInputBox>(document(), *this, style);
-    }
-}
-
-void HTMLInputElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
-{
-    if (type_state() == TypeAttributeState::Hidden || type_state() == TypeAttributeState::SubmitButton || type_state() == TypeAttributeState::Button || type_state() == TypeAttributeState::ResetButton || type_state() == TypeAttributeState::ImageButton || type_state() == TypeAttributeState::Checkbox || type_state() == TypeAttributeState::RadioButton)
-        return;
-
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
-
-    // AD-HOC: We rewrite `display: inline` to `display: inline-block`.
-    //         This is required for the internal shadow tree to work correctly in layout.
-    if (style.display().is_inline_outside() && style.display().is_flow_inside())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::InlineBlock)));
-
-    // https://drafts.csswg.org/css-ui-4/#input-rules
-    // * The content is vertically centered
-    // NB: Blink, WebKit, and Gecko clamp single-line input text to the font's normal line height. This prevents a
-    //     smaller author-specified line height from clipping glyph ink inside the vertically centered editor.
-    if (is_single_line()) {
-        auto current_line_height = style.line_height(document().font_computer()).to_double();
-        auto minimum_line_height = CSS::ComputedProperties::normal_line_height(style.first_available_computed_font(document().font_computer())->pixel_metrics()).to_double();
-
-        if (current_line_height < minimum_line_height)
-            style.set_property(CSS::PropertyID::LineHeight, CSS::KeywordStyleValue::create(CSS::Keyword::Normal));
+        return CSS::ElementBoxKind::InputText;
     }
 }
 
@@ -216,21 +202,32 @@ void HTMLInputElement::set_checked(bool checked)
 
     m_checked = checked;
 
-    CSS::Invalidation::invalidate_style_after_checked_state_change(*this, DOM::StyleInvalidationReason::HTMLInputElementSetChecked);
+    CSS::Invalidation::invalidate_style_after_checked_state_change(*this);
 
-    set_needs_repaint();
+    // Checkedness decides value-missing validity: for a checkbox its own, and for a radio button
+    // that of every member of its radio button group.
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
-    // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
-    if (type_state() == TypeAttributeState::RadioButton && checked) {
-        // No point iterating the tree if we have an empty name.
-        if (!name().has_value() || name()->is_empty())
-            return;
+    Painting::push_form_control_paint_facts(*this);
+    set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
+    // NB: The registry unchecks the other members of the group and republishes their validity. The tree walks
+    //     below are a fallback for radio buttons that have no registry.
+    if (m_radio_button_group_registry) {
+        m_radio_button_group_registry->checked_state_changed(m_radio_button_group_name, *this);
+    } else if (type_state() == TypeAttributeState::RadioButton && name().has_value() && !name()->is_empty()) {
         root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-            if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
-                element.set_checked(false);
+            if (&element != this && is_in_same_radio_button_group_as(element))
+                CSS::Invalidation::invalidate_style_after_validity_change(element);
             return TraversalDecision::Continue;
         });
+        if (checked) {
+            root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
+                if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
+                    element.set_checked(false);
+                return TraversalDecision::Continue;
+            });
+        }
     }
 }
 
@@ -245,7 +242,12 @@ bool HTMLInputElement::indeterminate() const
 void HTMLInputElement::set_indeterminate(bool value)
 {
     // The indeterminate setter steps are to set this's indeterminateness to the given value.
+    if (m_indeterminateness == value)
+        return;
     m_indeterminateness = value;
+    CSS::Invalidation::invalidate_style_after_indeterminate_state_change(*this, value);
+    Painting::push_form_control_paint_facts(*this);
+    set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-list
@@ -325,7 +327,7 @@ GC::Ptr<FileAPI::FileList> HTMLInputElement::files()
         return nullptr;
 
     if (!m_selected_files)
-        m_selected_files = FileAPI::FileList::create(realm());
+        m_selected_files = FileAPI::FileList::create();
     return m_selected_files;
 }
 
@@ -347,7 +349,7 @@ FileFilter HTMLInputElement::parse_accept_attribute() const
 
     // If specified, the attribute must consist of a set of comma-separated tokens, each of which must be an ASCII
     // case-insensitive match for one of the following:
-    auto accept = get_attribute_value_view(HTML::AttributeNames::accept).value_or({});
+    auto accept = attribute(HTML::AttributeNames::accept).value_or({});
 
     accept.for_each_split_view(',', SplitBehavior::Nothing, [&](Utf16View value) {
         // The string "audio/*"
@@ -388,16 +390,15 @@ void HTMLInputElement::update_the_file_selection(GC::Ref<FileAPI::FileList> file
     // https://github.com/whatwg/html/issues/1080
     // INTEROP: Other engines perform these steps synchronously once the user has selected the files.
 
-    // 1. Update element's selected files so that it represents the user's selection.
     set_files(files.ptr());
 
     // 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
-    auto input_event = DOM::Event::create(realm(), EventNames::input, { .bubbles = true, .composed = true });
-    dispatch_event(input_event);
+    auto input_event = create_event_for_element(*this, EventNames::input, { .bubbles = true, .composed = true });
+    this->dispatch_event(input_event);
 
     // 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
-    auto change_event = DOM::Event::create(realm(), EventNames::change, { .bubbles = true });
-    dispatch_event(change_event);
+    auto change_event = create_event_for_element(*this, EventNames::change, { .bubbles = true });
+    this->dispatch_event(change_event);
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#show-the-picker,-if-applicable
@@ -406,11 +407,10 @@ static void show_the_picker_if_applicable(HTMLInputElement& element)
     // To show the picker, if applicable for an input element element:
 
     // 1. If element's relevant global object does not have transient activation, then return.
-    auto& global_object = relevant_global_object(element);
-    if (!is<HTML::Window>(global_object))
+    auto* relevant_window = window_from_global_object(relevant_global_object(element));
+    if (!relevant_window)
         return;
-    auto& relevant_global_object = static_cast<HTML::Window&>(global_object);
-    if (!relevant_global_object.has_transient_activation())
+    if (!relevant_window->has_transient_activation())
         return;
 
     // 2. If element is not mutable, then return.
@@ -418,7 +418,7 @@ static void show_the_picker_if_applicable(HTMLInputElement& element)
         return;
 
     // 3. Consume user activation given element's relevant global object.
-    relevant_global_object.consume_user_activation();
+    relevant_window->consume_user_activation();
 
     // 4. If element does not support a picker, then return.
     if (!element.supports_a_picker())
@@ -445,7 +445,7 @@ static void show_the_picker_if_applicable(HTMLInputElement& element)
             auto weak_element = GC::Weak<HTMLInputElement> { element };
 
             element.set_is_open(true);
-            element.document().browsing_context()->top_level_browsing_context()->page().did_request_file_picker(weak_element, accepted_file_types, allow_multiple_files);
+            element.document().page().did_request_file_picker(weak_element, accepted_file_types, allow_multiple_files);
         }
         // 4. If dismissed is true or if the user dismissed the prompt without changing their selection,
         //    then queue an element task on the user interaction task source given element to fire an event named cancel at element,
@@ -468,7 +468,7 @@ static void show_the_picker_if_applicable(HTMLInputElement& element)
         if (element.type_state() == HTMLInputElement::TypeAttributeState::Color) {
             auto weak_element = GC::Weak<HTMLInputElement> { element };
             element.set_is_open(true);
-            element.document().browsing_context()->top_level_browsing_context()->page().did_request_color_picker(weak_element, Color::from_utf16_string(element.value()).value_or(Color(0, 0, 0)));
+            element.document().page().did_request_color_picker(weak_element, Color::from_utf16_string(element.value()).value_or(Color(0, 0, 0)));
         }
     }
 }
@@ -480,7 +480,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::show_picker()
 
     // 1. If this is not mutable, then throw an "InvalidStateError" DOMException.
     if (!is_mutable())
-        return WebIDL::InvalidStateError::create(realm(), "Element is not mutable"_utf16);
+        return WebIDL::InvalidStateError::create("Element is not mutable"_utf16);
 
     // 2. If this's relevant settings object's origin is not same origin with this's relevant settings object's top-level origin,
     // and this's type attribute is not in the File Upload state or Color state, then throw a "SecurityError" DOMException.
@@ -488,14 +488,13 @@ WebIDL::ExceptionOr<void> HTMLInputElement::show_picker()
     //       and has never been guarded by an origin check.
     if (!relevant_settings_object(*this).origin().is_same_origin(relevant_settings_object(*this).top_level_origin.value())
         && m_type != TypeAttributeState::FileUpload && m_type != TypeAttributeState::Color) {
-        return WebIDL::SecurityError::create(realm(), "Cross origin pickers are not allowed"_utf16);
+        return WebIDL::SecurityError::create("Cross origin pickers are not allowed"_utf16);
     }
 
     // 3. If this's relevant global object does not have transient activation, then throw a "NotAllowedError" DOMException.
-    // FIXME: The global object we get here should probably not need casted to Window to check for transient activation
-    auto& global_object = relevant_global_object(*this);
-    if (!is<HTML::Window>(global_object) || !static_cast<HTML::Window&>(global_object).has_transient_activation()) {
-        return WebIDL::NotAllowedError::create(realm(), "Too long since user activation to show picker"_utf16);
+    auto* relevant_window = window_from_global_object(relevant_global_object(*this));
+    if (!relevant_window || !relevant_window->has_transient_activation()) {
+        return WebIDL::NotAllowedError::create("Too long since user activation to show picker"_utf16);
     }
 
     // 4. Show the picker, if applicable, for this.
@@ -512,13 +511,13 @@ WebIDL::ExceptionOr<void> HTMLInputElement::run_input_activation_behavior(DOM::E
             return {};
 
         // 2. Fire an event named input at the element with the bubbles and composed attributes initialized to true.
-        auto input_event = DOM::Event::create(realm(), HTML::EventNames::input);
+        auto input_event = create_event_for_element(*this, HTML::EventNames::input);
         input_event->set_bubbles(true);
         input_event->set_composed(true);
         dispatch_event(input_event);
 
         // 3. Fire an event named change at the element with the bubbles attribute initialized to true.
-        auto change_event = DOM::Event::create(realm(), HTML::EventNames::change);
+        auto change_event = create_event_for_element(*this, HTML::EventNames::change);
         change_event->set_bubbles(true);
         dispatch_event(*change_event);
     }
@@ -625,7 +624,7 @@ void HTMLInputElement::did_pick_color(Optional<Color> picked_color, ColorPickerU
             CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
             // and fire an event named change at the input element, with the bubbles attribute initialized to true.
-            auto change_event = DOM::Event::create(realm(), HTML::EventNames::change);
+            auto change_event = create_event_for_element(*this, HTML::EventNames::change);
             change_event->set_bubbles(true);
             dispatch_event(*change_event);
         }
@@ -641,27 +640,29 @@ void HTMLInputElement::did_select_files(Span<SelectedFile> selected_files, Multi
     //    interaction task source given element to fire an event named cancel at element, with the bubbles attribute
     //    initialized to true.
     if (selected_files.is_empty()) {
-        // https://github.com/whatwg/html/issues/1080
-        // INTEROP: Other engines dispatch this event synchronously once the file picker closes.
-        dispatch_event(DOM::Event::create(realm(), HTML::EventNames::cancel, { .bubbles = true }));
+        queue_an_element_task(HTML::Task::Source::UserInteraction, [this]() {
+            dispatch_event(create_event_for_element(*this, HTML::EventNames::cancel, { .bubbles = true }));
+        });
 
         return;
     }
 
-    auto files = FileAPI::FileList::create(realm());
+    auto files = FileAPI::FileList::create();
 
     for (auto& selected_file : selected_files) {
         auto contents = selected_file.take_contents();
 
         auto mime_type = MimeSniff::Resource::sniff(contents);
-        auto type = Utf16String::from_ascii_without_validation(mime_type.essence().bytes());
-        auto blob = FileAPI::Blob::create(realm(), move(contents), type);
+        auto blob = FileAPI::Blob::create(move(contents), mime_type.essence());
+
+        // FIXME: The FileAPI should use ByteString for file names.
+        auto file_name = selected_file.name();
 
         // FIXME: Fill in other fields (e.g. last_modified).
-        Bindings::FilePropertyBag options {};
-        options.type = move(type);
+        FileAPI::FilePropertyBag options {};
+        options.type = Utf16String::from_ascii_without_validation(mime_type.essence().bytes());
 
-        auto file = MUST(FileAPI::File::create(realm(), { { blob } }, selected_file.name(), move(options)));
+        auto file = MUST(FileAPI::File::create({ { blob } }, file_name, move(options)));
         files->add_file(file);
     }
 
@@ -682,10 +683,10 @@ void HTMLInputElement::did_select_files(Span<SelectedFile> selected_files, Multi
     update_file_input_shadow_tree();
 
     // 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
-    dispatch_event(DOM::Event::create(realm(), HTML::EventNames::input, { .bubbles = true, .composed = true }));
+    dispatch_event(create_event_for_element(*this, HTML::EventNames::input, { .bubbles = true, .composed = true }));
 
     // 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
-    dispatch_event(DOM::Event::create(realm(), HTML::EventNames::change, { .bubbles = true }));
+    dispatch_event(create_event_for_element(*this, HTML::EventNames::change, { .bubbles = true }));
 }
 
 Utf16String HTMLInputElement::value() const
@@ -766,8 +767,6 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_relevant_value(Utf16View value)
 
 WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
 {
-    auto& realm = this->realm();
-
     switch (value_attribute_mode()) {
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-value
     case ValueAttributeMode::Value: {
@@ -796,9 +795,10 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
             if (m_text_node) {
                 m_text_node->set_data(m_value);
                 update_placeholder_visibility();
-
-                set_the_selection_range(m_text_node->length(), m_text_node->length());
             }
+
+            if (selection_or_range_applies())
+                set_the_selection_range(m_value.length_in_code_units(), m_value.length_in_code_units());
 
             update_shadow_tree();
         }
@@ -818,7 +818,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
     case ValueAttributeMode::Filename:
         // On setting, if the new value is the empty string, empty the list of selected files; otherwise, throw an "InvalidStateError" DOMException.
         if (!value.is_empty())
-            return WebIDL::InvalidStateError::create(realm, "Setting value of input type file to non-empty string"_utf16);
+            return WebIDL::InvalidStateError::create("Setting value of input type file to non-empty string"_utf16);
 
         m_selected_files = nullptr;
         break;
@@ -850,7 +850,7 @@ void HTMLInputElement::commit_pending_changes()
 
     m_has_uncommitted_changes = false;
 
-    auto change_event = DOM::Event::create(realm(), HTML::EventNames::change, { .bubbles = true });
+    auto change_event = create_event_for_element(*this, HTML::EventNames::change, { .bubbles = true });
     dispatch_event(change_event);
 }
 
@@ -858,8 +858,8 @@ static GC::Ref<CSS::CSSStyleProperties> stepper_button_style_when_visible()
 {
     static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(uR"~~~(
+        style = CSS::CSSStyleProperties::create({}, {});
+        style->set_declarations_from_text(R"~~~(
                 padding: 0;
                 cursor: default;
             )~~~"sv);
@@ -871,8 +871,8 @@ static GC::Ref<CSS::CSSStyleProperties> stepper_button_style_when_hidden()
 {
     static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(uR"~~~(
+        style = CSS::CSSStyleProperties::create({}, {});
+        style->set_declarations_from_text(R"~~~(
                 display: none;
             )~~~"sv);
     }
@@ -883,8 +883,9 @@ static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_visible()
 {
     static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(uR"~~~(
+        style = CSS::CSSStyleProperties::create({}, {});
+        style->set_declarations_from_text(R"~~~(
+                display: block;
                 width: 100%;
                 height: 1lh;
                 overflow: hidden;
@@ -902,20 +903,24 @@ static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_hidden()
 {
     static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
     if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(u"display: none;"sv);
+        style = CSS::CSSStyleProperties::create({}, {});
+        style->set_declarations_from_text("display: none;"sv);
     }
     return *style;
 }
 
 void HTMLInputElement::update_placeholder_visibility()
 {
+    // Whether the placeholder shows is decided by the control's value, which no attribute carries,
+    // so `:placeholder-shown` moves with it and the style engine has to be told.
+    CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
+
     if (!m_placeholder_element)
         return;
     if (this->placeholder_value().has_value())
-        m_placeholder_element->set_inline_style(placeholder_style_when_visible());
+        set_own_inline_style(*m_placeholder_element, placeholder_style_when_visible());
     else
-        m_placeholder_element->set_inline_style(placeholder_style_when_hidden());
+        set_own_inline_style(*m_placeholder_element, placeholder_style_when_hidden());
 }
 
 Utf16String HTMLInputElement::button_label() const
@@ -956,14 +961,14 @@ void HTMLInputElement::update_text_input_shadow_tree()
 {
     update_placeholder_visibility();
 
-    if (m_type == TypeAttributeState::Number) {
+    if (m_type == TypeAttributeState::Number && m_up_button_element && m_down_button_element) {
         // The `textfield` appearance is used to hide the stepper buttons.
-        if (auto style = computed_values(); style && style->appearance() == CSS::Appearance::Textfield) {
-            m_up_button_element->set_inline_style(stepper_button_style_when_hidden());
-            m_down_button_element->set_inline_style(stepper_button_style_when_hidden());
+        if (auto style = computed_style(); style && style->appearance() == CSS::Appearance::Textfield) {
+            set_own_inline_style(*m_up_button_element, stepper_button_style_when_hidden());
+            set_own_inline_style(*m_down_button_element, stepper_button_style_when_hidden());
         } else {
-            m_up_button_element->set_inline_style(stepper_button_style_when_visible());
-            m_down_button_element->set_inline_style(stepper_button_style_when_visible());
+            set_own_inline_style(*m_up_button_element, stepper_button_style_when_visible());
+            set_own_inline_style(*m_down_button_element, stepper_button_style_when_visible());
         }
     }
 }
@@ -1057,7 +1062,7 @@ Utf16String HTMLInputElement::placeholder() const
 // https://html.spec.whatwg.org/multipage/input.html#attr-input-placeholder
 Optional<Utf16String> HTMLInputElement::placeholder_value() const
 {
-    if (!m_text_node || !m_text_node->data().is_empty())
+    if (!relevant_value().is_empty())
         return {};
     if (!is_allowed_to_have_placeholder(type_state()))
         return {};
@@ -1082,6 +1087,8 @@ void HTMLInputElement::create_shadow_tree_if_needed()
         create_button_input_shadow_tree();
         break;
     case TypeAttributeState::ImageButton:
+        if (renders_as_alt_text() && !get_attribute_value(HTML::AttributeNames::alt).is_empty())
+            create_image_button_alt_text_shadow_tree();
         break;
     case TypeAttributeState::Color:
         create_color_input_shadow_tree();
@@ -1116,6 +1123,9 @@ void HTMLInputElement::update_shadow_tree()
     case TypeAttributeState::SubmitButton:
         update_button_input_shadow_tree();
         break;
+    case TypeAttributeState::ImageButton:
+        update_image_button_alt_text_shadow_tree();
+        break;
     default:
         update_text_input_shadow_tree();
         break;
@@ -1124,20 +1134,68 @@ void HTMLInputElement::update_shadow_tree()
 
 void HTMLInputElement::create_button_input_shadow_tree()
 {
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
     shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
     auto text_container = MUST(DOM::create_element(document(), HTML::TagNames::span, Namespace::HTML));
     text_container->set_attribute_value(HTML::AttributeNames::style, "display: inline-block; pointer-events: none;"_utf16);
 
-    m_text_node = realm().create<DOM::Text>(document(), button_label());
+    m_text_node = DOM::Text::create(document(), button_label());
     MUST(text_container->append_child(*m_text_node));
     MUST(shadow_root->append_child(*text_container));
 }
 
+void HTMLInputElement::create_image_button_alt_text_shadow_tree()
+{
+    VERIFY(!shadow_root());
+
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, DOM::ShadowRootMode::Closed);
+    shadow_root->set_user_agent_internal(true);
+    set_shadow_root(shadow_root);
+
+    auto wrapper = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+    // Keep the wrapper from introducing a block or a bidi isolate so the fallback behaves as
+    // ordinary phrasing content.
+    wrapper->set_attribute_value(HTML::AttributeNames::style, "display: inline; unicode-bidi: normal;"_utf16);
+    m_image_button_alt_text_node = DOM::Text::create(document(), get_attribute_value(HTML::AttributeNames::alt));
+    MUST(wrapper->append_child(*m_image_button_alt_text_node));
+    MUST(shadow_root->append_child(*wrapper));
+}
+
+void HTMLInputElement::remove_image_button_alt_text_shadow_tree()
+{
+    if (!m_image_button_alt_text_node)
+        return;
+
+    set_shadow_root(nullptr);
+    m_image_button_alt_text_node = nullptr;
+}
+
+void HTMLInputElement::update_image_button_alt_text_shadow_tree()
+{
+    // Whether an image button renders as its alternative text decides which box it asks for.
+    CSS::record_element_box_kind(*this);
+
+    if (!shadow_root() && !has_style())
+        return;
+
+    auto alt_text = get_attribute_value(HTML::AttributeNames::alt);
+    if (type_state() != TypeAttributeState::ImageButton || !renders_as_alt_text() || alt_text.is_empty()) {
+        remove_image_button_alt_text_shadow_tree();
+        return;
+    }
+
+    if (!m_image_button_alt_text_node) {
+        create_image_button_alt_text_shadow_tree();
+        return;
+    }
+
+    m_image_button_alt_text_node->set_data(alt_text);
+}
+
 void HTMLInputElement::create_text_input_shadow_tree()
 {
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
     shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
 
@@ -1145,8 +1203,8 @@ void HTMLInputElement::create_text_input_shadow_tree()
     {
         static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
         if (!style) {
-            style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-            style->set_declarations_from_text(uR"~~~(
+            style = CSS::CSSStyleProperties::create({}, {});
+            style->set_declarations_from_text(R"~~~(
                 display: flex;
                 height: 100%;
                 align-items: center;
@@ -1154,7 +1212,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
                 border: none;
             )~~~"sv);
         }
-        element->set_inline_style(*style);
+        set_own_inline_style(*element, *style);
     }
     MUST(shadow_root->append_child(element));
 
@@ -1164,7 +1222,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
         {
             static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
             if (!style) {
-                style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
+                style = CSS::CSSStyleProperties::create({}, {});
                 style->set_declarations_from_text(uR"~~~(
                     display: flex;
                     align-items: center;
@@ -1172,7 +1230,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
                     min-width: 0;
                 )~~~"sv);
             }
-            text_container->set_inline_style(*style);
+            set_own_inline_style(*text_container, *style);
         }
         MUST(element->append_child(*text_container));
     }
@@ -1182,8 +1240,8 @@ void HTMLInputElement::create_text_input_shadow_tree()
     {
         static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
         if (!style) {
-            style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-            style->set_declarations_from_text(uR"~~~(
+            style = CSS::CSSStyleProperties::create({}, {});
+            style->set_declarations_from_text(R"~~~(
                 width: 100%;
                 height: 1lh;
                 overflow: auto;
@@ -1192,11 +1250,11 @@ void HTMLInputElement::create_text_input_shadow_tree()
                 white-space: pre;
             )~~~"sv);
         }
-        m_inner_text_element->set_inline_style(*style);
+        set_own_inline_style(*m_inner_text_element, *style);
     }
     MUST(text_container->append_child(*m_inner_text_element));
 
-    m_text_node = realm().create<DOM::Text>(document(), m_value);
+    m_text_node = DOM::Text::create(document(), m_value);
     if (type_state() == TypeAttributeState::Password)
         m_text_node->set_is_password_input({}, true);
     handle_maxlength_attribute();
@@ -1206,12 +1264,16 @@ void HTMLInputElement::create_text_input_shadow_tree()
     MUST(text_container->append_child(*m_placeholder_element));
     m_placeholder_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::Placeholder);
 
-    m_placeholder_text_node = realm().create<DOM::Text>(document(), placeholder());
+    m_placeholder_text_node = DOM::Text::create(document(), placeholder());
     MUST(m_placeholder_element->append_child(*m_placeholder_text_node));
 
     if (type_state() == TypeAttributeState::Number) {
+        // NB: The buttons start out with the style they have when shown, so that the style application that follows
+        //     only rewrites their declarations when appearance hides them.
+
         // Up button
         m_up_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
+        set_own_inline_style(*m_up_button_element, stepper_button_style_when_visible());
 
         auto up_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
         up_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_utf16);
@@ -1227,30 +1289,31 @@ void HTMLInputElement::create_text_input_shadow_tree()
         MUST(element->append_child(*m_up_button_element));
 
         auto mouseup_callback_function = JS::NativeFunction::create(
-            realm(), [this](JS::VM&) {
+            HTML::relevant_realm(*this), [this](JS::VM&) {
                 commit_pending_changes();
                 return JS::js_undefined();
             },
-            0, Utf16FlyString {}, &realm());
-        auto mouseup_callback = realm().heap().allocate<WebIDL::CallbackType>(*mouseup_callback_function, realm());
-        Bindings::AddEventListenerOptions mouseup_listener_options;
+            0, Utf16FlyString {}, &HTML::relevant_realm(*this));
+        auto mouseup_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mouseup_callback_function, HTML::relevant_realm(*this));
+        DOM::EventTarget::AddEventListenerOptions mouseup_listener_options;
         mouseup_listener_options.once = true;
 
         auto up_callback_function = JS::NativeFunction::create(
-            realm(), [this](JS::VM&) {
+            HTML::relevant_realm(*this), [this](JS::VM&) {
                 if (type_state() == TypeAttributeState::Number && is_mutable() && allowed_value_step().has_value()) {
                     MUST(step_up());
                     user_interaction_did_change_input_value();
                 }
                 return JS::js_undefined();
             },
-            0, Utf16FlyString {}, &realm());
-        auto step_up_callback = realm().heap().allocate<WebIDL::CallbackType>(*up_callback_function, realm());
-        m_up_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(realm(), step_up_callback));
-        m_up_button_element->add_event_listener_without_options(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(realm(), mouseup_callback));
+            0, Utf16FlyString {}, &HTML::relevant_realm(*this));
+        auto step_up_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*up_callback_function, HTML::relevant_realm(*this));
+        m_up_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(step_up_callback));
+        m_up_button_element->add_event_listener_without_options(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(mouseup_callback));
 
         // Down button
         m_down_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
+        set_own_inline_style(*m_down_button_element, stepper_button_style_when_visible());
 
         auto down_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
         down_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_utf16);
@@ -1266,17 +1329,17 @@ void HTMLInputElement::create_text_input_shadow_tree()
         MUST(element->append_child(*m_down_button_element));
 
         auto down_callback_function = JS::NativeFunction::create(
-            realm(), [this](JS::VM&) {
+            HTML::relevant_realm(*this), [this](JS::VM&) {
                 if (type_state() == TypeAttributeState::Number && is_mutable() && allowed_value_step().has_value()) {
                     MUST(step_down());
                     user_interaction_did_change_input_value();
                 }
                 return JS::js_undefined();
             },
-            0, Utf16FlyString {}, &realm());
-        auto step_down_callback = realm().heap().allocate<WebIDL::CallbackType>(*down_callback_function, realm());
-        m_down_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(realm(), step_down_callback));
-        m_down_button_element->add_event_listener_without_options(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(realm(), mouseup_callback));
+            0, Utf16FlyString {}, &HTML::relevant_realm(*this));
+        auto step_down_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*down_callback_function, HTML::relevant_realm(*this));
+        m_down_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(step_down_callback));
+        m_down_button_element->add_event_listener_without_options(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(mouseup_callback));
     }
 
     update_text_input_shadow_tree();
@@ -1284,7 +1347,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
 
 void HTMLInputElement::create_color_input_shadow_tree()
 {
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
     shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
 
@@ -1306,7 +1369,7 @@ void HTMLInputElement::create_color_input_shadow_tree()
         border: 1px solid ButtonBorder;
         box-sizing: border-box;
 )~~~"_utf16);
-    MUST(m_color_well_element->style_for_bindings()->set_property(CSS::PropertyID::BackgroundColor, color.utf16_view()));
+    MUST(m_color_well_element->style()->set_property(CSS::PropertyID::BackgroundColor, color.utf16_view()));
 
     MUST(border->append_child(*m_color_well_element));
     MUST(shadow_root->append_child(border));
@@ -1317,14 +1380,12 @@ void HTMLInputElement::update_color_well_element()
     if (!m_color_well_element)
         return;
 
-    MUST(m_color_well_element->style_for_bindings()->set_property(CSS::PropertyID::BackgroundColor, m_value.utf16_view()));
+    MUST(m_color_well_element->style()->set_property(CSS::PropertyID::BackgroundColor, m_value.utf16_view()));
 }
 
 void HTMLInputElement::create_file_input_shadow_tree()
 {
-    auto& realm = this->realm();
-
-    auto shadow_root = realm.create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
     shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
 
@@ -1340,9 +1401,10 @@ void HTMLInputElement::create_file_input_shadow_tree()
         return JS::js_undefined();
     };
 
+    auto& realm = HTML::relevant_realm(*this);
     auto on_button_click_function = JS::NativeFunction::create(realm, move(on_button_click), 0, Utf16FlyString {}, &realm);
-    auto on_button_click_callback = realm.heap().allocate<WebIDL::CallbackType>(on_button_click_function, realm);
-    m_file_button->add_event_listener_without_options(UIEvents::EventNames::click, DOM::IDLEventListener::create(realm, on_button_click_callback));
+    auto on_button_click_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(on_button_click_function, realm);
+    m_file_button->add_event_listener_without_options(UIEvents::EventNames::click, DOM::IDLEventListener::create(on_button_click_callback));
 
     update_file_input_shadow_tree();
 
@@ -1369,12 +1431,21 @@ void HTMLInputElement::update_file_input_shadow_tree()
 
 void HTMLInputElement::create_range_input_shadow_tree()
 {
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
     shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
 
+    // NB: Center the track inside an internal flex container so author styles on
+    //     the input's display property do not affect its alignment.
+    auto slider_container = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+    MUST(slider_container->style()->set_property(CSS::PropertyID::Display, "flex"_utf16));
+    MUST(slider_container->style()->set_property(CSS::PropertyID::AlignItems, "center"_utf16));
+    MUST(slider_container->style()->set_property(CSS::PropertyID::Width, "100%"_utf16));
+    MUST(slider_container->style()->set_property(CSS::PropertyID::Height, "100%"_utf16));
+    MUST(shadow_root->append_child(*slider_container));
+
     m_slider_runnable_track = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(shadow_root->append_child(*m_slider_runnable_track));
+    MUST(slider_container->append_child(*m_slider_runnable_track));
     m_slider_runnable_track->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderTrack);
 
     m_slider_progress_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
@@ -1388,7 +1459,7 @@ void HTMLInputElement::create_range_input_shadow_tree()
     update_slider_shadow_tree_elements();
 
     auto keydown_callback_function = JS::NativeFunction::create(
-        realm(), [this](JS::VM& vm) {
+        HTML::relevant_realm(*this), [this](JS::VM& vm) {
             if (type_state() != TypeAttributeState::Range)
                 return JS::js_undefined();
             if (!allowed_value_step().has_value())
@@ -1411,12 +1482,12 @@ void HTMLInputElement::create_range_input_shadow_tree()
             user_interaction_did_change_input_value();
             return JS::js_undefined();
         },
-        0, Utf16FlyString {}, &realm());
-    auto keydown_callback = realm().heap().allocate<WebIDL::CallbackType>(*keydown_callback_function, realm());
-    add_event_listener_without_options(UIEvents::EventNames::keydown, DOM::IDLEventListener::create(realm(), keydown_callback));
+        0, Utf16FlyString {}, &HTML::relevant_realm(*this));
+    auto keydown_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*keydown_callback_function, HTML::relevant_realm(*this));
+    add_event_listener_without_options(UIEvents::EventNames::keydown, DOM::IDLEventListener::create(keydown_callback));
 
     auto wheel_callback_function = JS::NativeFunction::create(
-        realm(), [this](JS::VM& vm) {
+        HTML::relevant_realm(*this), [this](JS::VM& vm) {
             if (type_state() != TypeAttributeState::Range)
                 return JS::js_undefined();
             if (!allowed_value_step().has_value())
@@ -1432,14 +1503,16 @@ void HTMLInputElement::create_range_input_shadow_tree()
             user_interaction_did_change_input_value();
             return JS::js_undefined();
         },
-        0, Utf16FlyString {}, &realm());
-    auto wheel_callback = realm().heap().allocate<WebIDL::CallbackType>(*wheel_callback_function, realm());
-    add_event_listener_without_options(UIEvents::EventNames::wheel, DOM::IDLEventListener::create(realm(), wheel_callback));
+        0, Utf16FlyString {}, &HTML::relevant_realm(*this));
+    auto wheel_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*wheel_callback_function, HTML::relevant_realm(*this));
+    add_event_listener_without_options(UIEvents::EventNames::wheel, DOM::IDLEventListener::create(wheel_callback));
 
     auto update_slider_by_mouse = [this](JS::VM& vm) {
         if (type_state() != TypeAttributeState::Range)
             return;
-        auto event = vm.argument(0).as_if<UIEvents::MouseEvent>();
+        auto event = vm.argument(0).is_object()
+            ? Bindings::impl_from<UIEvents::MouseEvent>(&vm.argument(0).as_object())
+            : nullptr;
         if (!event)
             return;
         auto client_x = event->client_x();
@@ -1458,56 +1531,54 @@ void HTMLInputElement::create_range_input_shadow_tree()
     };
 
     auto mousedown_callback_function = JS::NativeFunction::create(
-        realm(), [this, update_slider_by_mouse](JS::VM& vm) {
+        HTML::relevant_realm(*this), [this, update_slider_by_mouse](JS::VM& vm) {
             update_slider_by_mouse(vm);
 
             auto mousemove_callback_function = JS::NativeFunction::create(
-                realm(), [update_slider_by_mouse](JS::VM& vm) {
+                HTML::relevant_realm(*this), [update_slider_by_mouse](JS::VM& vm) {
                     update_slider_by_mouse(vm);
                     return JS::js_undefined();
                 },
-                0, Utf16FlyString {}, &realm());
-            auto mousemove_callback = realm().heap().allocate<WebIDL::CallbackType>(*mousemove_callback_function, realm());
-            auto mousemove_listener = DOM::IDLEventListener::create(realm(), mousemove_callback);
-            auto& window = static_cast<HTML::Window&>(relevant_global_object(*this));
+                0, Utf16FlyString {}, &HTML::relevant_realm(*this));
+            auto mousemove_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mousemove_callback_function, HTML::relevant_realm(*this));
+            auto mousemove_listener = DOM::IDLEventListener::create(mousemove_callback);
+            auto& window = relevant_window(*this);
             window.add_event_listener_without_options(UIEvents::EventNames::mousemove, mousemove_listener);
 
             auto mouseup_callback_function = JS::NativeFunction::create(
-                realm(), [this, mousemove_listener](JS::VM&) {
-                    auto& window = static_cast<HTML::Window&>(relevant_global_object(*this));
+                HTML::relevant_realm(*this), [this, mousemove_listener](JS::VM&) {
+                    auto& window = relevant_window(*this);
                     window.remove_event_listener_without_options(UIEvents::EventNames::mousemove, mousemove_listener);
                     return JS::js_undefined();
                 },
-                0, Utf16FlyString {}, &realm());
-            auto mouseup_callback = realm().heap().allocate<WebIDL::CallbackType>(*mouseup_callback_function, realm());
-            Bindings::AddEventListenerOptions mouseup_listener_options;
+                0, Utf16FlyString {}, &HTML::relevant_realm(*this));
+            auto mouseup_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mouseup_callback_function, HTML::relevant_realm(*this));
+            DOM::EventTarget::AddEventListenerOptions mouseup_listener_options;
             mouseup_listener_options.once = true;
-            window.add_event_listener(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(realm(), mouseup_callback), mouseup_listener_options);
+            window.add_event_listener(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(mouseup_callback), mouseup_listener_options);
 
             return JS::js_undefined();
         },
-        0, Utf16FlyString {}, &realm());
-    auto mousedown_callback = realm().heap().allocate<WebIDL::CallbackType>(*mousedown_callback_function, realm());
-    add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(realm(), mousedown_callback));
+        0, Utf16FlyString {}, &HTML::relevant_realm(*this));
+    auto mousedown_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mousedown_callback_function, HTML::relevant_realm(*this));
+    add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(mousedown_callback));
 }
 
 void HTMLInputElement::user_interaction_did_change_input_value(Utf16FlyString const& input_type, Optional<Utf16String> const& data)
 {
     // https://html.spec.whatwg.org/multipage/input.html#common-input-element-events
     // For input elements without a defined input activation behavior, but to which these events apply,
-    // and for which the user interface involves both interactive manipulation and an explicit commit action,
-    // then when the user changes the element's value, the user agent must queue an element task on the user interaction task source
-    // given the input element to fire an event named input at the input element, with the bubbles and composed attributes initialized to true
-    // https://github.com/whatwg/html/issues/1080
-    // INTEROP: Other engines dispatch this event synchronously after changing the value. Controlled form controls
-    //          rely on observing each change before rendering can restore an older value.
-    // https://w3c.github.io/uievents/#event-type-input
-    Bindings::InputEventInit input_event_init;
+    // Although HTML specifies queuing this event, Blink, WebKit, and Gecko dispatch it
+    // synchronously. Controlled form controls rely on observing each edit before rendering
+    // can restore an older value.
+    UIEvents::InputEventInit input_event_init;
     input_event_init.bubbles = true;
     input_event_init.composed = true;
     input_event_init.input_type = input_type;
     input_event_init.data = data;
-    auto input_event = UIEvents::InputEvent::create_from_platform_event(realm(), HTML::EventNames::input, input_event_init);
+    // https://w3c.github.io/uievents/#dom-inputevent-iscomposing
+    input_event_init.is_composing = document().is_input_method_composing();
+    auto input_event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, input_event_init, {}, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
     dispatch_event(*input_event);
     // and any time the user commits the change, the user agent must queue an element task on the user interaction task source given the input
     // element to set its user validity to true and fire an event named change at the input element, with the bubbles attribute initialized to true.
@@ -1521,21 +1592,25 @@ void HTMLInputElement::update_slider_shadow_tree_elements()
     double maximum = *max();
     double position = (value - minimum) / (maximum - minimum) * 100;
 
-    if (m_slider_progress_element)
-        MUST(m_slider_progress_element->style_for_bindings()->set_property(CSS::PropertyID::Width, Utf16String::formatted("{}%", position)));
+    if (m_slider_progress_element) {
+        auto width = Utf16String::formatted("{}%", position);
+        MUST(m_slider_progress_element->style()->set_property(CSS::PropertyID::Width, width.utf16_view()));
+    }
 
-    if (m_slider_thumb)
-        MUST(m_slider_thumb->style_for_bindings()->set_property(CSS::PropertyID::MarginLeft, Utf16String::formatted("{}%", position)));
+    if (m_slider_thumb) {
+        auto margin_left = Utf16String::formatted("{}%", position);
+        MUST(m_slider_thumb->style()->set_property(CSS::PropertyID::MarginLeft, margin_left.utf16_view()));
+    }
 }
 
 void HTMLInputElement::did_receive_focus()
 {
     if (!m_text_node)
         return;
-    m_text_node->set_needs_repaint();
+    m_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     if (m_placeholder_text_node)
-        m_placeholder_text_node->set_needs_repaint();
+        m_placeholder_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     if (has_selectable_text()) {
         if (document().last_focus_trigger() == FocusTrigger::Key)
@@ -1548,10 +1623,10 @@ void HTMLInputElement::did_receive_focus()
 void HTMLInputElement::did_lose_focus()
 {
     if (m_text_node)
-        m_text_node->set_needs_repaint();
+        m_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     if (m_placeholder_text_node)
-        m_placeholder_text_node->set_needs_repaint();
+        m_placeholder_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     commit_pending_changes();
 }
@@ -1608,8 +1683,8 @@ void HTMLInputElement::form_associated_element_attribute_changed(Utf16FlyString 
     } else if (name == HTML::AttributeNames::src) {
         handle_src_attribute(value.has_value() ? value->utf16_view() : u""sv).release_value_but_fixme_should_propagate_errors();
     } else if (name == HTML::AttributeNames::alt) {
-        if (unsafe_layout_node() && type_state() == TypeAttributeState::ImageButton)
-            did_update_alt_text(as<Layout::ImageBox>(*unsafe_layout_node()));
+        if (type_state() == TypeAttributeState::ImageButton)
+            update_image_button_alt_text_shadow_tree();
     } else if (name == HTML::AttributeNames::maxlength) {
         handle_maxlength_attribute();
     } else if (name == HTML::AttributeNames::multiple) {
@@ -1622,6 +1697,16 @@ void HTMLInputElement::form_associated_element_attribute_changed(Utf16FlyString 
             m_value = value_sanitization_algorithm(m_value);
             update_shadow_tree();
         }
+    } else if (name == HTML::AttributeNames::size) {
+        // size feeds the element's default preferred width, which reaches layout only
+        // through the replaced-content facts; nothing else schedules a relayout.
+        if (old_value != value)
+            set_needs_layout_update(DOM::SetNeedsLayoutReason::DefaultPreferredSizeAttributeChange);
+    } else if (name == HTML::AttributeNames::name) {
+        update_radio_button_group_registration();
+    } else if (name == HTML::AttributeNames::required) {
+        if (m_radio_button_group_registry && old_value.has_value() != value.has_value())
+            m_radio_button_group_registry->required_state_changed(m_radio_button_group_name, *this);
     }
 
     // AD-HOC: A change to any of these attributes can change whether the element satisfies its constraints, and
@@ -1640,11 +1725,13 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
     if (old_state == new_state)
         return;
 
+    auto was_default = SelectorMatching::element_matches_state(*this, CSS::PseudoClass::Default);
+    auto was_read_write = SelectorMatching::element_matches_state(*this, CSS::PseudoClass::ReadWrite);
     auto new_value_attribute_mode = value_attribute_mode_for_type_state(new_state);
     auto old_value_attribute_mode = value_attribute_mode_for_type_state(old_state);
 
     if (checked_applies(old_state) != checked_applies(new_state)) {
-        CSS::Invalidation::invalidate_style_after_checked_state_change(*this, DOM::StyleInvalidationReason::HTMLInputElementSetType);
+        CSS::Invalidation::invalidate_style_after_checked_state_change(*this);
     }
 
     // 1. If the previous state of the element's type attribute put the value IDL attribute in the value mode, and the element's
@@ -1675,9 +1762,24 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
 
     // 4. Update the element's rendering and behavior to the new state's.
     m_type = new_state;
+    // Only the Image Button state maps align, border, width, height, hspace and vspace to hints,
+    // so entering or leaving it changes the element's hints without any attribute changing.
+    if ((old_state == TypeAttributeState::ImageButton) != (new_state == TypeAttributeState::ImageButton))
+        CSS::republish_presentational_hints(*this);
+    update_radio_button_group_registration();
+    if (auto* form = this->form(); form && (is_submit_button(old_state) || is_submit_button(new_state))) {
+        submit_button_state_changed();
+        form->default_button_state_maybe_changed(*this, was_default);
+    } else {
+        CSS::Invalidation::invalidate_style_after_default_state_change(*this, was_default);
+    }
+    CSS::Invalidation::invalidate_style_after_read_write_state_change(*this, was_read_write);
     clear_element_reference_pseudo_elements();
+    auto should_materialize_shadow_tree = shadow_root() || has_style();
     set_shadow_root(nullptr);
-    create_shadow_tree_if_needed();
+    m_image_button_alt_text_node = nullptr;
+    if (should_materialize_shadow_tree)
+        create_shadow_tree_if_needed();
 
     // 5. Signal a type change for the element. (The Radio Button state uses this, in particular.)
     signal_a_type_change();
@@ -1713,6 +1815,10 @@ void HTMLInputElement::signal_a_type_change()
     // the checkedness state of all the other elements in the same radio button group must be set to false:
     // ...
     // - A type change is signalled for the element.
+    // NB: Registering the element with its new radio button group has already unchecked the other members of the
+    //     group. The tree walk below is a fallback for radio buttons that have no registry.
+    if (m_radio_button_group_registry)
+        return;
     if (type_state() == TypeAttributeState::RadioButton && checked()) {
         root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](auto& element) {
             if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
@@ -1725,9 +1831,6 @@ void HTMLInputElement::signal_a_type_change()
 // https://html.spec.whatwg.org/multipage/input.html#attr-input-src
 WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value)
 {
-    auto& realm = this->realm();
-    auto& vm = realm.vm();
-
     if (type_state() != TypeAttributeState::ImageButton)
         return {};
 
@@ -1744,7 +1847,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
     // 3. Let request be a new request whose URL is url, client is the element's node document's relevant settings
     //    object, destination is "image", initiator type is "input", credentials mode is "include", and whose
     //    use-URL-credentials flag is set.
-    auto request = Fetch::Infrastructure::Request::create(vm);
+    auto request = Fetch::Infrastructure::Request::create();
     request->set_url(url.release_value());
     request->set_client(&document().relevant_settings_object());
     request->set_destination(Fetch::Infrastructure::Request::Destination::Image);
@@ -1753,36 +1856,44 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
     request->set_use_url_credentials(true);
 
     // 4. Fetch request, with processResponseEndOfBody set to the following steps given response response:
-    m_resource_request = SharedResourceRequest::get_or_create(realm, document().page(), request->url());
+    m_resource_request = SharedResourceRequest::get_or_create(document(), request->url());
+    CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
-        [this, &realm]() {
+        [this]() {
+            CSS::record_element_replaced_content_input(*this);
             // 1. If the download was successful and the image is available, queue an element task on the user interaction
             //    task source given the input element to fire an event named load at the input element.
-            queue_an_element_task(HTML::Task::Source::UserInteraction, [this, &realm]() {
-                dispatch_event(DOM::Event::create(realm, HTML::EventNames::load));
+            queue_an_element_task(HTML::Task::Source::UserInteraction, [this]() {
+                dispatch_event(DOM::Event::create(HTML::EventNames::load,
+                    HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
             });
 
             m_load_event_delayer.clear();
+            update_image_button_alt_text_shadow_tree();
             set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
         },
-        [this, &realm]() {
+        [this]() {
             // 2. Otherwise, if the fetching process fails without a response from the remote server, or completes but the
             //    image is not a valid or supported image, then queue an element task on the user interaction task source
             //    given the input element to fire an event named error on the input element.
-            queue_an_element_task(HTML::Task::Source::UserInteraction, [this, &realm]() {
-                dispatch_event(DOM::Event::create(realm, HTML::EventNames::error));
+            queue_an_element_task(HTML::Task::Source::UserInteraction, [this]() {
+                dispatch_event(DOM::Event::create(HTML::EventNames::error,
+                    HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
             });
 
             m_load_event_delayer.clear();
+            CSS::record_element_replaced_content_input(*this);
 
             // NB: The element may have been rendering as blank space while the load was pending;
             //     now that the load failed it renders its alt text instead.
+            update_image_button_alt_text_shadow_tree();
             set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
         });
 
     if (m_resource_request->needs_fetching()) {
-        m_resource_request->fetch_resource(realm, request);
+        m_resource_request->fetch_resource(request);
     }
+    update_image_button_alt_text_shadow_tree();
 
     // Fetching the image must delay the load event of the element's node document until the task that is queued by the
     // networking task source once the resource has been fetched (defined below) has been run.
@@ -2024,18 +2135,18 @@ void HTMLInputElement::reset_algorithm()
     // The reset algorithm for input elements is to set its user validity, dirty value flag, and dirty checkedness flag back to false,
     m_user_validity = false;
     m_dirty_value = false;
-    m_dirty_checkedness = false;
 
     // set the value of the element to the value of the value content attribute, if there is one, or the empty string otherwise,
     auto old_value = move(m_value);
     m_value = get_attribute_value(AttributeNames::value);
 
     // set the checkedness of the element to true if the element has a checked content attribute and false if it does not,
-    m_checked = has_attribute(AttributeNames::checked);
+    set_checked(has_attribute(AttributeNames::checked));
+    m_dirty_checkedness = false;
 
     // empty the list of selected files,
     if (m_selected_files)
-        m_selected_files = FileAPI::FileList::create(realm());
+        m_selected_files = FileAPI::FileList::create();
 
     // and then invoke the value sanitization algorithm, if the type attribute's current state defines one.
     m_value = value_sanitization_algorithm(m_value);
@@ -2059,18 +2170,18 @@ void HTMLInputElement::clear_algorithm()
 {
     // The clear algorithm for input elements is to set the dirty value flag and dirty checkedness flag back to false,
     m_dirty_value = false;
-    m_dirty_checkedness = false;
 
     // set the value of the element to an empty string,
     auto old_value = move(m_value);
     m_value = {};
 
     // set the checkedness of the element to true if the element has a checked content attribute and false if it does not,
-    m_checked = has_attribute(AttributeNames::checked);
+    set_checked(has_attribute(AttributeNames::checked));
+    m_dirty_checkedness = false;
 
     // empty the list of selected files,
     if (m_selected_files)
-        m_selected_files = FileAPI::FileList::create(realm());
+        m_selected_files = FileAPI::FileList::create();
 
     // and then invoke the value sanitization algorithm iff the type attribute's current state defines one.
     m_value = value_sanitization_algorithm(m_value);
@@ -2090,24 +2201,76 @@ void HTMLInputElement::clear_algorithm()
     update_shadow_tree();
 }
 
+RadioButtonGroupRegistry* HTMLInputElement::radio_button_group_registry()
+{
+    // NB: A radio button group is scoped to the members' common form owner when they have one, and to the root of
+    //     the tree that contains them otherwise. Radio buttons in a detached subtree that is neither a shadow tree
+    //     nor the tree containing their form owner have no registry.
+    if (type_state() != TypeAttributeState::RadioButton)
+        return nullptr;
+    if (!name().has_value() || name()->is_empty())
+        return nullptr;
+    auto& root = this->root();
+    if (auto* form = this->form()) {
+        if (&form->root() != &root)
+            return nullptr;
+        return &form->ensure_radio_button_group_registry();
+    }
+    if (auto* shadow_root = as_if<DOM::ShadowRoot>(root))
+        return &shadow_root->ensure_radio_button_group_registry();
+    if (auto* document = as_if<DOM::Document>(root))
+        return &document->ensure_radio_button_group_registry();
+    return nullptr;
+}
+
+void HTMLInputElement::update_radio_button_group_registration()
+{
+    auto* registry = radio_button_group_registry();
+    auto group_name = registry ? name().value() : Utf16FlyString {};
+    if (registry == m_radio_button_group_registry.ptr() && group_name == m_radio_button_group_name)
+        return;
+
+    if (m_radio_button_group_registry)
+        m_radio_button_group_registry->remove_button(m_radio_button_group_name, *this);
+    m_radio_button_group_registry = registry;
+    m_radio_button_group_name = move(group_name);
+    if (m_radio_button_group_registry)
+        m_radio_button_group_registry->add_button(m_radio_button_group_name, *this);
+
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
+}
+
 void HTMLInputElement::form_associated_element_was_inserted()
 {
-    create_shadow_tree_if_needed();
+    // NB: The user-agent shadow tree is rendering state. It is created when a connected control first participates in
+    //     a style update, before computed properties are assigned. Creating it in the insertion steps would also
+    //     materialize controls in detached and short-lived trees.
 
-    if (is_connected()) {
-        // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
-        // When any of the following phenomena occur, if the element's checkedness state is true after the occurrence,
-        // the checkedness state of all the other elements in the same radio button group must be set to false:
-        // ...
-        // - The element becomes connected.
-        if (type_state() == TypeAttributeState::RadioButton && checked()) {
-            root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](auto& element) {
-                if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
-                    element.set_checked(false);
-                return TraversalDecision::Continue;
-            });
-        }
-    }
+    // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
+    // When any of the following phenomena occur, if the element's checkedness state is true after the occurrence,
+    // the checkedness state of all the other elements in the same radio button group must be set to false:
+    // ...
+    // - The element becomes connected.
+    // NB: Registering the element with its radio button group sets the checkedness of the other elements in the
+    //     group to false.
+    update_radio_button_group_registration();
+}
+
+void HTMLInputElement::form_associated_element_was_removed(DOM::Node* old_parent)
+{
+    FormAssociatedElement::form_associated_element_was_removed(old_parent);
+    update_radio_button_group_registration();
+}
+
+void HTMLInputElement::form_associated_element_was_moved(GC::Ptr<DOM::Node> old_parent)
+{
+    FormAssociatedElement::form_associated_element_was_moved(old_parent);
+    update_radio_button_group_registration();
+}
+
+void HTMLInputElement::form_associated_element_form_owner_changed()
+{
+    update_radio_button_group_registration();
 }
 
 EventResult HTMLInputElement::handle_return_key(Utf16FlyString const&)
@@ -2250,13 +2413,17 @@ void HTMLInputElement::legacy_pre_activation_behavior()
     //    element's radio button group that has its checkedness set to true, if any, and then set this element's
     //    checkedness to true.
     if (type_state() == TypeAttributeState::RadioButton) {
-        root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-            if (element.checked() && is_in_same_radio_button_group_as(element)) {
-                m_legacy_pre_activation_behavior_checked_element_in_group = &element;
-                return TraversalDecision::Break;
-            }
-            return TraversalDecision::Continue;
-        });
+        if (m_radio_button_group_registry) {
+            m_legacy_pre_activation_behavior_checked_element_in_group = m_radio_button_group_registry->checked_button(m_radio_button_group_name);
+        } else {
+            root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
+                if (element.checked() && is_in_same_radio_button_group_as(element)) {
+                    m_legacy_pre_activation_behavior_checked_element_in_group = &element;
+                    return TraversalDecision::Break;
+                }
+                return TraversalDecision::Continue;
+            });
+        }
 
         set_checked(true);
     }
@@ -2308,7 +2475,8 @@ GC::Ptr<DecodedImageData> HTMLInputElement::image_data() const
 
 bool HTMLInputElement::is_image_pending() const
 {
-    return m_resource_request && m_resource_request->is_fetching();
+    // NB: A freshly created request that has not started fetching yet counts as pending too.
+    return m_resource_request && (m_resource_request->needs_fetching() || m_resource_request->is_fetching());
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
@@ -2332,7 +2500,7 @@ WebIDL::Long HTMLInputElement::max_length() const
 WebIDL::ExceptionOr<void> HTMLInputElement::set_max_length(WebIDL::Long value)
 {
     // The maxLength IDL attribute must reflect the maxlength content attribute, limited to only non-negative numbers.
-    set_attribute_value(HTML::AttributeNames::maxlength, TRY(convert_non_negative_integer_to_string(realm(), value)));
+    set_attribute_value(HTML::AttributeNames::maxlength, Utf16String::from_utf8(TRY(convert_non_negative_integer_to_string(value))));
     return {};
 }
 
@@ -2350,7 +2518,7 @@ WebIDL::Long HTMLInputElement::min_length() const
 WebIDL::ExceptionOr<void> HTMLInputElement::set_min_length(WebIDL::Long value)
 {
     // The minLength IDL attribute must reflect the minlength content attribute, limited to only non-negative numbers.
-    set_attribute_value(HTML::AttributeNames::minlength, TRY(convert_non_negative_integer_to_string(realm(), value)));
+    set_attribute_value(HTML::AttributeNames::minlength, Utf16String::from_utf8(TRY(convert_non_negative_integer_to_string(value))));
     return {};
 }
 
@@ -2369,7 +2537,7 @@ WebIDL::UnsignedLong HTMLInputElement::size() const
 WebIDL::ExceptionOr<void> HTMLInputElement::set_size(WebIDL::UnsignedLong value)
 {
     if (value == 0)
-        return WebIDL::IndexSizeError::create(realm(), "Size must be greater than zero"_utf16);
+        return WebIDL::IndexSizeError::create("Size must be greater than zero"_utf16);
     if (value > 2147483647)
         value = 20;
     set_attribute_value(HTML::AttributeNames::size, Utf16String::number(value));
@@ -2386,8 +2554,8 @@ WebIDL::UnsignedLong HTMLInputElement::height() const
         return 0;
 
     // Return the rendered height of the image, in CSS pixels, if the image is being rendered.
-    if (auto paintable_box = this->paintable_box())
-        return paintable_box->content_height().to_int();
+    if (auto const* layout_node = this->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+        return Painting::content_height(*layout_node).to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
     if (auto height_string = get_attribute(HTML::AttributeNames::height); height_string.has_value()) {
@@ -2421,8 +2589,8 @@ WebIDL::UnsignedLong HTMLInputElement::width() const
         return 0;
 
     // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
-    if (auto paintable_box = this->paintable_box())
-        return paintable_box->content_width().to_int();
+    if (auto const* layout_node = this->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+        return Painting::content_width(*layout_node).to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
     if (auto width_string = get_attribute(HTML::AttributeNames::width); width_string.has_value()) {
@@ -2512,10 +2680,10 @@ Optional<double> HTMLInputElement::convert_time_string_to_number(Utf16View input
     // The algorithm to convert a string to a number, given a string input, is as follows: If parsing a time from input
     // results in an error, then return an error; otherwise, return the number of milliseconds elapsed from midnight to
     // the parsed time on a day with no time changes.
-    auto maybe_time = parse_time_string(realm(), input);
+    auto maybe_time = parse_time_string_value(input);
     if (maybe_time.is_exception())
         return {};
-    return maybe_time.value()->date_value();
+    return maybe_time.value();
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-number
@@ -2686,7 +2854,7 @@ Utf16String HTMLInputElement::convert_number_to_string(double input) const
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-date
-WebIDL::ExceptionOr<GC::Ptr<JS::Date>> HTMLInputElement::convert_string_to_date(Utf16View input) const
+WebIDL::ExceptionOr<Optional<double>> HTMLInputElement::convert_string_to_date(StringView input) const
 {
     // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-string-date
     if (type_state() == TypeAttributeState::Date) {
@@ -2697,7 +2865,7 @@ WebIDL::ExceptionOr<GC::Ptr<JS::Date>> HTMLInputElement::convert_string_to_date(
         auto date = maybe_date.value();
 
         // otherwise, return a new Date object representing midnight UTC on the morning of the parsed date.
-        return JS::Date::create(realm(), JS::make_date(JS::make_day(date.year, date.month - 1, date.day), 0));
+        return JS::make_date(JS::make_day(date.year, date.month - 1, date.day), 0);
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-string-date
@@ -2709,7 +2877,7 @@ WebIDL::ExceptionOr<GC::Ptr<JS::Date>> HTMLInputElement::convert_string_to_date(
         auto year_and_month = maybe_year_and_month.value();
 
         // otherwise, return a new Date object representing midnight UTC on the morning of the first day of the parsed month.
-        return JS::Date::create(realm(), JS::make_date(JS::make_day(year_and_month.year, year_and_month.month - 1, 1), 0));
+        return JS::make_date(JS::make_day(year_and_month.year, year_and_month.month - 1, 1), 0);
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):concept-input-value-string-date
@@ -2722,53 +2890,58 @@ WebIDL::ExceptionOr<GC::Ptr<JS::Date>> HTMLInputElement::convert_string_to_date(
 
         // otherwise, return a new Date object representing midnight UTC on the morning of the Monday of the parsed week.
         auto datetime = UnixDateTime::from_iso8601_week(week.week_year, week.week);
-        return JS::Date::create(realm(), datetime.milliseconds_since_epoch());
+        return static_cast<double>(datetime.milliseconds_since_epoch());
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-value-string-date
     if (type_state() == TypeAttributeState::Time) {
         // If parsing a time from input results in an error, then return an error;
-        auto maybe_time = parse_time_string(realm(), input);
-        if (maybe_time.is_exception())
-            return maybe_time.exception();
-
         // otherwise, return a new Date object representing the parsed time in UTC on 1970-01-01.
-        return maybe_time.value();
+        return TRY(parse_time_string_value(input));
     }
 
     dbgln("HTMLInputElement::convert_string_to_date() not implemented for input type {}", type());
-    return nullptr;
+    return Optional<double> {};
+}
+
+// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-date
+WebIDL::ExceptionOr<Optional<double>> HTMLInputElement::convert_string_to_date(Utf16String const& input) const
+{
+    // FIXME: Implement a UTF-16 GenericLexer.
+    if (!input.has_ascii_storage())
+        return Optional<double> {};
+    return convert_string_to_date(input.ascii_view());
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#concept-input-value-date-string
-Utf16String HTMLInputElement::convert_date_to_string(GC::Ref<JS::Date> input) const
+Utf16String HTMLInputElement::convert_date_to_string(double input) const
 {
     // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-date-string
     if (type_state() == TypeAttributeState::Date) {
         // Return a valid date string that represents the date current at the time represented by input in the UTC time zone.
         // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-date-string
-        return convert_number_to_date_string(input->date_value());
+        return convert_number_to_date_string(input);
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-date-string
     if (type_state() == TypeAttributeState::Month) {
         // Return a valid month string that represents the month current at the time represented by input in the UTC time zone.
         // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-month-string
-        return convert_date_to_month_string(input->date_value());
+        return convert_date_to_month_string(input);
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):concept-input-value-date-string
     if (type_state() == TypeAttributeState::Week) {
         // Return a valid week string that represents the week current at the time represented by input in the UTC time zone.
         // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-week-string
-        return convert_number_to_week_string(input->date_value());
+        return convert_number_to_week_string(input);
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-value-string-date
     if (type_state() == TypeAttributeState::Time) {
         // Return a valid time string that represents the UTC time component that is represented by input.
         // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-time-string
-        return convert_number_to_time_string(input->date_value());
+        return convert_number_to_time_string(input);
     }
 
     dbgln("HTMLInputElement::convert_date_to_string() not implemented for input type {}", type());
@@ -2933,45 +3106,73 @@ double HTMLInputElement::step_base() const
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasdate
-JS::Object* HTMLInputElement::value_as_date() const
+Optional<double> HTMLInputElement::value_as_date() const
 {
     // On getting, if the valueAsDate attribute does not apply, as defined for the input element's type attribute's current state, then return null.
     if (!value_as_date_applies())
-        return nullptr;
+        return {};
 
     // Otherwise, run the algorithm to convert a string to a Date object defined for that state to the element's value;
     // if the algorithm returned a Date object, then return it, otherwise, return null.
     auto maybe_date = convert_string_to_date(value());
     if (!maybe_date.is_exception())
-        return maybe_date.value().ptr();
-    return nullptr;
+        return maybe_date.value();
+    return {};
+}
+
+GC::Ptr<JS::Object> HTMLInputElement::value_as_date_object(JS::Object& relevant_global_object) const
+{
+    auto value = value_as_date();
+    if (!value.has_value())
+        return nullptr;
+    return JS::Date::create(HTML::relevant_realm(relevant_global_object), *value);
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasdate
-WebIDL::ExceptionOr<void> HTMLInputElement::set_value_as_date(GC::Ptr<JS::Object> value)
+WebIDL::ExceptionOr<void> HTMLInputElement::set_value_as_date(Optional<double> value)
 {
     // On setting, if the valueAsDate attribute does not apply, as defined for the input element's type attribute's current state, then throw an "InvalidStateError" DOMException;
     if (!value_as_date_applies())
-        return WebIDL::InvalidStateError::create(realm(), "valueAsDate: Invalid input type used"_utf16);
-
-    // otherwise, if the new value is not null and not a Date object throw a TypeError exception;
-    if (value && !is<JS::Date>(*value))
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "valueAsDate: input is not a Date"_utf16 };
+        return WebIDL::InvalidStateError::create("valueAsDate: Invalid input type used"_utf16);
 
     // otherwise if the new value is null or a Date object representing the NaN time value, then set the value of the element to the empty string;
-    if (!value) {
+    if (!value.has_value()) {
         TRY(set_value({}));
         return {};
     }
-    auto& date = static_cast<JS::Date&>(*value);
-    if (!isfinite(date.date_value())) {
+    if (!isfinite(*value)) {
         TRY(set_value({}));
         return {};
     }
 
     // otherwise, run the algorithm to convert a Date object to a string, as defined for that state, on the new value, and set the value of the element to the resulting string.
-    TRY(set_value(convert_date_to_string(date)));
+    TRY(set_value(convert_date_to_string(*value)));
     return {};
+}
+
+WebIDL::ExceptionOr<void> HTMLInputElement::set_value_as_date_object(GC::Ptr<JS::Object> value)
+{
+    if (!value)
+        return set_value_as_date({});
+
+    if (!is<JS::Date>(*value))
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "valueAsDate: input is not a Date"_utf16 };
+
+    return set_value_as_date(static_cast<JS::Date&>(*value).date_value());
+}
+
+WebIDL::ExceptionOr<void> HTMLInputElement::set_range_text(Utf16String const& replacement)
+{
+    if (!selection_or_range_applies())
+        return WebIDL::InvalidStateError::create("setRangeText does not apply to this input type"_utf16);
+    return FormAssociatedTextControlElement::set_range_text(replacement.utf16_view(), selection_start(), selection_end());
+}
+
+WebIDL::ExceptionOr<void> HTMLInputElement::set_range_text(Utf16String const& replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, SelectionMode selection_mode)
+{
+    if (!selection_or_range_applies())
+        return WebIDL::InvalidStateError::create("setRangeText does not apply to this input type"_utf16);
+    return FormAssociatedTextControlElement::set_range_text(replacement, start, end, selection_mode);
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber
@@ -2995,7 +3196,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value_as_number(double value)
 
     // Otherwise, if the valueAsNumber attribute does not apply, as defined for the input element's type attribute's current state, then throw an "InvalidStateError" DOMException.
     if (!value_as_number_applies())
-        return WebIDL::InvalidStateError::create(realm(), "valueAsNumber: Invalid input type used"_utf16);
+        return WebIDL::InvalidStateError::create("valueAsNumber: Invalid input type used"_utf16);
 
     // Otherwise, if the new value is a Not-a-Number (NaN) value, then set the value of the element to the empty string.
     if (value == NAN) {
@@ -3025,12 +3226,12 @@ WebIDL::ExceptionOr<void> HTMLInputElement::step_up_or_down(bool is_down, WebIDL
 {
     // 1. If the stepDown() and stepUp() methods do not apply, as defined for the input element's type attribute's current state, then throw an "InvalidStateError" DOMException.
     if (!step_up_or_down_applies())
-        return WebIDL::InvalidStateError::create(realm(), Utf16String::formatted("{}: Invalid input type used", is_down ? "stepDown()" : "stepUp()"));
+        return WebIDL::InvalidStateError::create(Utf16String::formatted("{}: Invalid input type used", is_down ? "stepDown()" : "stepUp()"));
 
     // 2. If the element has no allowed value step, then throw an "InvalidStateError" DOMException.
     auto maybe_allowed_value_step = allowed_value_step();
     if (!maybe_allowed_value_step.has_value())
-        return WebIDL::InvalidStateError::create(realm(), "element has no allowed value step"_utf16);
+        return WebIDL::InvalidStateError::create("element has no allowed value step"_utf16);
     double allowed_value_step = *maybe_allowed_value_step;
 
     // 3. If the element has a minimum and a maximum and the minimum is greater than the maximum, then return.
@@ -3190,10 +3391,15 @@ bool HTMLInputElement::is_button() const
 
 bool HTMLInputElement::is_submit_button() const
 {
+    return is_submit_button(type_state());
+}
+
+bool HTMLInputElement::is_submit_button(TypeAttributeState type_state)
+{
     // https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit):concept-submit-button
     // https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):concept-submit-button
-    return type_state() == TypeAttributeState::SubmitButton
-        || type_state() == TypeAttributeState::ImageButton;
+    return type_state == TypeAttributeState::SubmitButton
+        || type_state == TypeAttributeState::ImageButton;
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#text-(type=text)-state-and-search-state-(type=search)
@@ -3248,8 +3454,10 @@ void HTMLInputElement::activation_behavior(DOM::Event const& event)
         return;
 
     // 4. Run the popover target attribute activation behavior given element and event's target.
-    if (event.target() && event.target()->is_dom_node())
-        PopoverTargetAttributes::popover_target_activation_behaviour(*this, as<DOM::Node>(*event.target()));
+    if (auto target = event.target()) {
+        if (auto* target_node = as_if<DOM::Node>(*target))
+            PopoverTargetAttributes::popover_target_activation_behaviour(*this, *target_node);
+    }
 }
 
 bool HTMLInputElement::has_input_activation_behavior() const
@@ -3564,6 +3772,8 @@ bool HTMLInputElement::suffering_from_being_missing() const
         // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type%3Dradio)%3Asuffering-from-being-missing
         // If an element in the radio button group is required, and all of the input elements in the radio button group
         // have a checkedness that is false, then the element is suffering from being missing.
+        if (m_radio_button_group_registry)
+            return m_radio_button_group_registry->group_is_suffering_from_being_missing(m_radio_button_group_name);
         root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
             if (is_in_same_radio_button_group_as(element)) {
                 if (element.checked())
@@ -3850,7 +4060,7 @@ void HTMLInputElement::set_is_open(bool is_open)
         return;
 
     m_is_open = is_open;
-    CSS::Invalidation::invalidate_style_after_input_open_state_change(*this);
+    CSS::Invalidation::invalidate_style_after_input_open_state_change(*this, is_open);
 }
 
 bool HTMLInputElement::is_mutable() const

@@ -10,7 +10,7 @@ dictionary PointerEventInit : MouseEventInit {
     long twist = 0;
     double altitudeAngle;
     double azimuthAngle;
-    [Utf16FlyString] Utf16DOMString pointerType = "";
+    [FlyString] DOMString pointerType = "";
     boolean isPrimary = false;
     long persistentDeviceId = 0;
     sequence<PointerEvent> coalescedEvents = [];
@@ -20,7 +20,7 @@ dictionary PointerEventInit : MouseEventInit {
 // https://w3c.github.io/pointerevents/#pointerevent-interface
 [Exposed=Window]
 interface PointerEvent : MouseEvent {
-    constructor([Utf16FlyString] Utf16DOMString type, optional PointerEventInit eventInitDict = {});
+    constructor(DOMString type, optional PointerEventInit eventInitDict = {});
     readonly attribute long pointerId;
     readonly attribute double width;
     readonly attribute double height;
@@ -31,9 +31,16 @@ interface PointerEvent : MouseEvent {
     readonly attribute long twist;
     readonly attribute double altitudeAngle;
     readonly attribute double azimuthAngle;
-    readonly attribute [Utf16FlyString] Utf16DOMString pointerType;
+    readonly attribute [FlyString] DOMString pointerType;
     readonly attribute boolean isPrimary;
     readonly attribute long persistentDeviceId;
     [SecureContext] sequence<PointerEvent> getCoalescedEvents();
     sequence<PointerEvent> getPredictedEvents();
+};
+
+// https://w3c.github.io/pointerevents/#extensions-to-the-element-interface
+partial interface Element {
+    undefined setPointerCapture (long pointerId);
+    undefined releasePointerCapture (long pointerId);
+    boolean hasPointerCapture (long pointerId);
 };

@@ -15,14 +15,14 @@
 #include <LibWeb/WebGL/Types.h>
 #include <LibWeb/WebGL/WebGLRenderingContextBase.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::WebGL {
 
 using namespace Web::HTML;
 
 class WebGLRenderingContextImpl : public WebGLRenderingContextBase {
-    WEB_NON_IDL_PLATFORM_OBJECT(WebGLRenderingContextImpl, WebGLRenderingContextBase);
+    WEB_NON_IDL_WRAPPABLE(WebGLRenderingContextImpl, WebGLRenderingContextBase);
 
 public:
     WebGLRenderingContextImpl(JS::Realm&, NonnullOwnPtr<WebGLContextProxy>);
@@ -53,12 +53,12 @@ public:
     void compile_shader(GC::Ref<WebGLShader> shader);
     void copy_tex_image2d(WebIDL::UnsignedLong target, WebIDL::Long level, WebIDL::UnsignedLong internalformat, WebIDL::Long x, WebIDL::Long y, WebIDL::Long width, WebIDL::Long height, WebIDL::Long border);
     void copy_tex_sub_image2d(WebIDL::UnsignedLong target, WebIDL::Long level, WebIDL::Long xoffset, WebIDL::Long yoffset, WebIDL::Long x, WebIDL::Long y, WebIDL::Long width, WebIDL::Long height);
-    GC::Ptr<WebGLBuffer> create_buffer();
-    GC::Ptr<WebGLFramebuffer> create_framebuffer();
-    GC::Ptr<WebGLProgram> create_program();
-    GC::Ptr<WebGLRenderbuffer> create_renderbuffer();
+    GC::Ref<WebGLBuffer> create_buffer();
+    GC::Ref<WebGLFramebuffer> create_framebuffer();
+    GC::Ref<WebGLProgram> create_program();
+    GC::Ref<WebGLRenderbuffer> create_renderbuffer();
     GC::Ptr<WebGLShader> create_shader(WebIDL::UnsignedLong type);
-    GC::Ptr<WebGLTexture> create_texture();
+    GC::Ref<WebGLTexture> create_texture();
     void cull_face(WebIDL::UnsignedLong mode);
     void delete_buffer(GC::Ptr<WebGLBuffer> buffer);
     void delete_framebuffer(GC::Ptr<WebGLFramebuffer> framebuffer);
@@ -87,8 +87,8 @@ public:
     Optional<Vector<GC::Root<WebGLShader>>> get_attached_shaders(GC::Ref<WebGLProgram> program);
     WebIDL::Long get_attrib_location(GC::Ref<WebGLProgram> program, Utf16String name);
     JS::Value get_buffer_parameter(WebIDL::UnsignedLong target, WebIDL::UnsignedLong pname);
-    WebIDL::ExceptionOr<JS::Value> get_parameter(WebIDL::UnsignedLong pname);
-    JS::Value get_framebuffer_attachment_parameter(WebIDL::UnsignedLong target, WebIDL::UnsignedLong attachment, WebIDL::UnsignedLong pname);
+    WebIDL::ExceptionOr<JS::Value> get_parameter(JS::Realm&, WebIDL::UnsignedLong pname);
+    JS::Value get_framebuffer_attachment_parameter(JS::Realm&, WebIDL::UnsignedLong target, WebIDL::UnsignedLong attachment, WebIDL::UnsignedLong pname);
     WebIDL::UnsignedLong get_error();
     JS::Value get_program_parameter(GC::Ref<WebGLProgram> program, WebIDL::UnsignedLong pname);
     Optional<Utf16String> get_program_info_log(GC::Ref<WebGLProgram> program);
@@ -100,7 +100,7 @@ public:
     JS::Value get_tex_parameter(WebIDL::UnsignedLong target, WebIDL::UnsignedLong pname);
     JS::Value get_uniform(GC::Ref<WebGLProgram> program, GC::Ref<WebGLUniformLocation> location);
     GC::Ptr<WebGLUniformLocation> get_uniform_location(GC::Ref<WebGLProgram> program, Utf16String name);
-    JS::Value get_vertex_attrib(WebIDL::UnsignedLong index, WebIDL::UnsignedLong pname);
+    JS::Value get_vertex_attrib(JS::Realm&, WebIDL::UnsignedLong index, WebIDL::UnsignedLong pname);
     WebIDL::LongLong get_vertex_attrib_offset(WebIDL::UnsignedLong index, WebIDL::UnsignedLong pname);
     void hint(WebIDL::UnsignedLong target, WebIDL::UnsignedLong mode);
     bool is_buffer(GC::Ptr<WebGLBuffer> buffer);

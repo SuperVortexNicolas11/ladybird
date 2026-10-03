@@ -15,11 +15,13 @@
 namespace Web::HTML {
 
 class HTMLDialogElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLDialogElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLDialogElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLDialogElement);
 
 public:
     virtual ~HTMLDialogElement() override;
+
+    virtual bool is_html_dialog_element() const final { return true; }
 
     virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
 
@@ -55,8 +57,6 @@ public:
 
 private:
     HTMLDialogElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
     virtual void inserted() override;
@@ -87,5 +87,12 @@ private:
     // https://html.spec.whatwg.org/multipage/interactive-elements.html#previously-focused-element
     GC::Ptr<Node> m_previously_focused_element;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLDialogElement>() const { return is_html_dialog_element(); }
 
 }

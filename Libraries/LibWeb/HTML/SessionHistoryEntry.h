@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/Optional.h>
 #include <AK/RefCounted.h>
@@ -18,78 +17,15 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
-#include <LibWeb/PixelUnits.h>
-#include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
+#include <LibWebCommon/PixelUnits.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
 
-// https://html.spec.whatwg.org/multipage/history.html#scroll-restoration-mode
-enum class ScrollRestorationMode {
-    // https://html.spec.whatwg.org/multipage/history.html#dom-scrollrestoration-auto
-    // The user agent is responsible for restoring the scroll position upon navigation.
-    Auto,
-
-    // https://html.spec.whatwg.org/multipage/history.html#dom-scrollrestoration-manual
-    // The page is responsible for restoring the scroll position and the user agent does not attempt to do so automatically.
-    Manual,
-};
-
-struct SessionHistoryNestedHistoryDescriptor;
-
-// IPC-friendly descriptors for the parts of session history entries and document states that can survive
-// WebContent process swaps.
-//
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state
-struct SessionHistoryDocumentStateDescriptor {
-    // AD-HOC: The spec models shared document state by object identity. The UI-process mirror uses a stable
-    //         descriptor ID so entries that share a document state can be reconstructed after IPC.
-    CrossProcessId id;
-    Variant<SerializedPolicyContainer, DocumentState::Client> history_policy_container { DocumentState::Client::Tag };
-    Fetch::Infrastructure::Request::ReferrerType request_referrer { Fetch::Infrastructure::Request::Referrer::Client };
-    ReferrerPolicy::ReferrerPolicy request_referrer_policy { ReferrerPolicy::DEFAULT_REFERRER_POLICY };
-    Optional<URL::Origin> initiator_origin;
-    Optional<URL::Origin> origin;
-    Optional<URL::URL> about_base_url;
-    DocumentResource resource;
-    bool reload_pending { false };
-    bool ever_populated { false };
-    bool is_provisional { false };
-    Utf16String navigable_target_name;
-    Vector<SessionHistoryNestedHistoryDescriptor> nested_histories;
-};
-
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#she-scroll-position
-struct SessionHistoryEntryScrollPositionData {
-    // FIXME: Track all restorable scrollable regions. Currently only the viewport is persisted.
-    Optional<CSSPixelPoint> viewport_scroll_position;
-
-    bool operator==(SessionHistoryEntryScrollPositionData const&) const = default;
-};
-
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry
-struct SessionHistoryEntryDescriptor {
-    i32 step { 0 };
-    URL::URL url;
-    SessionHistoryDocumentStateDescriptor document_state;
-    StorageSerializationRecord classic_history_api_state;
-    StorageSerializationRecord navigation_api_state;
-    Utf16String navigation_api_key;
-    Utf16String navigation_api_id;
-    ScrollRestorationMode scroll_restoration_mode { ScrollRestorationMode::Auto };
-    SessionHistoryEntryScrollPositionData scroll_position_data;
-};
-
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#nested-history
-struct SessionHistoryNestedHistoryDescriptor {
-    CrossProcessId id;
-    Vector<SessionHistoryEntryDescriptor> entries;
-};
-
-// https://html.spec.whatwg.org/multipage/history.html#session-history-entry
 class WEB_API SessionHistoryEntry final : public RefCounted<SessionHistoryEntry> {
 public:
     static NonnullRefPtr<SessionHistoryEntry> create();
@@ -115,6 +51,8 @@ public:
 
     [[nodiscard]] RefPtr<HTML::DocumentState> document_state() const;
     void set_document_state(RefPtr<HTML::DocumentState>);
+
+    [[nodiscard]] UniqueNodeID document_id() const;
 
     [[nodiscard]] StorageSerializationRecord const& classic_history_api_state() const { return m_classic_history_api_state; }
     void set_classic_history_api_state(StorageSerializationRecord classic_history_api_state) { m_classic_history_api_state = move(classic_history_api_state); }
@@ -176,39 +114,21 @@ private:
 };
 
 WEB_API SessionHistoryEntryDescriptor create_session_history_entry_descriptor(SessionHistoryEntry const&);
-WEB_API bool session_history_entry_descriptors_match(SessionHistoryEntryDescriptor const&, SessionHistoryEntryDescriptor const&);
-enum class MatchNestedHistories {
-    Yes,
-    No,
+
+WEB_API SessionHistoryDocumentStateDescriptor create_session_history_document_state_descriptor(DocumentState const&);
+WEB_API PendingSessionHistoryEntryDescriptor create_pending_session_history_entry_descriptor(SessionHistoryEntry const&);
+WEB_API Optional<SessionHistoryEntryPersistedState> create_session_history_entry_persisted_state(SessionHistoryEntry const&);
+WEB_API SessionHistoryEntryIdentity session_history_entry_identity(SessionHistoryEntry const&);
+
+// Document states already reconstructed from the UI process's descriptors, so entries that share a document state
+// there share one here too.
+struct SessionHistoryEntryReconstructionState {
+    HashMap<CrossProcessId, RefPtr<DocumentState>> document_states;
 };
-WEB_API bool session_history_entry_matches_descriptor_ignoring_document_state_id(SessionHistoryEntry const&, SessionHistoryEntryDescriptor const&, MatchNestedHistories = MatchNestedHistories::Yes);
 
-}
-
-namespace IPC {
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryEntryDescriptor const&);
-
-template<>
-WEB_API ErrorOr<Web::HTML::SessionHistoryEntryDescriptor> decode(Decoder&);
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryEntryScrollPositionData const&);
-
-template<>
-WEB_API ErrorOr<Web::HTML::SessionHistoryEntryScrollPositionData> decode(Decoder&);
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryDocumentStateDescriptor const&);
-
-template<>
-WEB_API ErrorOr<Web::HTML::SessionHistoryDocumentStateDescriptor> decode(Decoder&);
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryNestedHistoryDescriptor const&);
-
-template<>
-WEB_API ErrorOr<Web::HTML::SessionHistoryNestedHistoryDescriptor> decode(Decoder&);
+WEB_API void apply_session_history_entry_descriptor_from_ui_process(SessionHistoryEntry&, SessionHistoryEntryDescriptor&);
+WEB_API void apply_session_history_document_state_descriptor_from_ui_process(DocumentState&, SessionHistoryDocumentStateDescriptor const&);
+WEB_API RefPtr<DocumentState> get_or_create_document_state_from_ui_process(SessionHistoryDocumentStateDescriptor const&, SessionHistoryEntryReconstructionState&);
+WEB_API NonnullRefPtr<SessionHistoryEntry> create_session_history_entry_from_ui_process(SessionHistoryEntryDescriptor, SessionHistoryEntryReconstructionState&);
 
 }

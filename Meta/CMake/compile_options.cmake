@@ -72,6 +72,10 @@ add_cxx_compile_options(-Wimplicit-fallthrough)
 add_cxx_compile_options(-Wlogical-op)
 add_cxx_compile_options(-Wmissing-declarations)
 add_cxx_compile_options(-Wmissing-field-initializers)
+if (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    # Apple Clang does not include this diagnostic in -Wmissing-field-initializers as upstream Clang does.
+    add_cxx_compile_options(-Wmissing-designated-field-initializers)
+endif()
 add_cxx_compile_options(-Wsuggest-override)
 
 add_cxx_compile_options(-Wno-expansion-to-defined)
@@ -229,7 +233,7 @@ if (NOT WIN32 AND NOT APPLE AND NOT ENABLE_FUZZERS)
     # NOTE: Assume ELF
     # NOTE: --no-undefined is not compatible with clang sanitizer runtimes
     # NOTE: Some BSDs don't export all symbols from LibC so we can't use --no-undefined
-    if ((CMAKE_CXX_COMPILER_ID MATCHES "Clang$" AND (ENABLE_ADDRESS_SANITIZER OR ENABLE_MEMORY_SANITIZER OR ENABLE_UNDEFINED_SANITIZER OR ENABLE_LAGOM_COVERAGE_COLLECTION)) OR BSD)
+    if ((CMAKE_CXX_COMPILER_ID MATCHES "Clang$" AND (ENABLE_ADDRESS_SANITIZER OR ENABLE_MEMORY_SANITIZER OR ENABLE_THREAD_SANITIZER OR ENABLE_UNDEFINED_SANITIZER OR ENABLE_LAGOM_COVERAGE_COLLECTION)) OR BSD)
         add_link_options(LINKER:--allow-shlib-undefined)
         add_link_options(LINKER:-z,undefs)
     else()

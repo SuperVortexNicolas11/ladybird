@@ -30,7 +30,25 @@ TestWebView::TestWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewp
 
 void TestWebView::clear_content_blockers()
 {
-    client().async_set_content_blockers(m_client_state.page_index, MUST(Core::AnonymousBuffer::create_with_size(0)));
+    client().async_set_content_blockers(MUST(Core::AnonymousBuffer::create_with_size(0)));
+}
+
+// Force-dark rides on the navigable, so a test that turns it on leaves it on for whatever runs next in this view.
+void TestWebView::reset_force_dark()
+{
+    debug_request("set-force-dark"sv, "off"sv);
+}
+
+// Same story as force-dark above: the flag lives on the navigable and would otherwise outlive the test that set it.
+void TestWebView::reset_line_box_borders()
+{
+    debug_request("set-line-box-borders"sv, "off"sv);
+}
+
+// The emulated position lives on the page, so a test that moves it would otherwise hand its position to the next test.
+void TestWebView::reset_geolocation_emulated_position()
+{
+    geolocation_settings_changed();
 }
 
 NonnullRefPtr<Core::Promise<Empty>> TestWebView::reset_session_history()
@@ -43,18 +61,6 @@ pid_t TestWebView::web_content_pid() const
     return client().pid();
 }
 
-void TestWebView::insert_clipboard_item(Web::Clipboard::SystemClipboardItem item)
-{
-    m_clipboard_item = move(item);
-}
-
-Vector<Web::Clipboard::SystemClipboardRepresentation> TestWebView::clipboard_entries() const
-{
-    if (!m_clipboard_item.has_value())
-        return {};
-    return m_clipboard_item->system_clipboard_representations;
-}
-
 NonnullRefPtr<Core::Promise<RefPtr<Gfx::Bitmap const>>> TestWebView::take_screenshot()
 {
     VERIFY(!m_pending_screenshot);
@@ -65,7 +71,7 @@ NonnullRefPtr<Core::Promise<RefPtr<Gfx::Bitmap const>>> TestWebView::take_screen
     return *m_pending_screenshot;
 }
 
-void TestWebView::did_receive_screenshot(Badge<WebView::WebContentClient>, Gfx::ShareableBitmap const& screenshot)
+void TestWebView::did_receive_screenshot(Badge<WebView::WebContentPage>, Gfx::ShareableBitmap const& screenshot)
 {
     // NOTE: The screenshot may arrive after a timeout already completed the test and cleared m_pending_screenshot.
     if (!m_pending_screenshot)
@@ -78,10 +84,14 @@ void TestWebView::did_receive_screenshot(Badge<WebView::WebContentClient>, Gfx::
 void TestWebView::on_test_complete(TestCompletion completion)
 {
     m_pending_screenshot.clear();
-    m_pending_dialog = Web::Page::PendingDialog::None;
+    m_pending_dialog = Web::PendingDialog::None;
     m_pending_prompt_text.clear();
     m_is_fullscreen = Web::ViewportIsFullscreen::No;
-    client().async_set_viewport(m_client_state.page_index, viewport_size(), 1.0, Web::ViewportIsFullscreen::No);
+
+    // A crash of a child view's WebContent completes the test through its parent view, which can share the crashed
+    // process and not have replaced it yet. The replacement process gets the view's viewport when it is set up.
+    if (page().routed_connection())
+        client().async_set_viewport(page_id(), viewport_size(), 1.0, Web::ViewportIsFullscreen::No);
 
     m_test_promise->resolve(move(completion));
 }

@@ -2,11 +2,13 @@ set(SOURCES
     AddressInfoVector.cpp
     ArgsParser.cpp
     ConfigFile.cpp
+    CrashReportData.cpp
     DirIterator.cpp
     Directory.cpp
     DirectoryEntry.cpp
     ElapsedTimer.cpp
     Environment.cpp
+    Futex.cpp
     EventLoop.cpp
     EventLoopImplementation.cpp
     EventReceiver.cpp
@@ -84,6 +86,11 @@ else ()
     list(APPEND SOURCES Platform/ProcessStatisticsUnimplemented.cpp)
 endif()
 
+if (APPLE AND NOT IOS)
+    list(APPEND SOURCES Platform/TaskRoleMacOS.cpp)
+    list(APPEND SOURCES Platform/ThreadQoSMacOS.cpp)
+endif()
+
 if (LINUX OR BSD)
     list(APPEND SOURCES TimeZoneWatcherUnix.cpp)
 elseif (APPLE AND NOT IOS)
@@ -104,7 +111,7 @@ if (APPLE)
 endif()
 
 ladybird_lib(LibCore core EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibCore PRIVATE LibSync Threads::Threads LibUnicode LibURL LibTextCodec)
+target_link_libraries(LibCore PRIVATE Threads::Threads LibUnicode LibTextCodec)
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "NetBSD")
     # NetBSD has its shm_open and shm_unlink functions in librt so we need to link that
@@ -121,6 +128,7 @@ endif()
 
 if (APPLE)
     target_link_libraries(LibCore PUBLIC "-framework CoreFoundation")
+    target_link_libraries(LibCore PUBLIC "-framework CoreGraphics")
     target_link_libraries(LibCore PUBLIC "-framework CoreLocation")
     target_link_libraries(LibCore PUBLIC "-framework CoreServices")
     target_link_libraries(LibCore PUBLIC "-framework Foundation")
@@ -135,4 +143,10 @@ endif()
 
 if (ANDROID)
     target_link_libraries(LibCore PRIVATE log)
+endif()
+
+if ((APPLE AND NOT IOS) OR LINUX)
+    target_sources(LibCore PRIVATE CrashHandlerPOSIX.cpp)
+else()
+    target_sources(LibCore PRIVATE CrashHandlerUnimplemented.cpp)
 endif()

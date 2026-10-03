@@ -2,8 +2,8 @@
 [Exposed=Window]
 interface FocusEvent : UIEvent {
 
-    constructor([Utf16FlyString] Utf16DOMString type, optional FocusEventInit eventInitDict = {});
-    readonly attribute EventTarget? relatedTarget;
+    constructor(DOMString type, optional FocusEventInit eventInitDict = {});
+    [DirectGetter] readonly attribute EventTarget? relatedTarget;
 
 };
 

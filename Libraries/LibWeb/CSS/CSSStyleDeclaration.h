@@ -21,13 +21,12 @@ namespace Web::CSS {
 
 // https://drafts.csswg.org/cssom/#css-declaration-blocks
 class CSSStyleDeclaration
-    : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(CSSStyleDeclaration, Bindings::PlatformObject);
+    : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(CSSStyleDeclaration, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(CSSStyleDeclaration);
 
 public:
     virtual ~CSSStyleDeclaration() = default;
-    virtual void initialize(JS::Realm&) override;
 
     virtual size_t length() const = 0;
     virtual Utf16String item(size_t index) const = 0;
@@ -52,6 +51,7 @@ public:
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-parent-css-rule
     GC::Ptr<CSSRule> parent_rule() const { return m_parent_rule; }
     void set_parent_rule(GC::Ptr<CSSRule> parent) { m_parent_rule = parent; }
+    static constexpr size_t parent_rule_offset() { return offsetof(CSSStyleDeclaration, m_parent_rule); }
 
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-owner-node
     Optional<DOM::AbstractElement> owner_node() const { return m_owner_node; }
@@ -74,16 +74,14 @@ protected:
         No,
         Yes,
     };
-    explicit CSSStyleDeclaration(JS::Realm&, Computed, Readonly);
+    explicit CSSStyleDeclaration(Computed, Readonly);
 
-    virtual void visit_edges(Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
+    void prepare_to_update_style_attribute();
     void update_style_attribute();
 
 private:
-    // ^PlatformObject
-    virtual Optional<JS::Value> item_value(size_t index) const override;
-
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-parent-css-rule
     GC::Ptr<CSSRule> m_parent_rule { nullptr };
 

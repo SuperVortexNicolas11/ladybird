@@ -4,10 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/Runtime/Realm.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/DirectiveFactory.h>
-#include <LibWeb/ContentSecurityPolicy/Directives/SerializedDirective.h>
+#include <LibWebCommon/ContentSecurityPolicy/Directives/SerializedDirective.h>
 
 namespace Web::ContentSecurityPolicy::Directives {
 

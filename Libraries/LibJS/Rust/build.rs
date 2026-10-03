@@ -309,7 +309,8 @@ fn read_expr_for_type(ty: &str, offset: usize) -> String {
         | "EnvironmentCoordinateCacheIndex"
         | "TemplateObjectCacheIndex"
         | "ObjectShapeCacheIndex"
-        | "ObjectPropertyIteratorCacheIndex" => {
+        | "ObjectPropertyIteratorCacheIndex"
+        | "EnvironmentShapeCacheIndex" => {
             format!("super::validator::read_u32(bytes, at + {offset})")
         }
         "u64" | "Value" => format!("super::validator::read_u64(bytes, at + {offset})"),
@@ -715,6 +716,10 @@ fn emit_scalar_field_check(
         "ObjectPropertyIteratorCacheIndex" => writeln!(
             w,
             "            validate_object_property_iterator_cache_index(read_u32(bytes, at + {offset}), ctx)?;"
+        )?,
+        "EnvironmentShapeCacheIndex" => writeln!(
+            w,
+            "            validate_environment_shape_cache_index(read_u32(bytes, at + {offset}), ctx)?;"
         )?,
         "u32" => {
             // The handler signature gives us no first-class types for SFD,
@@ -1418,14 +1423,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", flap_path.display());
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
-    println!("cargo:rerun-if-env-changed=FFI_OUTPUT_DIR");
     println!("cargo:rerun-if-changed=src");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-
-    let ffi_out_dir = env::var("FFI_OUTPUT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| out_dir.clone());
 
     cbindgen::generate(manifest_dir).map_or_else(
         |error| match error {
@@ -1435,10 +1435,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         |bindings| {
             let header_path = out_dir.join("RustFFI.h");
             bindings.write_to_file(&header_path);
-
-            if ffi_out_dir != out_dir {
-                bindings.write_to_file(ffi_out_dir.join("RustFFI.h"));
-            }
         },
     );
 

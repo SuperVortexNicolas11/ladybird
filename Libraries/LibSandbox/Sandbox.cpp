@@ -10,9 +10,12 @@
 #    include <AK/LexicalPath.h>
 #    include <AK/ScopeGuard.h>
 #    include <AK/Vector.h>
+#    include <dirent.h>
 #    include <errno.h>
 #    include <fcntl.h>
 #    include <linux/landlock.h>
+#    include <stdlib.h>
+#    include <string.h>
 #    include <sys/prctl.h>
 #    include <sys/stat.h>
 #    include <sys/syscall.h>
@@ -110,6 +113,18 @@ ErrorOr<void> add_seatbelt_path_if_exists(Vector<SeatbeltPath>& paths, StringVie
     return {};
 }
 
+Optional<ByteString> application_bundle_for_executable(StringView executable_path)
+{
+    LexicalPath path { executable_path };
+    auto const& parts = path.parts_view();
+    if (parts.size() < 4)
+        return {};
+    auto bundle_name = parts[parts.size() - 4];
+    if (parts[parts.size() - 2] != "MacOS"sv || parts[parts.size() - 3] != "Contents"sv || !bundle_name.ends_with(".app"sv) || bundle_name == ".app"sv)
+        return {};
+    return LexicalPath::dirname(LexicalPath::dirname(LexicalPath::dirname(path.string())));
+}
+
 static void append_sandbox_string_literal(StringBuilder& builder, StringView string)
 {
     builder.append('"');
@@ -121,11 +136,33 @@ static void append_sandbox_string_literal(StringBuilder& builder, StringView str
     builder.append('"');
 }
 
+// /etc, /tmp and /var are symbolic links into /private. Seatbelt checks some operations, such as file-test-existence,
+// against the path before it follows those links, so a rule for a path in /private also has to name the short form.
+static Optional<StringView> path_alias_outside_private(StringView path)
+{
+    for (auto prefix : { "/private/etc"sv, "/private/tmp"sv, "/private/var"sv }) {
+        if (path == prefix || path.starts_with(ByteString::formatted("{}/", prefix)))
+            return path.substring_view("/private"sv.length());
+    }
+    return {};
+}
+
+static void append_sandbox_path_filter(StringBuilder& builder, StringView filter, StringView path)
+{
+    builder.appendff("({} ", filter);
+    append_sandbox_string_literal(builder, path);
+    builder.append(')');
+
+    if (auto alias = path_alias_outside_private(path); alias.has_value()) {
+        builder.appendff(" ({} ", filter);
+        append_sandbox_string_literal(builder, *alias);
+        builder.append(')');
+    }
+}
+
 static void append_sandbox_path_filter(StringBuilder& builder, SeatbeltPath const& path)
 {
-    builder.append(path.is_directory ? "(subpath "sv : "(literal "sv);
-    append_sandbox_string_literal(builder, path.path);
-    builder.append(')');
+    append_sandbox_path_filter(builder, path.is_directory ? "subpath"sv : "literal"sv, path.path);
 }
 
 static bool seatbelt_path_allows_access(SeatbeltPath::Access path_access, SeatbeltPath::Access requested_access)
@@ -157,6 +194,30 @@ static ErrorOr<void> append_allowed_paths(StringBuilder& builder, StringView ope
     return {};
 }
 
+// Resolving a path, as realpath() does, needs the metadata of every directory above it.
+static ErrorOr<void> append_allowed_ancestor_directories(StringBuilder& builder, ReadonlySpan<SeatbeltPath> paths)
+{
+    Vector<ByteString> ancestors;
+    for (auto const& path : paths) {
+        for (auto ancestor = LexicalPath::dirname(path.path); ancestor != "/"sv && !ancestor.is_empty(); ancestor = LexicalPath::dirname(ancestor)) {
+            if (!ancestors.contains_slow(ancestor))
+                TRY(ancestors.try_append(ancestor));
+        }
+    }
+
+    if (ancestors.is_empty())
+        return {};
+
+    builder.append("(allow file-read-metadata file-test-existence"sv);
+    for (auto const& ancestor : ancestors) {
+        builder.append(' ');
+        append_sandbox_path_filter(builder, "literal"sv, ancestor);
+    }
+    builder.append(")\n"sv);
+
+    return {};
+}
+
 static ErrorOr<void> append_allowed_path_extensions(StringBuilder& builder, ReadonlySpan<SeatbeltPath> paths, SeatbeltPath::Access access)
 {
     auto extension_class = access == SeatbeltPath::Access::ReadWrite ? "com.apple.app-sandbox.read-write"sv : "com.apple.app-sandbox.read"sv;
@@ -172,9 +233,9 @@ static ErrorOr<void> append_allowed_path_extensions(StringBuilder& builder, Read
         }
         builder.append(" (require-all (extension-class "sv);
         append_sandbox_string_literal(builder, extension_class);
-        builder.append(") "sv);
+        builder.append(") (require-any "sv);
         append_sandbox_path_filter(builder, path);
-        builder.append(')');
+        builder.append("))"sv);
     }
 
     if (emitted_header)
@@ -188,13 +249,17 @@ static ErrorOr<void> append_allowed_executables(StringBuilder& builder, Readonly
     if (executable_paths.is_empty())
         return {};
 
-    builder.append("(allow process-exec"sv);
+    builder.append("(allow syscall-unix (syscall-number SYS_posix_spawn SYS_wait4))\n"sv);
+    builder.append("(allow process-fork)\n(allow process-exec"sv);
     for (auto const& path : executable_paths) {
         builder.append(" (literal "sv);
         append_sandbox_string_literal(builder, path);
         builder.append(')');
     }
     builder.append(")\n"sv);
+
+    // NB: Child processes inherit the sandbox, and dyld needs F_GETPATH to find the shared library cache during startup.
+    builder.append("(allow system-fcntl (fcntl-command F_GETPATH))\n"sv);
 
     return {};
 }
@@ -210,26 +275,173 @@ static ErrorOr<void> append_allowed_iokit_user_client_classes(StringBuilder& bui
     return {};
 }
 
-ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAccess network_access, ReadonlySpan<ByteString> executable_paths, ReadonlySpan<StringView> iokit_user_client_classes)
+static ErrorOr<void> append_allowed_mach_services(StringBuilder& builder, SeatbeltProfile const& options)
+{
+    // The frameworks behind these services read properties of the GPU, media and audio devices, and of the platform.
+    // Keep the properties that identify the machine out of reach.
+    if (has_flag(options.system_services, SystemService::GPU) || has_flag(options.system_services, SystemService::VideoDecoding) || has_flag(options.system_services, SystemService::Audio)) {
+        builder.append(R"~~~(
+(allow iokit-get-properties)
+(deny iokit-get-properties
+    (iokit-property
+        "IOMACAddress"
+        "IOPlatformSerialNumber"
+        "IOPlatformUUID"
+        "mlb-serial-number"
+        "serial-number"))
+)~~~"sv);
+    }
+
+    if (!options.mach_server_name.is_empty()) {
+        builder.append("(allow mach-lookup (global-name "sv);
+        append_sandbox_string_literal(builder, options.mach_server_name);
+        builder.append("))\n"sv);
+    }
+
+    if (has_flag(options.system_services, SystemService::Fonts)) {
+        builder.append(R"~~~(
+(allow mach-lookup
+    (global-name "com.apple.fonts")
+    (global-name "com.apple.FontObjectsServer"))
+)~~~"sv);
+    }
+
+    if (has_flag(options.system_services, SystemService::Audio)) {
+        builder.append(R"~~~(
+(allow mach-lookup
+    (global-name "com.apple.audio.audiohald")
+    (global-name "com.apple.audio.AudioSession")
+    (xpc-service-name "com.apple.audio.SandboxHelper"))
+)~~~"sv);
+    }
+
+    // Audio output units and audio decoders alike go through the component registrar.
+    if (has_flag(options.system_services, SystemService::Audio)) {
+        builder.append(R"~~~(
+(allow mach-lookup
+    (global-name "com.apple.audio.AudioComponentRegistrar"))
+)~~~"sv);
+    }
+
+    if (has_flag(options.system_services, SystemService::VideoDecoding)) {
+        builder.append(R"~~~(
+(allow mach-lookup
+    (xpc-service-name "com.apple.coremedia.videodecoder"))
+)~~~"sv);
+    }
+
+    // Two frameworks ask for the path behind a descriptor they hold: ANGLE for its own descriptors while it sets up an
+    // EGL display, and AudioToolbox's code-signing workaround checks while it creates its first AudioConverter — which
+    // crash with SIGBUS rather than fail when the command is denied. F_GETPATH also reveals the path of a descriptor
+    // that was handed over without one, so the Audio service alone doesn't grant it: The renderer plays WebAudio, but
+    // it also receives files from the Browser. MediaServer decodes, and receives nothing but sockets.
+    if (has_flag(options.system_services, SystemService::GPU) || has_flag(options.system_services, SystemService::AudioDecoding)) {
+        builder.append(R"~~~(
+(allow system-fcntl
+    (fcntl-command F_GETPATH))
+)~~~"sv);
+    }
+
+    if (has_flag(options.system_services, SystemService::JIT))
+        builder.append("(allow dynamic-code-generation)\n"sv);
+
+    if (has_flag(options.system_services, SystemService::IOSurface)) {
+        builder.append(R"~~~(
+(allow iokit-open-user-client
+    (iokit-user-client-class "IOSurfaceRootUserClient"))
+)~~~"sv);
+    }
+
+    if (has_flag(options.system_services, SystemService::GPU)) {
+        builder.append(R"~~~(
+(allow mach-lookup
+    (global-name "com.apple.CARenderServer")
+    (xpc-service-name "com.apple.MTLCompilerService"))
+
+; Metal loads the driver bundles for some GPUs from here.
+(allow file-read* file-test-existence
+    (subpath "/Library/GPUBundles"))
+
+)~~~"sv);
+    }
+
+    // CoreGraphics and CoreVideo reach the window server for anything about displays. Without it,
+    // CGGetActiveDisplayList() reports no displays and CVDisplayLinkCreateWithCGDisplay() fails with
+    // kCVReturnInvalidDisplay. The GPU processes of Chromium and WebKit allow the same service.
+    if (has_flag(options.system_services, SystemService::Display)) {
+        builder.append(R"~~~(
+(allow mach-lookup
+    (global-name "com.apple.windowserver.active"))
+)~~~"sv);
+    }
+
+    return {};
+}
+
+ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
 {
     StringBuilder profile;
     TRY(profile.try_append(R"~~~(
 (version 1)
+
+; Seatbelt otherwise adds syscalls that it thinks go with the allowed operations, such as fork() with process-fork.
+(disable-syscall-inference)
+
 (deny default
     (with message "Ladybird macOS sandbox default deny"))
 
-(allow process-info*)
+(deny process-info*)
+(allow process-info-pidinfo process-info-rusage process-info-setcontrol
+    (target self))
 (allow signal (target self))
-(allow sysctl-read)
-(allow system*)
-(allow ipc*)
-(allow mach*)
-(allow iokit-open-user-client
-    (iokit-user-client-class "IOSurfaceRootUserClient"))
-(allow user-preference-read
-    (preference-domain "kCFPreferencesAnyApplication")
-    (preference-domain "org.ladybird.ladybird"))
-
+(allow sysctl-read
+    (sysctl-name
+        "hw.activecpu"
+        "hw.byteorder"
+        "hw.cachelinesize"
+        "hw.cachesize"
+        "hw.cpufamily"
+        "hw.cpusubfamily"
+        "hw.cputype"
+        "hw.l1dcachesize"
+        "hw.l1icachesize"
+        "hw.l2cachesize"
+        "hw.l3cachesize"
+        "hw.logicalcpu"
+        "hw.logicalcpu_max"
+        "hw.machine"
+        "hw.memsize"
+        "hw.model"
+        "hw.ncpu"
+        "hw.nperflevels"
+        "hw.pagesize"
+        "hw.pagesize_compat"
+        "hw.physicalcpu"
+        "hw.physicalcpu_max"
+        "hw.tbfrequency"
+        "hw.tbfrequency_compat"
+        "hw.vectorunit"
+        "kern.bootargs"
+        "kern.hv_vmm_present"
+        "kern.maxfilesperproc"
+        "kern.osproductversion"
+        "kern.osrelease"
+        "kern.ostype"
+        "kern.osvariant_status"
+        "kern.osversion"
+        "kern.secure_kernel"
+        "kern.usrstack64"
+        "kern.version"
+        "kern.willshutdown"
+        "machdep.cpu.brand_string"
+        "sysctl.name2oid"
+        "sysctl.proc_cputype"
+        "sysctl.proc_translated"
+        "vm.malloc_ranges")
+    (sysctl-name-prefix "hw.optional.")
+    (sysctl-name-prefix "hw.perflevel"))
+(allow ipc-posix-shm-write-create ipc-posix-shm-write-unlink
+    (ipc-posix-name-prefix "/shm-"))
 (allow network-outbound
     (literal "/private/var/run/syslog"))
 
@@ -241,7 +453,6 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
     (syscall-group-bsdthread)
     (syscall-group-close)
     (syscall-group-fcntl)
-    (syscall-group-getfsstat)
     (syscall-group-kevent)
     (syscall-group-kqueue)
     (syscall-group-mkdir)
@@ -263,7 +474,6 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
     (syscall-group-write)
     (syscall-number
         SYS___disable_threadsignal
-        SYS___channel_open
         SYS___mac_syscall
         SYS___semwait_signal
         SYS___semwait_signal_nocancel
@@ -271,9 +481,10 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
         SYS_access
         SYS_change_fdguard_np
         SYS_connect
+        SYS_connect_nocancel
         SYS_crossarch_trap
+        SYS_csops
         SYS_csops_audittoken
-        SYS_csrctl
         SYS_dup
         SYS_exit
         SYS_faccessat
@@ -281,6 +492,8 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
         SYS_fileport_makeport
         SYS_fgetattrlist
         SYS_fgetxattr
+        SYS_fremovexattr
+        SYS_fsetxattr
         SYS_flock
         SYS_fsgetpath
         SYS_fsync
@@ -293,9 +506,9 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
         SYS_getegid
         SYS_geteuid
         SYS_getgid
-        SYS_gethostuuid
         SYS_getpeername
         SYS_getpid
+        SYS_getpriority
         SYS_getrusage
         SYS_getsockname
         SYS_gettid
@@ -318,22 +531,24 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
         SYS_msync
         SYS_munlock
         SYS_munmap
-        SYS_necp_client_action
-        SYS_necp_open
         SYS_open
         SYS_open_nocancel
         SYS_openat
+        SYS_openat_nocancel
         SYS_os_fault_with_payload
         SYS_pathconf
+        SYS_persona
         SYS_pipe
         SYS_poll
-        SYS_posix_spawn
         SYS_proc_info
         SYS_readlink
+        SYS_removexattr
         SYS_rename
         SYS_rmdir
         SYS_sendfile
+        SYS_setxattr
         SYS_shm_open
+        SYS_shm_unlink
         SYS_shared_region_check_np
         SYS_shared_region_map_and_slide_2_np
         SYS_socket
@@ -342,23 +557,87 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
         SYS_sysctlbyname
         SYS_thread_selfid
         SYS_umask
-        SYS_wait4
+        SYS_unlink
+        SYS_unlinkat
         SYS_work_interval_ctl
         SYS_workq_kernreturn
         SYS_workq_open))
 
-(allow file-read-metadata)
-(allow file-read*
+; System frameworks ask for the mount table, the host UUID and the System Integrity Protection state while they set
+; themselves up, and cope when they cannot have them. Fail these calls instead of killing the helper.
+(deny syscall-unix
+    (with errno 1)
+    (syscall-number
+        SYS_csrctl
+        SYS_getfsstat
+        SYS_getfsstat64
+        SYS_gethostuuid))
+
+; Mach vouchers carry attributes through the kernel's voucher attribute managers, which parse recipes that the caller
+; provides. The helpers do not create vouchers of their own.
+(deny syscall-mach
+    (machtrap-number MSC_host_create_mach_voucher_trap))
+
+(deny dynamic-code-generation)
+(deny iokit-get-properties)
+(deny nvram*)
+
+(deny file-lock)
+
+; NB: dyld needs F_ADDFILESIGS_RETURN to load libraries after the sandbox is in place, for example Metal's GPU plugin.
+(deny system-fcntl)
+(allow system-fcntl
+    (fcntl-command
+        F_ADDFILESIGS_RETURN
+        F_BARRIERFSYNC
+        F_CHECK_LV
+        F_DUPFD
+        F_DUPFD_CLOEXEC
+        F_FULLFSYNC
+        F_GETFD
+        F_GETFL
+        F_GETLK
+        F_GETNOSIGPIPE
+        F_GETPROTECTIONCLASS
+        F_NOCACHE
+        F_OFD_GETLK
+        F_OFD_SETLK
+        F_OFD_SETLKW
+        F_RDADVISE
+        F_SETFD
+        F_SETFL
+        F_SETLK
+        F_SETLKW
+        F_SETNOSIGPIPE))
+
+(deny file-test-existence)
+
+(allow file-read-metadata file-test-existence
+    (literal "/Library")
+    (literal "/System/Volumes/Data")
+    (literal "/etc")
+    (literal "/private")
+    (literal "/private/etc")
+    (literal "/private/tmp")
+    (literal "/private/var")
+    (literal "/private/var/db")
+    (literal "/tmp")
+    (literal "/usr")
+    (literal "/var"))
+
+(allow file-read* file-test-existence
     (literal "/")
-    (literal "/dev/dtracehelper")
     (literal "/dev/null")
     (literal "/dev/random")
     (literal "/dev/urandom")
+    (literal "/etc/localtime")
     (literal "/private/etc/localtime")
+    (subpath "/etc/ssl")
     (subpath "/private/etc/ssl")
     (subpath "/System")
     (subpath "/Library/Preferences/Logging")
     (subpath "/private/var/db/timezone")
+    (subpath "/var/db/timezone")
     (subpath "/usr/lib")
     (subpath "/usr/share"))
 
@@ -366,20 +645,54 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
     (subpath "/System")
     (subpath "/usr/lib"))
 
-(allow file-write-data file-ioctl
-    (literal "/dev/dtracehelper"))
 )~~~"sv));
 
-    if (network_access == NetworkAccess::Allowed)
-        TRY(profile.try_append("(allow network*)\n"sv));
+    if (options.network_access == NetworkAccess::Allowed) {
+        TRY(profile.try_append(R"~~~(
+; Connect to hosts on the network and to the system's network daemons, but not to local sockets of other processes.
+(allow network-outbound
+    (remote ip)
+    (control-name "com.apple.netsrc")
+    (literal "/private/var/run/mDNSResponder"))
 
-    TRY(append_allowed_paths(profile, "file-read*"sv, paths, SeatbeltPath::Access::ReadOnly));
-    TRY(append_allowed_paths(profile, "file-map-executable"sv, paths, SeatbeltPath::Access::ReadAndExecute));
-    TRY(append_allowed_paths(profile, "file-write*"sv, paths, SeatbeltPath::Access::ReadWrite));
-    TRY(append_allowed_path_extensions(profile, paths, SeatbeltPath::Access::ReadOnly));
-    TRY(append_allowed_path_extensions(profile, paths, SeatbeltPath::Access::ReadWrite));
-    TRY(append_allowed_executables(profile, executable_paths));
-    TRY(append_allowed_iokit_user_client_classes(profile, iokit_user_client_classes));
+; SecTrust evaluates TLS certificates through the per-user trust daemon.
+(allow mach-lookup
+    (global-name "com.apple.trustd.agent"))
+
+; Sharing a port with another socket would let a helper receive traffic that is meant for another process.
+(deny socket-option-set
+    (require-all
+        (socket-option-level SOL_SOCKET)
+        (socket-option-name SO_REUSEADDR SO_REUSEPORT)))
+
+(allow sysctl-read
+    (sysctl-name-prefix "net.routetable."))
+(allow system-socket
+    (require-all
+        (socket-domain AF_SYSTEM)
+        (socket-protocol 2)))
+(allow system-necp-client-action)
+(allow file-test-existence
+    (literal "/private/var/run/mDNSResponder")
+    (literal "/var/run/mDNSResponder"))
+(allow syscall-unix
+    (syscall-number
+        SYS___channel_open
+        SYS_necp_client_action
+        SYS_necp_open))
+)~~~"sv));
+    }
+
+    TRY(append_allowed_paths(profile, "file-read* file-test-existence"sv, options.paths, SeatbeltPath::Access::ReadOnly));
+    TRY(append_allowed_ancestor_directories(profile, options.paths));
+    TRY(append_allowed_paths(profile, "file-map-executable"sv, options.paths, SeatbeltPath::Access::ReadAndExecute));
+    TRY(append_allowed_paths(profile, "file-write*"sv, options.paths, SeatbeltPath::Access::ReadWrite));
+    TRY(append_allowed_paths(profile, "file-lock"sv, options.paths, SeatbeltPath::Access::ReadWrite));
+    TRY(append_allowed_path_extensions(profile, options.paths, SeatbeltPath::Access::ReadOnly));
+    TRY(append_allowed_path_extensions(profile, options.paths, SeatbeltPath::Access::ReadWrite));
+    TRY(append_allowed_executables(profile, options.executable_paths));
+    TRY(append_allowed_iokit_user_client_classes(profile, options.iokit_user_client_classes));
+    TRY(append_allowed_mach_services(profile, options));
 
     auto profile_string = profile.to_byte_string();
 
@@ -402,17 +715,49 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
 #endif
 
 #if defined(AK_OS_LINUX)
+static ErrorOr<size_t> count_threads()
+{
+    auto* directory = opendir("/proc/self/task");
+    if (!directory)
+        return Error::from_syscall("opendir(/proc/self/task)"sv, errno);
+
+    size_t thread_count = 0;
+    while (auto* entry = readdir(directory)) {
+        if (entry->d_name[0] != '.')
+            ++thread_count;
+    }
+    closedir(directory);
+    return thread_count;
+}
+
 ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths)
 {
-#    if defined(__NR_landlock_create_ruleset) && defined(__NR_landlock_add_rule) && defined(__NR_landlock_restrict_self)
+    // Landlock confines only the calling thread and the threads that it starts later. A thread that already runs would
+    // keep full access to the file system.
+    if (TRY(count_threads()) != 1)
+        return Error::from_string_literal("Landlock must be applied before the process starts a second thread");
+
+    // Without Landlock, nothing limits the files a helper can open, so we refuse to go on. Running without it has to
+    // be a choice that the user makes with --disable-sandbox.
     auto landlock_abi = syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
-    if (landlock_abi < 0) {
-        if (errno == ENOSYS || errno == EOPNOTSUPP || errno == EINVAL)
-            return {};
+    if (landlock_abi < 0 && errno != ENOSYS && errno != EOPNOTSUPP)
         return Error::from_syscall("landlock_create_ruleset(LANDLOCK_CREATE_RULESET_VERSION)"sv, errno);
+    if (landlock_abi <= 0) {
+        // NB: Only for machines that cannot run Landlock at all, such as our CI runners. The rest of the sandbox still
+        //     applies. On a kernel that has Landlock, this changes nothing.
+        if (auto const* allow = getenv("LADYBIRD_UNSAFE_ALLOW_MISSING_LANDLOCK"); allow && StringView { allow, strlen(allow) } == "1"sv) {
+            warnln("Landlock is not available in this kernel. This helper runs without file system confinement, because LADYBIRD_UNSAFE_ALLOW_MISSING_LANDLOCK is set.");
+            return {};
+        }
+        return Error::from_string_literal("Landlock is not available in this kernel, so the helper cannot be sandboxed (--disable-sandbox runs helpers without a sandbox)");
     }
-    if (landlock_abi == 0)
-        return {};
+
+    // Before ABI 3, Landlock does not handle truncation, so a helper can truncate any file that it can open.
+    static bool s_warned_about_truncation = false;
+    if (landlock_abi < 3 && !s_warned_about_truncation) {
+        s_warned_about_truncation = true;
+        warnln("Landlock ABI {} does not restrict file truncation. Linux 6.2 or later is needed for that.", landlock_abi);
+    }
 
     landlock_ruleset_attr ruleset_attributes {};
     ruleset_attributes.handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE
@@ -429,19 +774,28 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
         | LANDLOCK_ACCESS_FS_MAKE_BLOCK
         | LANDLOCK_ACCESS_FS_MAKE_SYM;
 
-#        ifdef LANDLOCK_ACCESS_FS_REFER
+#    ifdef LANDLOCK_ACCESS_FS_REFER
     if (landlock_abi >= 2)
         ruleset_attributes.handled_access_fs |= LANDLOCK_ACCESS_FS_REFER;
-#        endif
-#        ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+#    endif
+#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
     if (landlock_abi >= 3)
         ruleset_attributes.handled_access_fs |= LANDLOCK_ACCESS_FS_TRUNCATE;
-#        endif
-#        if defined(LANDLOCK_ACCESS_NET_BIND_TCP) && defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
+#    endif
+#    if defined(LANDLOCK_ACCESS_NET_BIND_TCP) && defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
     auto ruleset_attributes_size = offsetof(landlock_ruleset_attr, handled_access_net);
-#        else
+#    else
     auto ruleset_attributes_size = sizeof(ruleset_attributes);
+#    endif
+#    ifdef LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
+    if (landlock_abi >= 6) {
+        ruleset_attributes.scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
+#        ifdef LANDLOCK_SCOPE_SIGNAL
+        ruleset_attributes.scoped |= LANDLOCK_SCOPE_SIGNAL;
 #        endif
+        ruleset_attributes_size = offsetof(landlock_ruleset_attr, scoped) + sizeof(ruleset_attributes.scoped);
+    }
+#    endif
     auto ruleset_fd = syscall(__NR_landlock_create_ruleset, &ruleset_attributes, ruleset_attributes_size, 0);
     if (ruleset_fd < 0)
         return Error::from_syscall("landlock_create_ruleset"sv, errno);
@@ -478,10 +832,10 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
         case LandlockPath::Access::ReadWrite: {
             path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE;
 
-#        ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
             if (landlock_abi >= 3)
                 path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
-#        endif
+#    endif
 
             if (landlock_path.is_directory) {
                 path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_READ_DIR
@@ -492,10 +846,10 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
                     | LANDLOCK_ACCESS_FS_MAKE_SOCK
                     | LANDLOCK_ACCESS_FS_MAKE_FIFO;
 
-#        ifdef LANDLOCK_ACCESS_FS_REFER
+#    ifdef LANDLOCK_ACCESS_FS_REFER
                 if (landlock_abi >= 2)
                     path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_REFER;
-#        endif
+#    endif
             }
             break;
         }
@@ -507,9 +861,6 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
 
     if (syscall(__NR_landlock_restrict_self, ruleset_fd, 0) < 0)
         return Error::from_syscall("landlock_restrict_self"sv, errno);
-#    else
-    (void)paths;
-#    endif
 
     return {};
 }

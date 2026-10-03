@@ -6,11 +6,13 @@
 
 #pragma once
 
+#include <AK/IntrusiveList.h>
 #include <LibGC/RootHashTable.h>
-#include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
+#include <LibGfx/Matrix4x4.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGAnimatedLength.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGFitToViewBox.h>
@@ -23,13 +25,23 @@ class SVGPatternElement
     : public SVGElement
     , public SVGFitToViewBox
     , public SVGURIReferenceMixin<SupportsXLinkHref::Yes> {
-    WEB_PLATFORM_OBJECT(SVGPatternElement, SVGElement);
+    WEB_WRAPPABLE(SVGPatternElement, SVGElement);
     GC_DECLARE_ALLOCATOR(SVGPatternElement);
 
 public:
     virtual ~SVGPatternElement() override = default;
 
+    virtual SVGFitToViewBox const* fit_to_view_box() const override { return this; }
+
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
+    virtual void inserted() override;
+    virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
+    virtual void moved_from(IsSubtreeRoot, GC::Ptr<Node> old_ancestor) override;
+    virtual void finalize() override;
+
+    Optional<Utf16String> href_attribute_value() const;
+    // The id this pattern's href names, if any.
+    Optional<Utf16String> linked_id() const;
 
     SVGUnits pattern_units() const;
     SVGUnits pattern_content_units() const;
@@ -40,31 +52,35 @@ public:
     NumberPercentage pattern_height() const;
 
     // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGPatternElement__x
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, SVGLengthValue::number(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGPatternElement__y
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, SVGLengthValue::number(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGPatternElement__width
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, SVGLengthValue::number(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGPatternElement__height
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, SVGLengthValue::number(0));
 
     GC::Ptr<SVGPatternElement const> pattern_content_element() const;
 
-    Optional<Painting::PaintStyle> to_gfx_paint_style(SVGPaintContext const&, DisplayListRecordingContext&, Layout::Node const& target_layout_node) const;
+    void push_paint_server_description(void* sink, Layout::Node const& target_layout_node) const;
 
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override { return nullptr; }
+    virtual CSS::ElementBoxKind box_kind() const override { return CSS::ElementBoxKind::NoBox; }
 
 protected:
     SVGPatternElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void initialize_element() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
 private:
     virtual bool is_svg_pattern_element() const final { return true; }
+
+    void update_document_pattern_list_membership();
+
+    IntrusiveListNode<SVGPatternElement> m_list_node;
 
     GC::Ptr<SVGPatternElement const> linked_pattern(GC::RootHashTable<SVGPatternElement const*>& seen_patterns) const;
     GC::Ptr<SVGPatternElement const> pattern_content_element_impl(GC::RootHashTable<SVGPatternElement const*>& seen_patterns) const;
@@ -84,6 +100,9 @@ private:
     Optional<NumberPercentage> m_y;
     Optional<NumberPercentage> m_width;
     Optional<NumberPercentage> m_height;
+
+public:
+    using DocumentPatternElementList = IntrusiveList<&SVGPatternElement::m_list_node>;
 };
 
 }

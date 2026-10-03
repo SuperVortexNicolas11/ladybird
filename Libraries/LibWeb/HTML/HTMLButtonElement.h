@@ -22,22 +22,18 @@ namespace Web::HTML {
 class HTMLButtonElement final
     : public HTMLElement
     , public PopoverTargetAttributes {
-    WEB_PLATFORM_OBJECT(HTMLButtonElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLButtonElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLButtonElement);
 
 public:
     virtual ~HTMLButtonElement() override;
-
-    virtual void initialize(JS::Realm&) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
-
     enum class TypeAttributeState {
 #define __ENUMERATE_HTML_BUTTON_TYPE_ATTRIBUTE(_, state) state,
         ENUMERATE_HTML_BUTTON_TYPE_ATTRIBUTES
 #undef __ENUMERATE_HTML_BUTTON_TYPE_ATTRIBUTE
     };
 
-    TypeAttributeState type_state() const;
+    TypeAttributeState type_state() const { return m_type_state; }
     Utf16FlyString type_for_bindings() const;
     void set_type_for_bindings(Utf16View);
 
@@ -101,6 +97,9 @@ private:
     // ^DOM::Element
     virtual i32 default_tab_index_value() const override;
 
+    static TypeAttributeState parse_type_attribute(Optional<Utf16String> const&);
+
+    TypeAttributeState m_type_state { TypeAttributeState::Auto };
     GC::Ptr<DOM::Element> m_command_for_element;
 };
 

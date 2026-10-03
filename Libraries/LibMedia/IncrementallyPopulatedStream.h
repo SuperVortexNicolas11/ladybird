@@ -8,8 +8,10 @@
 
 #include <AK/Atomic.h>
 #include <AK/AtomicRefCounted.h>
+#include <AK/ConditionVariable.h>
 #include <AK/Forward.h>
 #include <AK/Function.h>
+#include <AK/Mutex.h>
 #include <AK/RedBlackTree.h>
 #include <AK/RefPtr.h>
 #include <AK/Time.h>
@@ -18,8 +20,6 @@
 #include <LibMedia/DecoderError.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/MediaStream.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 
 namespace Media {
 
@@ -33,14 +33,14 @@ public:
 
     virtual NonnullRefPtr<MediaStreamCursor> create_cursor() override;
 
-    // Callback invoked when data at a specific offset is needed but not available.
-    // The callback receives the desired offset position and is invoked on the provided event loop.
-    using DataRequestCallback = Function<void(u64 offset)>;
+    // Invoked to request data at a particular offset. If the stream is idle and nothing is blocked on data, this will
+    // be invoked without an offset. It is invoked on the originating event loop.
+    using DataRequestCallback = Function<void(Optional<u64> offset)>;
     void set_data_request_callback(DataRequestCallback);
+    void set_may_idle(bool);
 
     void add_chunk_at(u64 offset, ReadonlyBytes);
     void remove_byte_range(u64 start, u64 end);
-    u64 next_chunk_start() const { return m_last_chunk_end; }
 
     void close();
     virtual bool is_closed() const override;
@@ -61,9 +61,11 @@ public:
 
         virtual DecoderErrorOr<void> seek(i64 offset, AK::SeekMode mode) override;
         virtual DecoderErrorOr<size_t> read_into(Bytes bytes) override;
+        virtual DecoderErrorOr<FixedArray<u8>> read_bytes(size_t size) override;
 
         virtual size_t position() const override { return m_position; }
-        virtual size_t size() const override { return m_stream->size(); }
+        virtual Optional<u64> size() const override { return m_stream->expected_size(); }
+        virtual size_t blocking_size() const override { return m_stream->size(); }
 
         virtual void abort() override;
         virtual void reset_abort() override { m_aborted = false; }
@@ -115,14 +117,18 @@ private:
 
     DecoderErrorOr<size_t> read_at(Cursor&, size_t position, Bytes&);
 
+    bool a_cursor_is_blocked_while_locked() const;
+    u64 select_request_position_while_locked(u64 position);
     void begin_new_request_while_locked(u64 position);
+    void stop_request_if_idle_while_locked();
+    void dispatch_data_request_while_locked(Optional<u64> position);
     bool check_if_data_is_available_or_begin_request_while_locked(Cursor&, u64 position, u64 length);
     size_t read_from_chunks_while_locked(u64 position, Bytes& bytes) const;
     void notify_available_ranges_changed_while_locked();
 
-    mutable Sync::Mutex m_mutex;
+    mutable Mutex m_mutex;
     Vector<Cursor&> m_cursors;
-    Sync::ConditionVariable m_state_changed { m_mutex };
+    ConditionVariable m_state_changed { m_mutex };
 
     Chunks m_chunks;
     Optional<u64> m_expected_size;
@@ -132,8 +138,10 @@ private:
 
     RefPtr<Core::WeakEventLoopReference> m_callback_event_loop;
     DataRequestCallback m_data_request_callback;
-    u64 m_currently_requested_position { 0 };
-    u64 m_last_chunk_end { 0 };
+    Optional<u64> m_currently_requested_position { 0 };
+    u64 m_current_append_head { 0 };
+    u64 m_last_appended_chunk_end { 0 };
+    bool m_may_idle { false };
 };
 
 }

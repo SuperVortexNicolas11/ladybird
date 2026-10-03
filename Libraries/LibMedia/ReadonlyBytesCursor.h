@@ -46,19 +46,29 @@ public:
         if (m_position >= m_data.size())
             return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "End of buffer"sv);
 
-        auto available = m_data.size() - m_position;
-        if (available < bytes.size())
-            return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "End of buffer"sv);
-
-        auto to_read = bytes.size();
+        auto to_read = min(bytes.size(), m_data.size() - m_position);
         m_data.slice(m_position, to_read).copy_to(bytes);
         m_position += to_read;
         VERIFY(m_position <= m_data.size());
         return to_read;
     }
 
+    virtual DecoderErrorOr<FixedArray<u8>> read_bytes(size_t size) override
+    {
+        if (size == 0)
+            return FixedArray<u8>();
+
+        if (m_position >= m_data.size() || size > m_data.size() - m_position)
+            return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "End of buffer"sv);
+
+        auto buffer = DECODER_TRY_ALLOC(FixedArray<u8>::create(m_data.slice(m_position, size)));
+        m_position += size;
+        return buffer;
+    }
+
     virtual size_t position() const override { return m_position; }
-    virtual size_t size() const override { return m_data.size(); }
+    virtual Optional<u64> size() const override { return m_data.size(); }
+    virtual size_t blocking_size() const override { return m_data.size(); }
 
     void set_data(ReadonlyBytes data) { m_data = data; }
 

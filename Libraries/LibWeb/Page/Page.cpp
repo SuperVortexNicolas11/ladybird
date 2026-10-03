@@ -7,45 +7,59 @@
  */
 
 #include <AK/SourceLocation.h>
+#include <LibGC/Heap.h>
+#include <LibGC/HeapVector.h>
+#include <LibGfx/Bitmap.h>
+#include <LibGfx/PaintingSurface.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
-#include <LibWeb/Bindings/ExceptionOrUtils.h>
+#include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/CSS/StyleComputer.h>
-#include <LibWeb/Clipboard/SystemClipboard.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Range.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
+#include <LibWeb/HTML/HTMLVideoElement.h>
+#include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/HTML/OffscreenCanvas.h>
+#include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowProxy.h>
+#include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWebCommon/Clipboard/SystemClipboard.h>
+#include <LibWebCommon/HTML/NavigationPopulationRequest.h>
+#include <LibWebCommon/HTML/SelectedFile.h>
 
 namespace Web {
 
 GC_DEFINE_ALLOCATOR(Page);
 
-GC::Ref<Page> Page::create(JS::VM& vm, GC::Ref<PageClient> page_client)
+GC::Ref<Page> Page::create(GC::Ref<PageClient> page_client)
 {
-    return vm.heap().allocate<Page>(page_client);
+    return GC::Heap::the().allocate<Page>(page_client);
 }
 
 Page::Page(GC::Ref<PageClient> client)
     : m_client(client)
+    , m_history_executor(GC::Heap::the().allocate<HTML::HistoryExecutor>(*this))
 {
 }
 
@@ -67,6 +81,21 @@ void Page::release_screen_wake_lock()
 bool Page::has_compositor_host() const
 {
     return m_client->compositor_host();
+}
+
+void Page::retire_page_compositor_context(OwnPtr<Compositor::CompositorContextHandle> context)
+{
+    m_retired_page_compositor_context = move(context);
+}
+
+OwnPtr<Compositor::CompositorContextHandle> Page::take_retired_page_compositor_context()
+{
+    return move(m_retired_page_compositor_context);
+}
+
+void Page::drop_retired_page_compositor_context()
+{
+    m_retired_page_compositor_context.clear();
 }
 
 void Page::ensure_compositor_host()
@@ -94,11 +123,18 @@ Compositor::CompositorHost const& Page::compositor_host() const
 void Page::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
+    if (m_context_menu_request.has_value())
+        visitor.visit(m_context_menu_request->target);
     visitor.visit(m_top_level_traversable);
+    visitor.visit(m_navigables_being_destroyed);
+    visitor.visit(m_history_executor);
     visitor.visit(m_client);
     visitor.visit(m_window_rect_observer);
     visitor.visit(m_on_pending_dialog_closed);
     visitor.visit(m_pending_clipboard_requests);
+    visitor.visit(m_emulated_position_data);
+    visitor.visit(m_emulated_position_data_observers);
+    visitor.visit(m_offscreen_canvases_pending_placeholder_commit);
     for (auto const& request : m_pending_geolocation_requests)
         visitor.visit(request.value.callback);
     m_pending_fullscreen_operations.for_each([&](auto const& operation) {
@@ -113,88 +149,115 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     });
 }
 
-HTML::LocalNavigable& Page::focused_navigable()
+// The navigable keyboard input goes to in the tab, which is the top-level traversable until focus moves into another.
+GC::Ptr<HTML::Navigable> Page::focused_navigable() const
 {
-    if (m_focused_navigable)
-        return *m_focused_navigable;
-    return top_level_traversable();
+    if (m_focused_navigable && !m_focused_navigable->has_been_destroyed())
+        return m_focused_navigable.ptr();
+    return m_top_level_traversable;
 }
 
-void Page::set_focused_navigable(HTML::LocalNavigable& navigable)
+GC::Ptr<HTML::LocalNavigable> Page::hosted_focused_navigable() const
 {
+    return as_if<HTML::LocalNavigable>(focused_navigable().ptr());
+}
+
+void Page::set_focused_navigable(HTML::Navigable& navigable)
+{
+    if (m_focused_navigable == &navigable)
+        return;
+    update_focused_navigable(navigable);
+
+    // NB: The UI process holds the tab's focused navigable and tells the other pages of the tab. A navigable hosted by
+    //     another process is focused there, and that process tells it.
+    if (is<HTML::LocalNavigable>(navigable))
+        m_client->page_did_change_focused_navigable(navigable.id());
+}
+
+void Page::focused_navigable_changed_in_another_page(HTML::CrossProcessId id)
+{
+    // NB: The focus update steps ran in the page that moved focus, for the documents it hosts. The documents this page
+    //     hosts go from the focus chain they held to the one the tab's focused navigable shows here.
+    auto root = top_level_traversable();
+    auto old_focused_area = root->currently_focused_area();
+    update_focused_navigable(navigable_with_id(id));
+    auto new_focused_area = root->currently_focused_area_shown_by_focused_navigable();
+    if (old_focused_area == new_focused_area)
+        return;
+    HTML::run_focus_update_steps(HTML::focus_chain(old_focused_area), HTML::focus_chain(new_focused_area), new_focused_area);
+}
+
+void Page::update_focused_navigable(GC::Ptr<HTML::Navigable> navigable)
+{
+    invalidate_compositor_keyboard_scroll_state();
     m_focused_navigable = navigable;
+    for (auto const& root : local_roots())
+        root->set_needs_repaint();
 }
 
 void Page::navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable& navigable)
 {
-    if (&navigable == m_focused_navigable.ptr())
-        m_focused_navigable = nullptr;
-    if (&navigable == m_mouse_event_tracking_navigable.ptr())
+    // NB: The tab's focused navigable outlives the documents it shows, and is cleared when it is itself destroyed.
+    if (GC::Ref { navigable } == m_mouse_event_tracking_navigable.ptr())
         m_mouse_event_tracking_navigable = nullptr;
 }
 
-void Page::load(URL::URL const& url, Bindings::NavigationHistoryBehavior history_handling)
+void Page::queue_screenshot_task(Optional<UniqueNodeID> node_id)
 {
-    (void)top_level_traversable()->navigate({ .url = url, .source_document = *top_level_traversable()->active_document(), .history_handling = history_handling, .user_involvement = HTML::UserNavigationInvolvement::BrowserUI });
+    m_screenshot_tasks.enqueue({ node_id });
+    local_traversable()->set_needs_repaint();
+    client().request_frame();
 }
 
-void Page::load(URL::URL const& url, HTML::DocumentResource document_resource,
-    Bindings::NavigationHistoryBehavior history_handling, Optional<HTML::NavigationSourceSnapshot> source_snapshot)
+void Page::process_screenshot_requests()
 {
-    (void)top_level_traversable()->navigate({
-        .url = url,
-        .source_document = *top_level_traversable()->active_document(),
-        .document_resource = move(document_resource),
-        .history_handling = history_handling,
-        .user_involvement = HTML::UserNavigationInvolvement::BrowserUI,
-        .cross_process_source_snapshot = move(source_snapshot),
-    });
-}
-
-void Page::load_html(StringView html)
-{
-    // FIXME: #23909 Figure out why GC threshold does not stay low when repeatedly loading html from the WebView
-    heap().collect_garbage();
-
-    (void)top_level_traversable()->navigate({ .url = URL::about_srcdoc(),
-        .source_document = *top_level_traversable()->active_document(),
-        .document_resource = Utf16String::from_utf8(html),
-        .user_involvement = HTML::UserNavigationInvolvement::BrowserUI });
-}
-
-void Page::load_html(StringView html, URL::URL const& url)
-{
-    // FIXME: #23909 Figure out why GC threshold does not stay low when repeatedly loading html from the WebView
-    heap().collect_garbage();
-
-    auto document = top_level_traversable()->active_document();
-    auto& realm = document->realm();
-    auto html_string = String::from_utf8(html).release_value_but_fixme_should_propagate_errors();
-
-    auto response = Fetch::Infrastructure::Response::create(realm.vm());
-    response->url_list().append(url);
-    response->header_list()->append({ "Content-Type"sv, "text/html"sv });
-    response->set_body(Fetch::Infrastructure::byte_sequence_as_body(realm, html_string.bytes()));
-
-    HTML::LocalNavigable::NavigateParams params { .url = url,
-        .source_document = *document,
-        .response = response,
-        .user_involvement = HTML::UserNavigationInvolvement::BrowserUI };
-
-    if (url == URL::about_srcdoc())
-        params.document_resource = Utf16String::from_utf8(html);
-
-    (void)top_level_traversable()->navigate(move(params));
-}
-
-void Page::reload()
-{
-    top_level_traversable()->reload();
-}
-
-void Page::traverse_the_history_by_delta(int delta)
-{
-    m_client->page_did_request_traverse_the_history_by_delta(delta, HistoryTraversalPrecheck::Needed);
+    // Screenshots are of the tab as the view displays it.
+    if (m_screenshot_tasks.is_empty())
+        return;
+    auto& client = this->client();
+    auto navigable = local_traversable();
+    while (!m_screenshot_tasks.is_empty()) {
+        auto task = m_screenshot_tasks.dequeue();
+        if (task.node_id.has_value()) {
+            auto* dom_node = DOM::Node::from_unique_id(*task.node_id);
+            if (dom_node)
+                dom_node->document().update_layout(DOM::UpdateLayoutReason::ProcessScreenshot);
+            auto const* layout_node = dom_node ? dom_node->layout_node() : nullptr;
+            if (!layout_node || !Painting::has_committed_box(*layout_node)) {
+                client.page_did_take_screenshot({});
+                continue;
+            }
+            auto rect = enclosing_device_rect(Painting::absolute_border_box_rect(*layout_node));
+            auto bitmap_or_error = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, rect.size().to_type<int>());
+            if (bitmap_or_error.is_error()) {
+                client.page_did_take_screenshot({});
+                continue;
+            }
+            auto bitmap = bitmap_or_error.release_value();
+            auto painting_surface = Gfx::PaintingSurface::wrap_bitmap(*bitmap);
+            HTML::PaintConfig paint_config { .canvas_fill_rect = rect.to_type<int>() };
+            navigable->render_screenshot(painting_surface, paint_config, [bitmap, &client] {
+                client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
+            });
+        } else {
+            navigable->active_document()->update_layout(DOM::UpdateLayoutReason::ProcessScreenshot);
+            auto const* layout_node = navigable->active_document()->layout_node();
+            VERIFY(layout_node && Painting::has_committed_box(*layout_node));
+            auto scrollable_overflow_rect = Painting::scrollable_overflow_rect(*layout_node);
+            auto rect = enclosing_device_rect(scrollable_overflow_rect.value());
+            auto bitmap_or_error = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, rect.size().to_type<int>());
+            if (bitmap_or_error.is_error()) {
+                client.page_did_take_screenshot({});
+                continue;
+            }
+            auto bitmap = bitmap_or_error.release_value();
+            auto painting_surface = Gfx::PaintingSurface::wrap_bitmap(*bitmap);
+            HTML::PaintConfig paint_config { .paint_overlay = true, .canvas_fill_rect = rect.to_type<int>() };
+            navigable->render_screenshot(painting_surface, paint_config, [bitmap, &client] {
+                client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
+            });
+        }
+    }
 }
 
 Gfx::Palette Page::palette() const
@@ -248,6 +311,12 @@ CSS::PreferredColorScheme Page::preferred_color_scheme() const
 {
     if (m_preferred_color_scheme_override_for_testing.has_value())
         return *m_preferred_color_scheme_override_for_testing;
+
+    // Force-dark presents a dark preference, the way Android WebView's force-dark does (Chrome itself leaves the
+    // preference alone and darkens per element): a page that can style itself dark does, the color-scheme opt-out keeps
+    // the filter away from it, and only pages with no dark support get filtered.
+    if (has_local_traversable() && local_traversable()->force_dark_enabled())
+        return CSS::PreferredColorScheme::Dark;
 
     auto preferred_color_scheme = m_client->preferred_color_scheme();
 
@@ -337,7 +406,7 @@ ChromeMetrics Page::chrome_metrics() const
     return ChromeMetrics { m_client->zoom_level() };
 }
 
-EventResult Page::handle_mouseup(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers)
+EventResult Page::handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target)
 {
     // INTEROP: Releasing outside an iframe still ends selection and drag tracking in the child document where the
     //          interaction began, while the mouseup event itself remains targeted at the document under the pointer.
@@ -347,17 +416,27 @@ EventResult Page::handle_mouseup(DevicePixelPoint position, DevicePixelPoint scr
             navigable->event_handler().reset_mouse_input_tracking({});
         }
     };
-    return top_level_traversable()->event_handler().handle_mouseup(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers);
+    return root.event_handler().handle_mouseup(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, remote_target);
 }
 
-EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count)
+EventResult Page::handle_mouseup(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers)
+{
+    return handle_mouseup(local_traversable(), position, screen_position, button, buttons, modifiers, nullptr);
+}
+
+EventResult Page::handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Web::ScrollbarDraggedByCompositor> const& scrollbar_dragged_by_compositor, Optional<RemoteInputEventTarget>* remote_target)
 {
     if (button == UIEvents::MouseButton::Primary) {
         if (auto navigable = m_mouse_event_tracking_navigable)
             navigable->event_handler().reset_mouse_input_tracking({});
         m_mouse_event_tracking_navigable = nullptr;
     }
-    return top_level_traversable()->event_handler().handle_mousedown(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, click_count);
+    return root.event_handler().handle_mousedown(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, remote_target);
+}
+
+EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Web::ScrollbarDraggedByCompositor> const& scrollbar_dragged_by_compositor)
+{
+    return handle_mousedown(local_traversable(), position, screen_position, button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, nullptr);
 }
 
 void Page::set_mouse_event_tracking_navigable(Badge<EventHandler>, HTML::LocalNavigable& navigable)
@@ -365,86 +444,197 @@ void Page::set_mouse_event_tracking_navigable(Badge<EventHandler>, HTML::LocalNa
     m_mouse_event_tracking_navigable = navigable;
 }
 
+void Page::set_hover_reporting_navigable(Badge<EventHandler>, GC::Ptr<HTML::LocalNavigable> navigable)
+{
+    m_hover_reporting_navigable = navigable;
+}
+
+EventResult Page::handle_mousemove(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target)
+{
+    return root.event_handler().handle_mousemove(device_to_css_point(position), device_to_css_point(screen_position), buttons, modifiers, remote_target);
+}
+
 EventResult Page::handle_mousemove(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers)
 {
-    return top_level_traversable()->event_handler().handle_mousemove(device_to_css_point(position), device_to_css_point(screen_position), buttons, modifiers);
+    return handle_mousemove(local_traversable(), position, screen_position, buttons, modifiers, nullptr);
+}
+
+EventResult Page::handle_mouseleave(HTML::LocalNavigable& root)
+{
+    return root.event_handler().handle_mouseleave();
 }
 
 EventResult Page::handle_mouseleave()
 {
-    return top_level_traversable()->event_handler().handle_mouseleave();
+    return handle_mouseleave(local_traversable());
 }
 
 #if defined(AK_OS_MACOS)
 bool Page::select_word_for_dictionary_lookup(DevicePixelPoint position)
 {
-    return top_level_traversable()->event_handler().select_word_for_dictionary_lookup(device_to_css_point(position));
+    auto navigable = hosted_focused_navigable();
+    if (!navigable)
+        return false;
+    return navigable->local_root()->event_handler().select_word_for_dictionary_lookup(device_to_css_point(position));
 }
 #endif
 
 UniqueNodeID Page::node_id_at_position(DevicePixelPoint position)
 {
-    auto node = top_level_traversable()->event_handler().target_node_for_mouse_position(device_to_css_point(position));
+    auto node = local_traversable()->event_handler().target_node_for_mouse_position(device_to_css_point(position));
     if (!node)
         return 0;
 
     return node->unique_id();
 }
 
-EventResult Page::handle_mousewheel(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation)
+EventResult Page::handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target)
 {
-    return top_level_traversable()->event_handler().handle_mousewheel(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, async_scroll_performed_default_action, async_scroll_operation);
+    return root.event_handler().handle_mousewheel(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, remote_target);
+}
+
+EventResult Page::handle_mousewheel(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation)
+{
+    return handle_mousewheel(local_traversable(), position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, nullptr);
+}
+
+EventResult Page::handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type type, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files)
+{
+    return root.event_handler().handle_drag_and_drop_event(type, device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, move(files));
 }
 
 EventResult Page::handle_drag_and_drop_event(DragEvent::Type type, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files)
 {
-    return top_level_traversable()->event_handler().handle_drag_and_drop_event(type, device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, move(files));
+    return handle_drag_and_drop_event(local_traversable(), type, position, screen_position, button, buttons, modifiers, move(files));
+}
+
+EventResult Page::handle_pinch_event(HTML::LocalNavigable& root, DevicePixelPoint position, unsigned modifiers, double scale)
+{
+    return root.event_handler().handle_pinch_event(device_to_css_point(position), modifiers, scale);
 }
 
 EventResult Page::handle_pinch_event(DevicePixelPoint position, unsigned modifiers, double scale)
 {
-    return top_level_traversable()->event_handler().handle_pinch_event(device_to_css_point(position), modifiers, scale);
+    return handle_pinch_event(local_traversable(), position, modifiers, scale);
 }
 
-EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text)
+EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action)
 {
-    return focused_navigable().event_handler().handle_keydown(key, modifiers, code_point, repeat, should_insert_text);
+    // The compositor forwards these updates ahead of keyboard events. Both DOM listeners and a main-thread
+    // fallback default action must observe the offsets that have already been presented.
+    auto navigable = hosted_focused_navigable();
+    if (!navigable)
+        return EventResult::Dropped;
+    navigable->local_root()->adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
+    return navigable->event_handler().handle_keydown(key, modifiers, code_point, repeat, should_insert_text, async_scroll_performed_default_action);
 }
 
 EventResult Page::handle_keyup(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat)
 {
-    return focused_navigable().event_handler().handle_keyup(key, modifiers, code_point, repeat);
+    auto navigable = hosted_focused_navigable();
+    if (!navigable)
+        return EventResult::Dropped;
+    navigable->local_root()->adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
+    return navigable->event_handler().handle_keyup(key, modifiers, code_point, repeat);
 }
 
 void Page::handle_sdl_input_events()
 {
-    top_level_traversable()->event_handler().handle_sdl_input_events();
+    // The view's input reaches the page displaying the tab.
+    if (has_local_traversable())
+        local_traversable()->event_handler().handle_sdl_input_events();
+}
+
+void Page::invalidate_compositor_keyboard_scroll_state()
+{
+    if (!m_keyboard_scroll_state_is_current)
+        return;
+    m_keyboard_scroll_state_is_current = false;
+    ++m_keyboard_scroll_state_generation;
+    if (has_local_traversable() && local_traversable()->has_compositor_context()) {
+        // No synchronous barrier is needed if the last publication already disabled keyboard scrolling.
+        if (m_keyboard_scroll_state_is_scrollable)
+            local_traversable()->compositor_context().invalidate_keyboard_scroll_state(m_keyboard_scroll_state_generation);
+        local_traversable()->set_needs_repaint();
+    }
+}
+
+void Page::invalidate_compositor_keyboard_scroll_state_for_document(DOM::Document const& document)
+{
+    if (has_local_traversable() && local_traversable()->active_document().ptr() == &document)
+        invalidate_compositor_keyboard_scroll_state();
+}
+
+void Page::keyboard_scroll_event_path_changed(DOM::EventTarget const& target)
+{
+    if (m_keyboard_scroll_state_is_current && m_keyboard_scroll_event_path.contains([&](auto const& dependency) { return dependency.ptr().ptr() == &target; }))
+        invalidate_compositor_keyboard_scroll_state();
+}
+
+void Page::keyboard_scroll_dom_tree_changed(DOM::Node const& subtree)
+{
+    if (!m_keyboard_scroll_state_is_current || !has_local_traversable())
+        return;
+    auto document = local_traversable()->active_document();
+    if (!document || &subtree.document() != document.ptr())
+        return;
+
+    keyboard_scroll_event_path_changed(subtree);
+    if (auto target = m_keyboard_scroll_dom_target.ptr(); target && subtree.is_shadow_including_inclusive_ancestor_of(*target))
+        invalidate_compositor_keyboard_scroll_state();
+
+    // With no focused area, inserting/replacing the body can change the event target even though the new body
+    // was not in the previous snapshot's path.
+    if (!document->focused_area() && !m_keyboard_scroll_event_path.is_empty()) {
+        DOM::Node const* event_target = document->body() ?: &document->root();
+        if (m_keyboard_scroll_event_path.first().ptr().ptr() != event_target)
+            invalidate_compositor_keyboard_scroll_state();
+    }
+}
+
+void Page::keyboard_scroll_editability_changed(DOM::Document& document)
+{
+    if (m_keyboard_scroll_state_is_current && has_local_traversable()
+        && local_traversable()->active_document().ptr() == &document
+        && m_keyboard_scroll_focus_is_editable != (document.active_input_events_target() != nullptr))
+        invalidate_compositor_keyboard_scroll_state();
+}
+
+Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor(u64 visual_context_tree_structural_epoch)
+{
+    if (!has_local_traversable() || !local_traversable()->has_compositor_context())
+        return {};
+    auto snapshot = local_traversable()->event_handler().keyboard_scroll_snapshot();
+    m_keyboard_scroll_event_path = move(snapshot.event_path);
+    m_keyboard_scroll_dom_target = snapshot.scroll_target;
+    auto document = local_traversable()->active_document();
+    m_keyboard_scroll_focus_is_editable = document && document->active_input_events_target();
+    auto state = snapshot.state;
+    state.generation = m_keyboard_scroll_state_generation;
+    state.visual_context_tree_structural_epoch = visual_context_tree_structural_epoch;
+    m_keyboard_scroll_state_is_scrollable = state.target.has_value();
+    m_keyboard_scroll_state_is_current = true;
+    return state;
 }
 
 void Page::invalidate_compositor_wheel_event_listener_state()
 {
     ++m_wheel_event_listener_state_generation;
 
-    if (!m_async_scrolling_enabled || !top_level_traversable_is_initialized() || !top_level_traversable()->has_compositor_context())
-        return;
-
-    top_level_traversable()->compositor_context().invalidate_wheel_event_listener_state(m_wheel_event_listener_state_generation);
+    for (auto const& root : local_roots()) {
+        if (root->has_compositor_context())
+            root->compositor_context().invalidate_wheel_event_listener_state(m_wheel_event_listener_state_generation);
+    }
 }
 
 void Page::update_needs_beforeunload_check()
 {
     auto needs_beforeunload_check = [&] {
-        if (!top_level_traversable_is_initialized())
+        if (!has_top_level_traversable())
             return true;
 
-        auto top_level_traversable = this->top_level_traversable();
-        auto active_document = top_level_traversable->active_document();
-        if (!active_document)
-            return true;
-        if (active_document->navigable() != top_level_traversable.ptr())
-            return true;
-
-        for (auto const& navigable : active_document->inclusive_descendant_navigables()) {
+        // Each page reports the listeners of the documents it hosts.
+        for (auto const& navigable : hosted_navigables()) {
             auto window = navigable->active_window();
             if (window && window->has_event_listener(HTML::EventNames::beforeunload))
                 return true;
@@ -460,7 +650,7 @@ void Page::update_needs_beforeunload_check()
     client().page_did_change_needs_beforeunload_check(m_needs_beforeunload_check);
 }
 
-void Page::set_top_level_traversable(GC::Ref<HTML::LocalTraversableNavigable> navigable)
+void Page::set_top_level_traversable(GC::Ref<HTML::Navigable> navigable)
 {
     VERIFY(!m_top_level_traversable); // Replacement is not allowed!
     VERIFY(&navigable->page() == this);
@@ -468,30 +658,365 @@ void Page::set_top_level_traversable(GC::Ref<HTML::LocalTraversableNavigable> na
     update_needs_beforeunload_check();
 }
 
-bool Page::top_level_traversable_is_initialized() const
-{
-    return m_top_level_traversable;
-}
-
-HTML::BrowsingContext& Page::top_level_browsing_context()
-{
-    return *m_top_level_traversable->active_browsing_context();
-}
-
-HTML::BrowsingContext const& Page::top_level_browsing_context() const
-{
-    return *m_top_level_traversable->active_browsing_context();
-}
-
-GC::Ref<HTML::LocalTraversableNavigable> Page::top_level_traversable() const
+GC::Ref<HTML::Navigable> Page::top_level_traversable() const
 {
     return *m_top_level_traversable;
 }
 
-void Page::did_update_window_rect()
+bool Page::has_local_traversable() const
+{
+    return m_top_level_traversable && is<HTML::LocalNavigable>(*m_top_level_traversable);
+}
+
+GC::Ref<HTML::LocalNavigable> Page::local_traversable() const
+{
+    return as<HTML::LocalNavigable>(*m_top_level_traversable);
+}
+
+Vector<GC::Ref<HTML::LocalNavigable>> Page::local_roots() const
+{
+    Vector<GC::Ref<HTML::LocalNavigable>> roots;
+    if (!m_top_level_traversable)
+        return roots;
+    Function<void(HTML::Navigable&)> collect = [&](HTML::Navigable& navigable) {
+        if (navigable.has_been_destroyed())
+            return;
+        if (auto* local_navigable = as_if<HTML::LocalNavigable>(navigable)) {
+            roots.append(*local_navigable);
+            return;
+        }
+        for (auto const& child : as<HTML::RemoteNavigable>(navigable).children())
+            collect(*child);
+    };
+    collect(*m_top_level_traversable);
+    return roots;
+}
+
+Vector<GC::Root<HTML::LocalNavigable>> Page::hosted_navigables() const
+{
+    Vector<GC::Root<HTML::LocalNavigable>> navigables;
+    for (auto const& root : local_roots())
+        navigables.extend(root->hosted_inclusive_descendant_navigables());
+    return navigables;
+}
+
+GC::Ptr<HTML::Navigable> Page::navigable_with_id(HTML::CrossProcessId id) const
+{
+    for (auto& navigable : HTML::all_local_navigables()) {
+        if (navigable->id() == id && &navigable->page() == this && !navigable->has_been_destroyed())
+            return navigable;
+    }
+    if (auto navigable = HTML::remote_navigable_with_id(*this, id); navigable && !navigable->has_been_destroyed())
+        return navigable;
+    return nullptr;
+}
+
+void Page::create_remote_navigable_graph(Vector<HTML::RemoteNavigableDescriptor> descriptors)
+{
+    VERIFY(!m_top_level_traversable);
+    ensure_compositor_host();
+
+    // The graph is every navigable of the tab, parents before children and siblings in creation order, every one of
+    // them hosted by another process until this page begins hosting one.
+    for (auto& descriptor : descriptors) {
+        GC::Ptr<HTML::Navigable> parent;
+        if (descriptor.parent_id.has_value()) {
+            parent = HTML::remote_navigable_with_id(*this, *descriptor.parent_id);
+            VERIFY(parent);
+        }
+        auto navigable = HTML::RemoteNavigable::create(*this, descriptor.id, parent, move(descriptor.replicated_state));
+        if (parent)
+            as<HTML::RemoteNavigable>(*parent).append_child(navigable);
+        else
+            set_top_level_traversable(navigable);
+    }
+    VERIFY(m_top_level_traversable);
+}
+
+// The page destroys a child before the UI process hears of it, and messages about that child, or about its subtree,
+// can still be on their way here: a navigable the page no longer holds is left alone.
+void Page::insert_remote_navigable(HTML::RemoteNavigableDescriptor descriptor)
+{
+    VERIFY(descriptor.parent_id.has_value());
+    auto parent = HTML::remote_navigable_with_id(*this, *descriptor.parent_id);
+    if (!parent)
+        return;
+    parent->append_child(HTML::RemoteNavigable::create(*this, descriptor.id, parent, move(descriptor.replicated_state)));
+}
+
+void Page::remove_remote_navigable(HTML::CrossProcessId id)
+{
+    auto navigable = HTML::remote_navigable_with_id(*this, id);
+    if (!navigable)
+        return;
+    as<HTML::RemoteNavigable>(*navigable->parent()).remove_child(*navigable);
+    navigable->set_has_been_destroyed();
+    navigable->remove_from_all_remote_navigables();
+}
+
+void Page::update_remote_navigable(HTML::CrossProcessId id, HTML::ReplicatedNavigableState state)
+{
+    auto navigable = HTML::remote_navigable_with_id(*this, id);
+    if (!navigable)
+        return;
+    navigable->set_replicated_state(move(state));
+}
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#completely-finish-loading
+void Page::content_navigable_completely_finished_loading(HTML::CrossProcessId id)
+{
+    // NB: The document completely finished loading in the process hosting it. Its container, whose document this page
+    //     hosts, runs steps 4 and 5 here.
+    auto navigable = HTML::remote_navigable_with_id(*this, id);
+    if (!navigable)
+        return;
+    if (auto container = navigable->container())
+        container->content_navigable_completely_finished_loading();
+}
+
+void Page::discard_provisional_navigable_of(HTML::RemoteNavigable& remote_navigable)
+{
+    auto navigable = remote_navigable.provisional_navigable();
+    if (!navigable)
+        return;
+    remote_navigable.set_provisional_navigable(nullptr);
+    navigable->clear_provisional_for();
+    if (navigable->is_delaying_load_events())
+        navigable->set_delaying_load_events(false);
+    navigable->set_container({}, nullptr);
+    // The tab's stand-in gives the page's traversable back to the RemoteNavigable it stood in for.
+    if (m_top_level_traversable.ptr() == navigable.ptr()) {
+        m_top_level_traversable = remote_navigable;
+        update_needs_beforeunload_check();
+        retire_page_compositor_context(navigable->take_compositor_context());
+    }
+    navigable->set_has_been_destroyed();
+    if (auto document = navigable->active_document())
+        document->destroy_a_document_and_its_descendants();
+    navigable->remove_from_all_local_navigables();
+}
+
+// A tab's traversable created before a view displayed it joins the group the UI process creates for the tab then.
+void Page::set_browsing_context_group(u64 browsing_context_group_id)
+{
+    auto* traversable = as_if<HTML::LocalTraversableNavigable>(m_top_level_traversable.ptr());
+    if (auto browsing_context = traversable ? traversable->active_browsing_context() : nullptr)
+        browsing_context->set_browsing_context_group_id(browsing_context_group_id);
+}
+
+GC::Ref<HTML::LocalNavigable> Page::begin_hosting(HTML::CrossProcessId id, HTML::SessionHistoryEntryDescriptor const& current_history_entry)
+{
+    auto navigable = HTML::remote_navigable_with_id(*this, id);
+    VERIFY(navigable && !navigable->has_been_destroyed());
+    // A host chosen for the navigable's previous navigation, which never activated a document here.
+    discard_provisional_navigable_of(*navigable);
+    // The tab's document, or an isolated frame's. The tab's stand-in is the page's traversable from now on: the page
+    // displays the tab through it until the document it populates activates, or the stand-in is discarded.
+    if (!navigable->parent()) {
+        auto stand_in = HTML::LocalTraversableNavigable::create_stand_in({}, *navigable, current_history_entry);
+        stand_in->active_browsing_context()->set_browsing_context_group_id(navigable->replicated_state().browsing_context_group_id);
+        VERIFY(m_top_level_traversable.ptr() == navigable.ptr());
+        m_top_level_traversable = stand_in;
+        update_needs_beforeunload_check();
+        return stand_in;
+    }
+    return HTML::LocalNavigable::create_stand_in({}, *navigable, current_history_entry);
+}
+
+void Page::adopt_hosted(HTML::LocalNavigable& navigable)
+{
+    auto remote_navigable = navigable.provisional_for();
+    VERIFY(remote_navigable && remote_navigable->provisional_navigable().ptr() == &navigable);
+
+    if (auto container = remote_navigable->container()) {
+        container->swap_content_navigable_to_local({}, navigable);
+    } else if (auto parent = remote_navigable->parent()) {
+        as<HTML::RemoteNavigable>(*parent).replace_child(*remote_navigable, navigable);
+    } else {
+        // The tab's stand-in has been the page's traversable since it began hosting the tab.
+        VERIFY(m_top_level_traversable.ptr() == &navigable);
+    }
+
+    navigable.clear_provisional_for();
+    remote_navigable->set_provisional_navigable(nullptr);
+    remote_navigable->set_has_been_destroyed();
+    remote_navigable->remove_from_all_remote_navigables();
+}
+
+void Page::discard_provisional_navigable(HTML::CrossProcessId id)
+{
+    if (auto navigable = HTML::remote_navigable_with_id(*this, id))
+        discard_provisional_navigable_of(*navigable);
+}
+
+void Page::stop_hosting(HTML::CrossProcessId id, HTML::ReplicatedNavigableState state)
+{
+    auto navigable = navigable_with_id(id);
+    if (!navigable)
+        return;
+    // The page retired the navigable when its document was unloaded. This is the state its next document activated
+    // with.
+    if (auto* remote_navigable = as_if<HTML::RemoteNavigable>(*navigable)) {
+        remote_navigable->set_replicated_state(move(state));
+        return;
+    }
+    stop_hosting(as<HTML::LocalNavigable>(*navigable), move(state));
+}
+
+void Page::stop_hosting(HTML::LocalNavigable& local_navigable, HTML::ReplicatedNavigableState state)
+{
+    // A stand-in for a lost document never took the navigable's node over.
+    if (auto remote_navigable = local_navigable.provisional_for()) {
+        discard_provisional_navigable_of(*remote_navigable);
+        remote_navigable->set_replicated_state(move(state));
+        return;
+    }
+
+    if (auto container = local_navigable.container()) {
+        container->swap_content_navigable_to_remote({}, move(state));
+        return;
+    }
+
+    // A local root: the RemoteNavigable takes its place among the children of its parent, whose document another
+    // process hosts, or as the traversable of a page displaying the tab no longer.
+    auto parent = local_navigable.parent();
+    auto remote_navigable = HTML::RemoteNavigable::create(*this, local_navigable.id(), parent, move(state));
+    // The container's page can destroy the navigable while its document activates here, after the UI process's walk
+    // unloaded the document it displayed before: the document is unloaded now, as that walk would have.
+    if (auto document = local_navigable.active_document()) {
+        local_navigable.inform_the_navigation_api_about_child_navigable_destruction();
+        document->unload();
+    }
+    // The WindowProxy scripts hold stays theirs.
+    if (auto window_proxy = local_navigable.window_proxy_after_unload()) {
+        remote_navigable->set_window_proxy(*window_proxy);
+        window_proxy->set_window(remote_navigable->active_window());
+    }
+    if (parent) {
+        as<HTML::RemoteNavigable>(*parent).replace_child(local_navigable, remote_navigable);
+    } else {
+        VERIFY(m_top_level_traversable.ptr() == &local_navigable);
+        m_top_level_traversable = remote_navigable;
+        retire_page_compositor_context(local_navigable.take_compositor_context());
+    }
+    local_navigable.set_has_been_destroyed();
+    local_navigable.remove_from_all_local_navigables();
+}
+
+// https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
+GC::Ptr<HTML::LocalNavigable> Page::fullscreen_element_and_its_containers(GC::Ref<DOM::Element> element, Fullscreen::RequestType request_type, ElementIsRequestedElement element_is_requested_element)
+{
+    // 11. Let fullscreenElements be an ordered set initially consisting of this.
+    auto fullscreen_elements = GC::Heap::the().allocate<GC::HeapVector<GC::Ref<DOM::Element>>>();
+    fullscreen_elements->elements().append(element);
+
+    // 12. While true:
+    while (true) {
+        // 1. Let last be the last item of fullscreenElements.
+        auto last = fullscreen_elements->elements().last();
+
+        // 2. Let container be last's node navigable's container.
+        auto container = last->navigable()->container();
+
+        // 3. If container is null, then break.
+        if (!container)
+            break;
+
+        // 4. Append container to fullscreenElements.
+        fullscreen_elements->elements().append(*container);
+    }
+
+    // 13. For each element in fullscreenElements:
+    for (auto& fullscreen_element : fullscreen_elements->elements()) {
+        // 1. Let doc be element's node document.
+        auto& doc = fullscreen_element->document();
+
+        // 2. If element is doc's fullscreen element, continue.
+        if (doc.fullscreen_element() == fullscreen_element)
+            continue;
+
+        // 3. If element is this and this is an iframe element, then set element's iframe fullscreen flag.
+        if (fullscreen_element == element && element_is_requested_element == ElementIsRequestedElement::Yes) {
+            if (auto* iframe = as_if<HTML::HTMLIFrameElement>(*fullscreen_element))
+                iframe->set_iframe_fullscreen_flag(true);
+        }
+
+        // 4. Fullscreen element within doc.
+        doc.fullscreen_element_within_doc(fullscreen_element, request_type);
+
+        // 5. Append (fullscreenchange, element) to doc's list of pending fullscreen events.
+        doc.append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, fullscreen_element, request_type);
+    }
+
+    // NB: The walk stops at the navigable whose container another process holds. That process runs these steps for
+    //     the container and the containers above it.
+    auto last_navigable = fullscreen_elements->elements().last()->navigable();
+    if (!last_navigable->container() && last_navigable->parent())
+        return last_navigable;
+    return nullptr;
+}
+
+// https://fullscreen.spec.whatwg.org/#exit-fullscreen
+void Page::unfullscreen_descendant_documents(Vector<GC::Root<HTML::Navigable>> const& descendant_navigables)
+{
+    for (auto const& descendant : descendant_navigables) {
+        auto* local_descendant = as_if<HTML::LocalNavigable>(*descendant);
+        if (!local_descendant) {
+            // NB: The document of a descendant hosted by another process is there, with its own descendants. The UI
+            //     process has that process run these steps for it.
+            auto& remote_descendant = as<HTML::RemoteNavigable>(*descendant);
+            if (remote_descendant.parent() && is<HTML::LocalNavigable>(*remote_descendant.parent()))
+                m_client->page_did_request_remote_document_unfullscreen(remote_descendant.id());
+            continue;
+        }
+        auto descendant_doc = local_descendant->active_document();
+        if (!descendant_doc)
+            continue;
+        auto fullscreen_element = descendant_doc->fullscreen_element();
+        if (!fullscreen_element)
+            continue;
+
+        // 1. Append (fullscreenchange, descendantDoc's fullscreen element) to descendantDoc's list of pending
+        //    fullscreen events.
+        descendant_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, *fullscreen_element, fullscreen_element->fullscreen_request_type());
+
+        // 2. Unfullscreen descendantDoc.
+        descendant_doc->unfullscreen();
+    }
+}
+
+void Page::discard()
+{
+    // A tab closed while this page still displayed a document of it: the document goes without the unload the UI
+    // process runs otherwise, as the documents of a top-level traversable being destroyed do.
+    for (auto const& navigable : local_roots()) {
+        if (auto document = navigable->active_document())
+            document->destroy_a_document_and_its_descendants();
+        navigable->set_has_been_destroyed();
+        navigable->remove_from_all_local_navigables();
+    }
+    client().page_did_close();
+}
+
+void Page::hold_navigable_being_destroyed(Badge<HTML::NavigableContainer>, GC::Ref<HTML::Navigable> navigable)
+{
+    m_navigables_being_destroyed.append(navigable);
+}
+
+void Page::release_navigable_being_destroyed(Badge<HTML::NavigableContainer>, HTML::Navigable& navigable)
+{
+    m_navigables_being_destroyed.remove_first_matching([&](auto const& held) { return held.ptr() == &navigable; });
+}
+
+HTML::HistoryExecutor& Page::history_executor()
+{
+    return *m_history_executor;
+}
+
+void Page::did_complete_window_rect_request(u64 completion_id)
 {
     if (m_window_rect_observer)
-        m_window_rect_observer->function()({ window_position(), window_size() });
+        m_window_rect_observer->function()({ window_position(), window_size() }, completion_id);
 }
 
 template<typename ResponseType>
@@ -500,7 +1025,7 @@ static ResponseType spin_event_loop_until_dialog_closed(PageClient& client, Opti
     auto& event_loop = Web::HTML::current_settings_object().responsible_event_loop();
     auto pause_handle = event_loop.pause();
 
-    Web::Platform::EventLoopPlugin::the().spin_until(GC::create_function(event_loop.heap(), [&]() {
+    Web::Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), [&]() {
         return response.has_value() || !client.is_connection_open();
     }));
 
@@ -567,6 +1092,15 @@ void Page::prompt_closed(Optional<Utf16String> response)
         m_pending_prompt_response = move(response);
         on_pending_dialog_closed();
     }
+}
+
+// NB: A dialog blocks the whole tab, so every page of the tab holds the one a document of any of them opened.
+void Page::did_open_dialog_in_another_process(PendingDialog dialog, Utf16String const& message)
+{
+    m_pending_dialog = dialog;
+    m_pending_dialog_text.clear();
+    if (!message.is_empty())
+        m_pending_dialog_text = message;
 }
 
 void Page::dismiss_dialog(GC::Ref<GC::Function<void()>> on_dialog_closed)
@@ -661,12 +1195,12 @@ void Page::file_picker_closed(Span<HTML::SelectedFile> selected_files)
     }
 }
 
-void Page::did_request_select_dropdown(GC::Weak<HTML::HTMLSelectElement> target, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items)
+void Page::did_request_select_dropdown(GC::Weak<HTML::HTMLSelectElement> target, HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items)
 {
     if (m_pending_non_blocking_dialog == PendingNonBlockingDialog::None) {
         m_pending_non_blocking_dialog = PendingNonBlockingDialog::Select;
         m_pending_non_blocking_dialog_target = move(target);
-        m_client->page_did_request_select_dropdown(content_position, minimum_width, move(items));
+        m_client->page_did_request_select_dropdown(local_root_id, content_position, minimum_width, move(items));
     }
 }
 
@@ -695,6 +1229,35 @@ void Page::retrieved_clipboard_entries(u64 request_id, Vector<Clipboard::SystemC
 {
     if (auto request = m_pending_clipboard_requests.take(request_id); request.has_value())
         (*request)->function()(move(items));
+}
+
+// https://w3c.github.io/geolocation/#dfn-emulated-position-data
+void Page::set_emulated_position_data(Geolocation::EmulatedPositionData data)
+{
+    m_emulated_position_data = data;
+
+    GC::RootVector<GC::Ref<GC::Function<void()>>> observers;
+    for (auto& observer : m_emulated_position_data_observers)
+        observers.append(observer.value);
+    for (auto& observer : observers)
+        observer->function()();
+}
+
+void Page::set_emulated_position_data(Geolocation::CoordinatesData coordinates_data)
+{
+    set_emulated_position_data(heap().allocate<Geolocation::GeolocationCoordinates>(move(coordinates_data)));
+}
+
+u64 Page::register_emulated_position_data_observer(GC::Ref<GC::Function<void()>> observer)
+{
+    auto observer_id = m_next_emulated_position_data_observer_id++;
+    m_emulated_position_data_observers.set(observer_id, observer);
+    return observer_id;
+}
+
+void Page::unregister_emulated_position_data_observer(u64 observer_id)
+{
+    m_emulated_position_data_observers.remove(observer_id);
 }
 
 u64 Page::request_geolocation_position(GeolocationPositionCallback callback, GeolocationRequestType type)
@@ -798,6 +1361,25 @@ void Page::for_each_media_element(Callback&& callback)
     }
 }
 
+bool Page::has_media_element_playing_audio(DOM::Document const& document) const
+{
+    for (auto media_id : m_media_elements) {
+        auto* node = DOM::Node::from_unique_id(media_id);
+        if (node && &node->document() == &document && as<HTML::HTMLMediaElement>(*node).is_playing_audio())
+            return true;
+    }
+    return false;
+}
+
+void Page::sync_media_element_video_sink_ticking()
+{
+    for_each_media_element([&](auto& media_element) {
+        media_element.sync_video_sink_ticking();
+        if (auto* video_element = as_if<HTML::HTMLVideoElement>(&media_element))
+            Painting::push_video_paint_facts(*video_element);
+    });
+}
+
 void Page::restore_all_media_element_video_sinks()
 {
     for_each_media_element([&](auto& media_element) {
@@ -808,7 +1390,7 @@ void Page::restore_all_media_element_video_sinks()
 void Page::detach_all_media_element_video_sinks_after_compositor_lost()
 {
     for_each_media_element([&](auto& media_element) {
-        media_element.detach_video_sink_after_compositor_lost();
+        media_element.detach_video_sink_edge();
     });
 }
 
@@ -833,6 +1415,11 @@ void Page::for_each_canvas_element(Callback&& callback)
     }
 }
 
+void Page::enqueue_offscreen_canvas_placeholder_commit(Badge<HTML::OffscreenCanvas>, HTML::OffscreenCanvas& offscreen_canvas)
+{
+    m_offscreen_canvases_pending_placeholder_commit.append(offscreen_canvas);
+}
+
 void Page::prepare_canvas_contexts_for_compositing()
 {
     for_each_canvas_element([](auto& canvas_element) {
@@ -844,6 +1431,11 @@ void Page::prepare_canvas_contexts_for_compositing()
     // even when nothing else repaints this rendering update.
     if (has_compositor_host())
         compositor_host().flush_canvas_2d_stream();
+
+    GC::RootVector<GC::Ref<HTML::OffscreenCanvas>> offscreen_canvases { m_offscreen_canvases_pending_placeholder_commit.span() };
+    m_offscreen_canvases_pending_placeholder_commit.clear();
+    for (auto& offscreen_canvas : offscreen_canvases)
+        offscreen_canvas->commit_to_placeholder();
 }
 
 void Page::notify_all_canvas_elements_of_lost_backing_storage()
@@ -860,10 +1452,22 @@ void Page::notify_all_webgl_contexts_lost()
     });
 }
 
-void Page::did_request_media_context_menu(UniqueNodeID media_id, CSSPixelPoint position, ByteString const& target, unsigned modifiers, MediaContextMenu const& menu)
+void Page::record_context_menu_request(Badge<EventHandler>, ContextMenuRequest request)
+{
+    m_context_menu_request = request;
+}
+
+Optional<Page::ContextMenuRequest> Page::take_context_menu_request()
+{
+    auto request = m_context_menu_request;
+    m_context_menu_request.clear();
+    return request;
+}
+
+void Page::did_request_media_context_menu(UniqueNodeID media_id, HTML::CrossProcessId local_root_id, CSSPixelPoint position, ByteString const& target, unsigned modifiers, MediaContextMenu const& menu, HTML::PreparedNavigationDescriptor navigation)
 {
     m_media_context_menu_element_id = media_id;
-    client().page_did_request_media_context_menu(position, target, modifiers, menu);
+    client().page_did_request_media_context_menu(local_root_id, position, target, modifiers, menu, move(navigation));
 }
 
 void Page::toggle_media_play_state()
@@ -872,13 +1476,10 @@ void Page::toggle_media_play_state()
     if (!media_element)
         return;
 
-    // AD-HOC: An execution context is required for Promise creation hooks.
-    HTML::TemporaryExecutionContext execution_context { media_element->realm() };
-
     if (media_element->potentially_playing())
         media_element->pause();
     else
-        media_element->play();
+        media_element->play_from_user_interaction();
 }
 
 void Page::toggle_media_mute_state()
@@ -888,7 +1489,7 @@ void Page::toggle_media_mute_state()
         return;
 
     // AD-HOC: An execution context is required for Promise creation hooks.
-    HTML::TemporaryExecutionContext execution_context { media_element->realm() };
+    HTML::TemporaryExecutionContext execution_context { media_element->document().relevant_settings_object() };
 
     media_element->set_muted(!media_element->muted());
 }
@@ -900,7 +1501,7 @@ void Page::toggle_media_loop_state()
         return;
 
     // AD-HOC: An execution context is required for Promise creation hooks.
-    HTML::TemporaryExecutionContext execution_context { media_element->realm() };
+    HTML::TemporaryExecutionContext execution_context { media_element->document().relevant_settings_object() };
 
     if (media_element->has_attribute(HTML::AttributeNames::loop))
         media_element->remove_attribute(HTML::AttributeNames::loop);
@@ -914,7 +1515,7 @@ void Page::toggle_media_fullscreen_state()
     if (!media_element)
         return;
 
-    HTML::TemporaryExecutionContext execution_context { media_element->realm() };
+    HTML::TemporaryExecutionContext execution_context { media_element->document().relevant_settings_object() };
     media_element->toggle_fullscreen();
 }
 
@@ -924,7 +1525,7 @@ void Page::toggle_media_controls_state()
     if (!media_element)
         return;
 
-    HTML::TemporaryExecutionContext execution_context { media_element->realm() };
+    HTML::TemporaryExecutionContext execution_context { media_element->document().relevant_settings_object() };
 
     if (media_element->has_attribute(HTML::AttributeNames::controls))
         media_element->remove_attribute(HTML::AttributeNames::controls);
@@ -961,7 +1562,13 @@ GC::Ptr<HTML::HTMLMediaElement> Page::media_context_menu_element()
 
 void Page::set_user_style(Utf16String source)
 {
-    m_user_style_sheet_source = move(source);
+    // An empty user style is indistinguishable from having none, and shadow scopes only share style
+    // caches while no user style is present, so setting an empty source clears it outright. This
+    // matters across tests too: page state outlives the documents a test runner loads into it.
+    if (source.is_empty())
+        m_user_style_sheet_source = {};
+    else
+        m_user_style_sheet_source = move(source);
     invalidate_user_style();
 }
 
@@ -979,22 +1586,37 @@ void Page::set_content_blocking_enabled(bool enabled)
 
 void Page::invalidate_user_style()
 {
-    if (!top_level_traversable_is_initialized() || !top_level_traversable()->active_document())
+    if (!has_top_level_traversable())
         return;
 
     auto invalidate_document = [](DOM::Document& document) {
         document.invalidate_content_blocker_style_sheet();
         document.style_scope().invalidate_user_style_sheet();
         document.for_each_shadow_root([](auto& shadow_root) {
-            shadow_root.invalidate_style(DOM::StyleInvalidationReason::StyleSheetReplace);
+            shadow_root.record_style_environment_change();
         });
-        document.invalidate_style(DOM::StyleInvalidationReason::StyleSheetReplace);
+        document.record_style_environment_change();
     };
 
-    auto& active_document = *top_level_traversable()->active_document();
-    invalidate_document(active_document);
+    // Each page invalidates the documents it hosts.
+    for (auto const& navigable : hosted_navigables()) {
+        if (auto document = navigable->active_document())
+            invalidate_document(*document);
+    }
+}
 
-    for (auto& navigable : active_document.descendant_navigables()) {
+void Page::invalidate_style_for_preference_change()
+{
+    if (!has_top_level_traversable())
+        return;
+
+    auto invalidate_document = [](DOM::Document& document) {
+        document.record_style_environment_change();
+        document.set_needs_media_query_evaluation();
+    };
+
+    // Each page invalidates the documents it hosts.
+    for (auto const& navigable : hosted_navigables()) {
         if (auto document = navigable->active_document())
             invalidate_document(*document);
     }
@@ -1002,11 +1624,11 @@ void Page::invalidate_user_style()
 
 Vector<GC::Root<DOM::Document>> Page::documents_in_active_window() const
 {
-    if (!top_level_traversable_is_initialized())
+    if (!has_local_traversable())
         return {};
 
     auto documents = HTML::main_thread_event_loop().documents_in_this_event_loop_matching([&](auto& document) {
-        return document.window() == top_level_traversable()->active_window();
+        return document.window() == local_traversable()->active_window();
     });
 
     return documents;
@@ -1025,7 +1647,7 @@ void Page::clear_selection()
 
 Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& query, Optional<SearchDirection> direction)
 {
-    VERIFY(top_level_traversable_is_initialized());
+    VERIFY(has_local_traversable());
 
     Vector<GC::Root<DOM::Range>> all_matches;
 
@@ -1054,7 +1676,7 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
     auto should_update_match_index = false;
     for (auto const& document : documents_in_active_window()) {
         auto matches = document->find_matching_text(query.string, query.case_sensitivity);
-        if (document == top_level_traversable()->active_document()) {
+        if (GC::Ptr { document.ptr() } == local_traversable()->active_document()) {
             if (auto range = active_range(*document)) {
                 auto new_match_index = find_current_match_index(*range, matches);
                 should_update_match_index = true;
@@ -1067,9 +1689,9 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
         all_matches.extend(move(matches));
     }
 
-    if (auto active_document = top_level_traversable()->active_document()) {
+    if (auto active_document = local_traversable()->active_document()) {
         if (m_last_find_in_page_url.serialize(URL::ExcludeFragment::Yes) != active_document->url().serialize(URL::ExcludeFragment::Yes)) {
-            m_last_find_in_page_url = top_level_traversable()->active_document()->url();
+            m_last_find_in_page_url = local_traversable()->active_document()->url();
             m_find_in_page_match_index = 0;
         }
     }
@@ -1104,7 +1726,7 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
 
 Page::FindInPageResult Page::find_in_page(FindInPageQuery const& query)
 {
-    if (!top_level_traversable_is_initialized())
+    if (!has_local_traversable())
         return {};
 
     if (query.string.is_empty()) {
@@ -1116,14 +1738,14 @@ Page::FindInPageResult Page::find_in_page(FindInPageQuery const& query)
     auto result = perform_find_in_page_query(query);
 
     m_last_find_in_page_query = query;
-    m_last_find_in_page_url = top_level_traversable()->active_document()->url();
+    m_last_find_in_page_url = local_traversable()->active_document()->url();
 
     return result;
 }
 
 Page::FindInPageResult Page::find_in_page_next_match()
 {
-    if (!(m_last_find_in_page_query.has_value() && top_level_traversable_is_initialized()))
+    if (!(m_last_find_in_page_query.has_value() && has_local_traversable()))
         return {};
 
     auto result = perform_find_in_page_query(*m_last_find_in_page_query, SearchDirection::Forward);
@@ -1132,7 +1754,7 @@ Page::FindInPageResult Page::find_in_page_next_match()
 
 Page::FindInPageResult Page::find_in_page_previous_match()
 {
-    if (!(m_last_find_in_page_query.has_value() && top_level_traversable_is_initialized()))
+    if (!(m_last_find_in_page_query.has_value() && has_local_traversable()))
         return {};
 
     auto result = perform_find_in_page_query(*m_last_find_in_page_query, SearchDirection::Backward);
@@ -1162,40 +1784,36 @@ void Page::update_find_in_page_selection(Vector<GC::Root<DOM::Range>> matches, C
     selection->add_range(*current_range);
 
     if (auto element = common_ancestor_container->parent_element()) {
-        Bindings::ScrollIntoViewOptions scroll_options;
-        scroll_options.block = Bindings::ScrollLogicalPosition::Nearest;
-        scroll_options.inline_ = Bindings::ScrollLogicalPosition::Nearest;
-        scroll_options.behavior = Bindings::ScrollBehavior::Instant;
-        (void)element->scroll_into_view(scroll_options);
+        DOM::Element::ScrollIntoViewOptions scroll_options;
+        scroll_options.block = DOM::Element::ScrollLogicalPosition::Nearest;
+        scroll_options.inline_ = DOM::Element::ScrollLogicalPosition::Nearest;
+        scroll_options.behavior = DOM::Element::ScrollBehavior::Instant;
+        element->scroll_into_view(scroll_options, nullptr);
     }
 }
 
-void Page::enqueue_fullscreen_enter(GC::Ref<DOM::Element> element, GC::Ref<DOM::Document> pending_doc, DOM::RequestFullscreenError error, GC::Ref<WebIDL::Promise> promise)
+void Page::enqueue_fullscreen_enter(GC::Ref<DOM::Element> element, GC::Ref<DOM::Document> pending_doc, DOM::RequestFullscreenError error, GC::Ptr<WebIDL::Promise> promise, Fullscreen::RequestType request_type)
 {
-    m_pending_fullscreen_operations.enqueue(PendingFullscreenEnter { element, pending_doc, error, promise });
+    m_pending_fullscreen_operations.enqueue(PendingFullscreenEnter { element, pending_doc, error, promise, request_type });
     // NOTE: Processing is deferred because the spec says "run the remaining steps in parallel",
     //       meaning the caller's synchronous JS should complete before we process the operation.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this]() {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this]() {
         process_pending_fullscreen_operations();
     }));
 }
 
-void Page::enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::Ref<WebIDL::Promise> promise)
+void Page::enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::Ptr<WebIDL::Promise> promise, Optional<HTML::CrossProcessId> requesting_navigable_id)
 {
-    m_pending_fullscreen_operations.enqueue(PendingFullscreenExit { doc, resize, promise });
+    m_pending_fullscreen_operations.enqueue(PendingFullscreenExit { doc, resize, promise, requesting_navigable_id });
     // NOTE: Processing is deferred because the spec says "run the remaining steps in parallel",
     //       meaning the caller's synchronous JS should complete before we process the operation.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this]() {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this]() {
         process_pending_fullscreen_operations();
     }));
 }
 
 void Page::process_pending_fullscreen_operations()
 {
-    // FIXME: The Fullscreen API interacts with the top-level traversable's viewport. With site-isolation,
-    //        an iframe's content process won't have direct access to this Page, so fullscreen operations
-    //        will need to be routed through IPC to the top-level process.
-
     // NOTE: Resolving/rejecting promises during processing may trigger JS microtasks that re-enter
     //       this function (e.g., JS calls exitFullscreen() after a requestFullscreen() promise resolves).
     //       The outer call's while loop will pick up newly enqueued items.
@@ -1211,88 +1829,66 @@ void Page::process_pending_fullscreen_operations()
             [&](PendingFullscreenEnter& enter) -> bool {
                 // https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
 
-                // 8. If error is false, then resize pendingDoc's node navigable's top-level traversable's
-                //    active document's viewport's dimensions, optionally taking into account
-                //    options["navigationUI"]:
-                if (enter.error == DOM::RequestFullscreenError::False) {
-                    if (m_viewport_is_fullscreen == ViewportIsFullscreen::No) {
-                        if (!m_fullscreen_ipc_sent_to_ui) {
-                            m_client->page_did_request_fullscreen_window();
-                            m_fullscreen_ipc_sent_to_ui = true;
-                        }
-                        // NB: Stop processing here and wait for a change in the fullscreen state if we aren't
-                        //     in the desired state yet.
-                        return false;
-                    }
+                // NB: The process holding the container above this one runs steps 12 and 13 for the rest of the
+                //     chain, and the promise waits for it.
+                if (enter.container_chain == ContainerChain::InAnotherProcess)
+                    return false;
 
-                    // 9. If any of the following conditions are false, then set error to true:
-                    //    * This's node document is pendingDoc.
-                    //    * The fullscreen element ready check for this returns true.
-                    if (enter.element->owner_document() != enter.pending_doc.ptr())
-                        enter.error = DOM::RequestFullscreenError::ElementNodeDocIsNotPendingDoc;
-                    else if (!enter.element->is_element_ready_for_fullscreen())
-                        enter.error = DOM::RequestFullscreenError::ElementReadyCheckFailed;
-                }
-
-                auto& realm = enter.element->realm();
+                auto& realm = HTML::relevant_realm(*enter.pending_doc);
                 HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
 
-                // 10. If error is true:
-                if (enter.error != DOM::RequestFullscreenError::False) {
-                    // 1. Append (fullscreenerror, this) to pendingDoc's list of pending fullscreen events.
-                    enter.pending_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Error, enter.element);
+                if (enter.container_chain == ContainerChain::NotStarted) {
+                    // 8. If error is false, then resize pendingDoc's node navigable's top-level traversable's
+                    //    active document's viewport's dimensions, optionally taking into account
+                    //    options["navigationUI"]:
+                    if (enter.error == DOM::RequestFullscreenError::False) {
+                        if (m_viewport_is_fullscreen == ViewportIsFullscreen::No) {
+                            if (!m_fullscreen_ipc_sent_to_ui) {
+                                m_client->page_did_request_fullscreen_window();
+                                m_fullscreen_ipc_sent_to_ui = true;
+                            }
+                            // NB: Stop processing here and wait for a change in the fullscreen state if we aren't
+                            //     in the desired state yet.
+                            return false;
+                        }
 
-                    // 2. Reject promise with a TypeError exception and terminate these steps.
-                    WebIDL::reject_promise(realm, enter.promise, JS::TypeError::create(realm, DOM::request_fullscreen_error_to_string(enter.error)));
-                    return true;
-                }
+                        // 9. If any of the following conditions are false, then set error to true:
+                        //    * This's node document is pendingDoc.
+                        //    * The fullscreen element ready check for this returns true.
+                        if (enter.element->owner_document() != GC::Ptr { enter.pending_doc.ptr() })
+                            enter.error = DOM::RequestFullscreenError::ElementNodeDocIsNotPendingDoc;
+                        else if (!enter.element->is_element_ready_for_fullscreen())
+                            enter.error = DOM::RequestFullscreenError::ElementReadyCheckFailed;
+                    }
 
-                // 11. Let fullscreenElements be an ordered set initially consisting of this.
-                auto fullscreen_elements = realm.heap().allocate<GC::HeapVector<GC::Ref<DOM::Element>>>();
-                fullscreen_elements->elements().append(enter.element);
+                    // 10. If error is true:
+                    if (enter.error != DOM::RequestFullscreenError::False) {
+                        // 1. Append (fullscreenerror, this) to pendingDoc's list of pending fullscreen events.
+                        enter.pending_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Error, enter.element, enter.request_type);
 
-                // 12. While true:
-                while (true) {
-                    // 1. Let last be the last item of fullscreenElements.
-                    auto last = fullscreen_elements->elements().last();
+                        // 2. Reject promise with a TypeError exception and terminate these steps.
+                        if (enter.promise)
+                            WebIDL::reject_promise(*enter.promise, JS::TypeError::create(realm, DOM::request_fullscreen_error_to_string(enter.error)));
+                        return true;
+                    }
 
-                    // 2. Let container be last's node navigable's container.
-                    auto container = last->navigable()->container();
-
-                    // 3. If container is null, then break.
-                    if (!container)
-                        break;
-
-                    // 4. Append container to fullscreenElements.
-                    fullscreen_elements->elements().append(*container);
-                }
-
-                // 13. For each element in fullscreenElements:
-                for (auto& element : fullscreen_elements->elements()) {
-                    // 1. Let doc be element's node document.
-                    auto& doc = element->document();
-
-                    // 2. If element is doc's fullscreen element, continue.
-                    if (doc.fullscreen_element() == element)
-                        continue;
-
-                    // 3. If element is this and this is an iframe element, then set element's iframe fullscreen flag.
-                    if (element == enter.element && is<HTML::HTMLIFrameElement>(*enter.element))
-                        as<HTML::HTMLIFrameElement>(*element).set_iframe_fullscreen_flag(true);
-
-                    // 4. Fullscreen element within doc.
-                    doc.fullscreen_element_within_doc(element);
-
-                    // 5. Append (fullscreenchange, element) to doc's list of pending fullscreen events.
-                    doc.append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, element);
+                    // 11 to 13.
+                    if (auto hosted_root = fullscreen_element_and_its_containers(*enter.element, enter.request_type, ElementIsRequestedElement::Yes)) {
+                        enter.container_chain = ContainerChain::InAnotherProcess;
+                        enter.hosted_root_id = hosted_root->id();
+                        m_client->page_did_request_container_fullscreen(hosted_root->id(), hosted_root->id(), enter.request_type);
+                        return false;
+                    }
+                    enter.container_chain = ContainerChain::Complete;
                 }
 
                 // 14. Resolve promise with undefined
-                WebIDL::resolve_promise(realm, enter.promise, JS::js_undefined());
+                if (enter.promise)
+                    WebIDL::resolve_promise(*enter.promise);
                 return true;
             },
             [&](PendingFullscreenExit& exit) -> bool {
-                auto& realm = exit.doc->realm();
+                auto& realm = HTML::relevant_realm(*exit.doc);
                 HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
 
                 // https://fullscreen.spec.whatwg.org/#exit-fullscreen
@@ -1313,26 +1909,46 @@ void Page::process_pending_fullscreen_operations()
                 // 11. If doc's fullscreen element is null, then resolve promise with undefined and terminate these
                 //     steps.
                 if (!exit.doc->fullscreen_element()) {
-                    WebIDL::resolve_promise(realm, exit.promise, JS::js_undefined());
+                    if (exit.promise)
+                        WebIDL::resolve_promise(*exit.promise);
+                    if (exit.requesting_navigable_id.has_value())
+                        m_client->page_did_complete_container_unfullscreen(*exit.requesting_navigable_id);
                     return true;
                 }
 
                 // 12. Let exitDocs be the result of collecting documents to unfullscreen given doc.
                 auto exit_docs = exit.doc->collect_documents_to_unfullscreen();
 
+                // NB: The collection stops at the document whose container another process holds. That process
+                //     continues it from the container, and this exit waits for it: the resize the process holding
+                //     the top-level traversable decides on comes before any document leaves fullscreen.
+                if (exit.container_chain == ContainerChain::NotStarted) {
+                    auto& last_exit_doc = exit_docs->elements().last();
+                    auto navigable = last_exit_doc->navigable();
+                    if (last_exit_doc->is_simple_fullscreen_document() && navigable && !navigable->container() && navigable->parent()) {
+                        exit.container_chain = ContainerChain::InAnotherProcess;
+                        exit.hosted_root_id = navigable->id();
+                        m_client->page_did_request_container_unfullscreen(navigable->id());
+                        return false;
+                    }
+                    exit.container_chain = ContainerChain::Complete;
+                }
+                if (exit.container_chain == ContainerChain::InAnotherProcess)
+                    return false;
+
                 // 13. Let descendantDocs be an ordered set consisting of doc's descendant navigables' active documents
                 //     whose fullscreen element is non-null, if any, in tree order.
-                auto descendant_docs = realm.heap().allocate<GC::HeapVector<GC::Ref<DOM::Document>>>();
-                for (auto& descendant : exit.doc->descendant_navigables()) {
-                    if (descendant->active_document()->fullscreen_element())
-                        descendant_docs->elements().append(*descendant->active_document());
-                }
+                // NB: A descendant's document can be hosted by another process, so its fullscreen element is checked
+                //     where that document is, in step 15.
+                auto descendant_navigables = exit.doc->descendant_navigables();
 
                 // 14. For each exitDoc in exitDocs:
                 for (auto& exit_doc : exit_docs->elements()) {
+                    auto fullscreen_element = exit_doc->fullscreen_element();
+
                     // 1. Append (fullscreenchange, exitDoc's fullscreen element) to exitDoc's list of pending
                     //    fullscreen events.
-                    exit_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, *exit_doc->fullscreen_element());
+                    exit_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, *fullscreen_element, fullscreen_element->fullscreen_request_type());
 
                     // 2. If resize is true, unfullscreen exitDoc.
                     if (exit.resize)
@@ -1343,17 +1959,15 @@ void Page::process_pending_fullscreen_operations()
                 }
 
                 // 15. For each descendantDoc in descendantDocs:
-                for (auto& descendant_doc : descendant_docs->elements()) {
-                    // 1. Append (fullscreenchange, descendantDoc's fullscreen element) to descendantDoc's list of
-                    //    pending fullscreen events.
-                    descendant_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, *descendant_doc->fullscreen_element());
-
-                    // 2. Unfullscreen descendantDoc.
-                    descendant_doc->unfullscreen();
-                }
+                unfullscreen_descendant_documents(descendant_navigables);
 
                 // 16. Resolve promise with undefined.
-                WebIDL::resolve_promise(realm, exit.promise, JS::js_undefined());
+                if (exit.promise)
+                    WebIDL::resolve_promise(*exit.promise);
+                // NB: An exit continued for a document another process holds tells that process once the documents
+                //     above it have left fullscreen.
+                if (exit.requesting_navigable_id.has_value())
+                    m_client->page_did_complete_container_unfullscreen(*exit.requesting_navigable_id);
                 return true;
             });
 
@@ -1373,31 +1987,46 @@ void Page::set_viewport_is_fullscreen(ViewportIsFullscreen is_fullscreen)
     process_pending_fullscreen_operations();
 }
 
+void Page::container_fullscreen_complete(HTML::CrossProcessId hosted_root_id)
+{
+    if (m_pending_fullscreen_operations.is_empty())
+        return;
+    auto* enter = m_pending_fullscreen_operations.head().get_pointer<PendingFullscreenEnter>();
+    if (!enter || enter->container_chain != ContainerChain::InAnotherProcess || enter->hosted_root_id != hosted_root_id)
+        return;
+    enter->container_chain = ContainerChain::Complete;
+    process_pending_fullscreen_operations();
 }
 
-template<>
-ErrorOr<void> IPC::encode(Encoder& encoder, Web::Page::MediaContextMenu const& menu)
+void Page::container_unfullscreen_complete(HTML::CrossProcessId hosted_root_id)
 {
-    TRY(encoder.encode(menu.media_url));
-    TRY(encoder.encode(menu.is_video));
-    TRY(encoder.encode(menu.is_playing));
-    TRY(encoder.encode(menu.is_muted));
-    TRY(encoder.encode(menu.has_user_agent_controls));
-    TRY(encoder.encode(menu.is_looping));
-    TRY(encoder.encode(menu.is_fullscreen));
-    return {};
+    if (m_pending_fullscreen_operations.is_empty())
+        return;
+    auto* exit = m_pending_fullscreen_operations.head().get_pointer<PendingFullscreenExit>();
+    if (!exit || exit->container_chain != ContainerChain::InAnotherProcess || exit->hosted_root_id != hosted_root_id)
+        return;
+    exit->container_chain = ContainerChain::Complete;
+    process_pending_fullscreen_operations();
 }
 
-template<>
-ErrorOr<Web::Page::MediaContextMenu> IPC::decode(Decoder& decoder)
+void PageClient::request_navigation_start(HTML::LocalNavigable&, NavigationTarget, URL::URL const&, Utf16String, Optional<HTML::NavigationStartRequest>)
 {
-    return Web::Page::MediaContextMenu {
-        .media_url = TRY(decoder.decode<URL::URL>()),
-        .is_video = TRY(decoder.decode<bool>()),
-        .is_playing = TRY(decoder.decode<bool>()),
-        .is_muted = TRY(decoder.decode<bool>()),
-        .has_user_agent_controls = TRY(decoder.decode<bool>()),
-        .is_looping = TRY(decoder.decode<bool>()),
-        .is_fullscreen = TRY(decoder.decode<bool>()),
-    };
+    VERIFY_NOT_REACHED();
+}
+
+void PageClient::request_navigation_population(HTML::LocalNavigable&, NavigationTarget, HTML::NavigationPopulationRequest)
+{
+    VERIFY_NOT_REACHED();
+}
+
+void PageClient::navigation_params_creation_finished(HTML::LocalNavigable&, HTML::NavigationPopulationRequest, HTML::NavigationPopulationResult)
+{
+    VERIFY_NOT_REACHED();
+}
+
+void PageClient::history_navigation_params_creation_finished(HTML::CrossProcessId, HTML::HistoryNavigationPopulation)
+{
+    VERIFY_NOT_REACHED();
+}
+
 }

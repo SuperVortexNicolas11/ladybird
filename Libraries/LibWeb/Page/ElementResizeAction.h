@@ -8,7 +8,7 @@
 
 #include <LibGC/Weak.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/PixelUnits.h>
+#include <LibWebCommon/PixelUnits.h>
 
 // https://drafts.csswg.org/css-ui#resize
 
@@ -16,6 +16,8 @@ namespace Web {
 
 class ElementResizeAction {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     ElementResizeAction(GC::Ref<DOM::Element> element, CSSPixelPoint pointer_down_origin);
 
     void handle_pointer_move(CSSPixelPoint pointer_position);

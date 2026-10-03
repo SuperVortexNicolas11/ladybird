@@ -4,16 +4,16 @@ interface SerialPort : EventTarget {
     attribute EventHandler onconnect;
     attribute EventHandler ondisconnect;
     readonly attribute boolean connected;
-    readonly attribute ReadableStream? readable;
-    readonly attribute WritableStream? writable;
+    [DirectGetter] readonly attribute ReadableStream? readable;
+    [DirectGetter] readonly attribute WritableStream? writable;
 
     SerialPortInfo getInfo();
 
-    Promise<undefined> open(SerialOptions options);
-    Promise<undefined> setSignals(optional SerialOutputSignals signals = {});
-    Promise<SerialInputSignals> getSignals();
-    Promise<undefined> close();
-    Promise<undefined> forget();
+    [CreatesPromise] Promise<undefined> open(SerialOptions options);
+    [CreatesPromise] Promise<undefined> setSignals(optional SerialOutputSignals signals = {});
+    [CreatesPromise] Promise<SerialInputSignals> getSignals();
+    [CreatesPromise] Promise<undefined> close();
+    [CreatesPromise] Promise<undefined> forget();
 };
 
 // https://wicg.github.io/serial/#serialoptions-dictionary
@@ -46,7 +46,7 @@ dictionary SerialPortInfo {
     unsigned short usbVendorId;
     unsigned short usbProductId;
     // FIXME: Should be a BluetoothServiceUUID
-    Utf16DOMString bluetoothServiceClassId;
+    DOMString bluetoothServiceClassId;
 };
 
 // https://wicg.github.io/serial/#paritytype-enum

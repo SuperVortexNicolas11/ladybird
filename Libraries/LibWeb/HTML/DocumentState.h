@@ -15,10 +15,12 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/CrossProcessId.h>
-#include <LibWeb/HTML/POSTResource.h>
-#include <LibWeb/HTML/SerializedPolicyContainer.h>
-#include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/DocumentStateClient.h>
+#include <LibWebCommon/HTML/POSTResource.h>
+#include <LibWebCommon/HTML/SerializedPolicyContainer.h>
+#include <LibWebCommon/HTML/UserAgentInitiated.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
 
@@ -33,25 +35,12 @@ public:
     }
     ~DocumentState();
 
-    struct NestedHistory {
-        CrossProcessId id;
-        Vector<NonnullRefPtr<SessionHistoryEntry>> entries;
-    };
-
-    enum class Client {
-        Tag,
-    };
+    using Client = DocumentStateClient;
 
     [[nodiscard]] Optional<UniqueNodeID> document_id() const { return m_document_id; }
     void set_document_id(Optional<UniqueNodeID> document_id) { m_document_id = document_id; }
 
     [[nodiscard]] CrossProcessId cross_process_id() const { return m_cross_process_id; }
-
-    // Reconstructing from the UI process adopts the canonical id the UI already tracks for this state, so later reports
-    // and acknowledgements name the identity the UI expects.
-    // FIXME: Remove this API. It is only needed because the UI process can mint its own ids for provisional entries and
-    //        seed them back onto live local states. Remove once ids are only ever allocated in WebContent.
-    void adopt_cross_process_id_from_ui_process(CrossProcessId id) { m_cross_process_id = id; }
 
     [[nodiscard]] Variant<SerializedPolicyContainer, Client> const& history_policy_container() const { return m_history_policy_container; }
     void set_history_policy_container(Variant<SerializedPolicyContainer, Client> history_policy_container) { m_history_policy_container = move(history_policy_container); }
@@ -71,9 +60,6 @@ public:
     [[nodiscard]] Optional<URL::URL> const& about_base_url() const { return m_about_base_url; }
     void set_about_base_url(Optional<URL::URL> url) { m_about_base_url = move(url); }
 
-    [[nodiscard]] Vector<NestedHistory> const& nested_histories() const { return m_nested_histories; }
-    [[nodiscard]] Vector<NestedHistory>& nested_histories() { return m_nested_histories; }
-
     [[nodiscard]] DocumentResource resource() const { return m_resource; }
     void set_resource(DocumentResource resource) { m_resource = move(resource); }
 
@@ -82,6 +68,9 @@ public:
 
     [[nodiscard]] bool ever_populated() const { return m_ever_populated; }
     void set_ever_populated(bool ever_populated) { m_ever_populated = ever_populated; }
+
+    [[nodiscard]] UserAgentInitiated user_agent_initiated() const { return m_user_agent_initiated; }
+    void set_user_agent_initiated(UserAgentInitiated user_agent_initiated) { m_user_agent_initiated = user_agent_initiated; }
 
     [[nodiscard]] Utf16String const& navigable_target_name() const { return m_navigable_target_name; }
     void set_navigable_target_name(Utf16String navigable_target_name) { m_navigable_target_name = move(navigable_target_name); }
@@ -94,8 +83,7 @@ private:
     //       decoupled from the document's lifetime (LocalNavigable owns the document directly).
     Optional<UniqueNodeID> m_document_id;
 
-    // AD-HOC: Stable identity used by the UI-process session history mirror to preserve shared document states
-    //         across IPC and WebContent process swaps.
+    // AD-HOC: Stable identity used to preserve shared document states across canonical UI history and WebContent process swaps.
     CrossProcessId m_cross_process_id;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-history-policy-container
@@ -116,9 +104,6 @@ private:
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-about-base-url
     Optional<URL::URL> m_about_base_url = {};
 
-    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-nested-histories
-    Vector<NestedHistory> m_nested_histories;
-
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-resource
     DocumentResource m_resource {};
 
@@ -127,6 +112,12 @@ private:
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-ever-populated
     bool m_ever_populated { false };
+
+    // AD-HOC: Not one of the spec's document state fields. It's whether the navigation that created the entry had no
+    //         source document, recorded so a traversal back to the entry can replay it. Blink and Gecko keep the same
+    //         on their entries: Blink an absent FrameNavigationEntry::initiator_origin(), Gecko a system principal as
+    //         SessionHistoryInfo::GetTriggeringPrincipal().
+    UserAgentInitiated m_user_agent_initiated { UserAgentInitiated::No };
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-nav-target-name
     Utf16String m_navigable_target_name;

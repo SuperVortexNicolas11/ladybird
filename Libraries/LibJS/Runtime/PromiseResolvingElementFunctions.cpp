@@ -45,7 +45,11 @@ PromiseResolvingElementFunction::PromiseResolvingElementFunction(size_t index, P
 void PromiseResolvingElementFunction::initialize(Realm& realm)
 {
     Base::initialize(realm);
-    define_direct_property(vm().names.length, Value(1), Attribute::Configurable);
+
+    auto& intrinsics = realm.intrinsics();
+    unsafe_set_shape(intrinsics.native_function_shape());
+    put_direct(intrinsics.native_function_length_offset(), Value(1));
+    put_direct(intrinsics.native_function_name_offset(), PrimitiveString::create(vm(), Utf16String {}));
 }
 
 ThrowCompletionOr<Value> PromiseResolvingElementFunction::call()
@@ -113,6 +117,10 @@ ThrowCompletionOr<Value> PromiseAllSettledResolveElementFunction::resolve_elemen
     auto& vm = this->vm();
     auto& realm = *vm.current_realm();
 
+    // The paired allSettled callbacks share this result slot as their already-called state.
+    if (!m_values->values()[m_index].is_undefined())
+        return js_undefined();
+
     // 9. Let obj be OrdinaryObjectCreate(%Object.prototype%).
     auto object = Object::create(realm, realm.intrinsics().object_prototype());
 
@@ -153,6 +161,10 @@ ThrowCompletionOr<Value> PromiseAllSettledRejectElementFunction::resolve_element
 {
     auto& vm = this->vm();
     auto& realm = *vm.current_realm();
+
+    // The paired allSettled callbacks share this result slot as their already-called state.
+    if (!m_values->values()[m_index].is_undefined())
+        return js_undefined();
 
     // 9. Let obj be OrdinaryObjectCreate(%Object.prototype%).
     auto object = Object::create(realm, realm.intrinsics().object_prototype());

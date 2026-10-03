@@ -6,10 +6,11 @@
  */
 
 #include "CanvasTextDrawingStyles.h"
-#include <AK/Utf16StringBuilder.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/FontResolution.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/FontStyleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
@@ -20,8 +21,7 @@
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/HTML/OffscreenCanvasRenderingContext2D.h>
-#include <LibWeb/HTML/Window.h>
-#include <LibWeb/HTML/WorkerGlobalScope.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 
 namespace Web::HTML {
 
@@ -37,34 +37,6 @@ Utf16String CanvasTextDrawingStyles<CanvasType>::font() const
     return drawing_state().font_style_value->to_utf16_string(CSS::SerializationMode::ResolvedValue);
 }
 
-// https://html.spec.whatwg.org/multipage/canvas.html#font-style-source-object
-template<typename CanvasType>
-Variant<DOM::Document*, HTML::WorkerGlobalScope*> CanvasTextDrawingStyles<CanvasType>::get_font_source_for_font_style_source_object(CanvasType& font_style_source_object)
-{
-    // Font resolution for the font style source object requires a font source. This is determined for a given object implementing CanvasTextDrawingStyles by the following steps: [CSSFONTLOAD]
-
-    if constexpr (SameAs<CanvasType, HTML::HTMLCanvasElement>) {
-        // 1. If object's font style source object is a canvas element, return the element's node document.
-        return &font_style_source_object.document();
-    } else {
-        // 2. Otherwise, object's font style source object is an OffscreenCanvas object:
-
-        // 1. Let global be object's relevant global object.
-        auto& global_object = HTML::relevant_global_object(font_style_source_object);
-
-        // 2. If global is a Window object, then return global's associated Document.
-        if (is<HTML::Window>(global_object)) {
-            auto& window = as<HTML::Window>(global_object);
-            return &(window.associated_document());
-        }
-
-        // 3. Assert: global implements WorkerGlobalScope.
-        VERIFY(is<HTML::WorkerGlobalScope>(global_object));
-
-        // 4. Return global.
-        return &(as<HTML::WorkerGlobalScope>(global_object));
-    };
-}
 template<typename CanvasType>
 void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
 {
@@ -88,21 +60,27 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
 
     // Load font with font style value properties
     auto const& font_style_value = font_style_value_result->as_shorthand();
-    auto& canvas_element = *this->canvas_element().template get<GC::Ref<CanvasType>>();
+    auto& canvas_element = static_cast<CanvasType&>(this->canvas_host());
 
     auto computed_math_depth = CSS::InitialValues::math_depth();
 
     // FIXME: We will need to absolutize this once we support ident() functions
-    auto& font_family = *font_style_value.longhand(CSS::PropertyID::FontFamily);
+    auto font_family = font_style_value.longhand(CSS::PropertyID::FontFamily);
 
     Optional<DOM::AbstractElement> inheritance_parent;
 
     if constexpr (SameAs<CanvasType, HTML::HTMLCanvasElement>) {
-        canvas_element.document().update_style_for_element(DOM::AbstractElement { canvas_element });
+        // NB: Once pending style work is settled, the canvas's installed style is current, unless it is below
+        //     display:none, where style updates leave it stale. Only then is its style computed again.
+        auto& document = canvas_element.document();
+        document.update_style_for_element(DOM::AbstractElement { canvas_element }, DOM::Document::StyleUpdateMode::OnlyIfNeeded);
+        auto style_record = canvas_element.style_record_identity();
+        if (!style_record || has_flag(document.style_computer().style_engine().style_record_dependency_flags(style_record), CSS::StyleRecordDependencyFlag::InDisplayNoneSubtree))
+            document.update_style_for_element(DOM::AbstractElement { canvas_element });
 
         if (canvas_element.navigable() && canvas_element.is_connected()) {
             // NOTE: Since we can't set a math depth directly here we always use the inherited value for the computed value
-            computed_math_depth = canvas_element.computed_values()->math_depth();
+            computed_math_depth = canvas_element.template style_group<CSS::ComputedValues::FontValues>()->math_depth;
 
             // NOTE: The canvas itself is considered the inheritance parent
             inheritance_parent = canvas_element;
@@ -141,7 +119,7 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
         },
         {
             // Set explicitly
-            font_family,
+            *font_family,
             computed_font_size,
             computed_font_width,
             computed_font_style,
@@ -158,35 +136,27 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
             property_initial_value(CSS::PropertyID::FontVariationSettings), // font-variation-settings
         });
 
-    // https://drafts.csswg.org/css-font-loading/#font-source
-    auto font_source = get_font_source_for_font_style_source_object(canvas_element);
-
     CSS::FontFeatureData font_feature_data;
 
     if (keyword_to_font_variant_caps(computed_font_variant->as_shorthand().longhand(CSS::PropertyID::FontVariantCaps)->to_keyword()) == CSS::FontVariantCaps::SmallCaps)
         font_feature_data.font_variant_caps = CSS::FontVariantCaps::SmallCaps;
 
-    auto font_list = font_source.visit(
-        [&](DOM::Document* document) -> RefPtr<Gfx::FontCascadeList const> {
-            return document->font_computer().compute_font_for_style_values(
-                font_family,
-                computed_font_size->as_length().length().absolute_length_to_px(),
-                computed_font_style->as_font_style().to_font_slope(),
-                computed_font_weight->as_number().number(),
-                computed_font_width->as_percentage().percentage(),
-                CSS::FontOpticalSizing::Auto,
-                {},
-                font_feature_data);
-        },
-        [](HTML::WorkerGlobalScope*) -> RefPtr<Gfx::FontCascadeList const> {
-            // FIXME: implement computing the font for HTML::WorkerGlobalScope
-            return {};
+    // https://drafts.csswg.org/css-font-loading/#font-source
+    auto& font_computer = canvas_element.canvas_font_computer();
+
+    drawing_state().font_environment_generation = font_computer.environment_generation();
+    drawing_state().current_font_cascade_list = CSS::resolve_font_for_style_values(font_computer,
+        {
+            .font_families = CSS::computed_font_families_from_style_value(*font_family),
+            .font_optical_sizing = CSS::FontOpticalSizing::Auto,
+            .font_size = computed_font_size->as_length().length().absolute_length_to_px(),
+            .font_slope = computed_font_style->as_font_style().to_font_slope(),
+            .font_weight = computed_font_weight->as_number().number(),
+            .font_width = computed_font_width->as_percentage().percentage(),
+            .font_variation_settings = {},
+            .font_feature_data = font_feature_data,
+            .font_feature_values_scope = {},
         });
-
-    if (!font_list)
-        return;
-
-    drawing_state().current_font_cascade_list = font_list;
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-letterspacing

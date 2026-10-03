@@ -9,6 +9,7 @@
 #include <AK/StringView.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <AK/kmalloc.h>
 #include <LibJS/Export.h>
 
 #define JS_ENUMERATE_ERROR_TYPES(M)                                                                                                 \
@@ -78,6 +79,7 @@
     M(IntlTemporalFormatRangeTypeMismatch, "Cannot format a date-time range with different date-time types")                        \
     M(IntlTemporalInvalidCalendar, "Cannot format {} with calendar '{}' in locale with calendar '{}'")                              \
     M(IntlTemporalZonedDateTime, "Cannot format Temporal.ZonedDateTime, use Temporal.ZonedDateTime.prototype.toLocaleString")       \
+    M(IntlUnsupportedLanguageTag, "{} is not a supported language tag")                                                             \
     M(InvalidAssignToConst, "Invalid assignment to const variable")                                                                 \
     M(InvalidCodePoint, "Invalid code point {}, must be an integer no less than 0 and no greater than 0x10FFFF")                    \
     M(InvalidEnumerationValue, "Invalid value '{}' for enumeration type '{}'")                                                      \
@@ -315,6 +317,8 @@ namespace JS {
 
 class JS_API ErrorType {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
 #define __ENUMERATE_JS_ERROR(name, message) \
     static ErrorType const& name;
     JS_ENUMERATE_ERROR_TYPES(__ENUMERATE_JS_ERROR)

@@ -5,9 +5,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibWeb/IndexedDB/Internal/Key.h>
 #include <LibWeb/Infra/ByteSequences.h>
-#include <LibWeb/Infra/Strings.h>
+#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::IndexedDB {
 
@@ -30,9 +31,9 @@ Key::Key(KeyType type, KeyValue value)
 
 Key::~Key() = default;
 
-GC::Ref<Key> Key::create(JS::Realm& realm, KeyType key, KeyValue value)
+GC::Ref<Key> Key::create(KeyType key, KeyValue value)
 {
-    return realm.create<Key>(key, value);
+    return GC::Heap::the().allocate<Key>(key, value);
 }
 
 Key::KeyValue Key::value()

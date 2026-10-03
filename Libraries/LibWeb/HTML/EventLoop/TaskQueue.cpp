@@ -38,8 +38,15 @@ void TaskQueue::add(GC::Ref<Task> task)
     if (task->document() && task->document()->is_temporary_document_for_fragment_parsing())
         return;
 
+    // AD-HOC: Don't enqueue a task for a destroyed document either: "destroy a document" removes the document's
+    //         tasks from every task queue, and a destroyed document is never fully active again, so a task queued
+    //         for it afterwards could never run. It would only sit in the queue — and queuing it wakes the event
+    //         loop, which then scans the whole queue for a runnable task, but finds none.
+    if (task->document() && task->document()->has_been_destroyed())
+        return;
+
     m_last_added_task = task.ptr();
-    if (task->source() == Task::Source::IdleTask)
+    if (task->priority() == Task::Priority::Idle)
         m_idle_tasks.append(*task);
     else
         m_tasks.append(*task);
@@ -52,7 +59,7 @@ GC::Ptr<Task> TaskQueue::dequeue()
         if (tasks.is_empty())
             return {};
         auto* task = tasks.take_first();
-        if (m_last_added_task == task)
+        if (m_last_added_task.ptr() == task)
             m_last_added_task = {};
         return task;
     };
@@ -76,14 +83,14 @@ GC::Ptr<Task> TaskQueue::take_first_runnable()
         }
 
         if (task.is_runnable()) {
-            if (m_last_added_task == &task)
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
             it.erase();
             return &task;
         }
 
         if (task.is_permanently_unrunnable()) {
-            if (m_last_added_task == &task)
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
             it.erase();
             continue;
@@ -96,14 +103,14 @@ GC::Ptr<Task> TaskQueue::take_first_runnable()
         auto& task = *it;
 
         if (task.is_runnable()) {
-            if (m_last_added_task == &task)
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
             it.erase();
             return &task;
         }
 
         if (task.is_permanently_unrunnable()) {
-            if (m_last_added_task == &task)
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
             it.erase();
             continue;
@@ -142,7 +149,7 @@ void TaskQueue::remove_tasks_matching(Function<bool(HTML::Task const&)> filter)
                 ++it;
                 continue;
             }
-            if (m_last_added_task == &task)
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
             it.erase();
         }
@@ -157,14 +164,14 @@ GC::Ptr<Task> TaskQueue::take_first_runnable_matching(Function<bool(HTML::Task c
         auto& task = *it;
 
         if (task.is_runnable() && filter(task)) {
-            if (m_last_added_task == &task)
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
             it.erase();
             return &task;
         }
 
         if (task.is_permanently_unrunnable()) {
-            if (m_last_added_task == &task)
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
             it.erase();
             continue;
@@ -177,14 +184,14 @@ GC::Ptr<Task> TaskQueue::take_first_runnable_matching(Function<bool(HTML::Task c
         auto& task = *it;
 
         if (task.is_runnable() && filter(task)) {
-            if (m_last_added_task == &task)
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
             it.erase();
             return &task;
         }
 
         if (task.is_permanently_unrunnable()) {
-            if (m_last_added_task == &task)
+            if (m_last_added_task.ptr() == &task)
                 m_last_added_task = {};
             it.erase();
             continue;

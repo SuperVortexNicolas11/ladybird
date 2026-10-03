@@ -4,14 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibCompositing/DisplayList/Canvas2DCommandStream.h>
+#include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibGfx/PaintingSurface.h>
+#include <LibWeb/Compositor/CompositorFrame.h>
 #include <LibWeb/Compositor/CompositorHost.h>
-#include <LibWeb/Painting/Canvas2DCommandStream.h>
-#include <LibWeb/Painting/DisplayList.h>
 
 namespace Web::Compositor {
 
-CompositorContextHandle::CompositorContextHandle(CompositorHost& host, CompositorContextId context_id)
+CompositorContextHandle::CompositorContextHandle(CompositorHost& host, Web::CompositorContextId context_id)
     : m_host(host)
     , m_context_id(context_id)
 {
@@ -22,7 +23,7 @@ CompositorContextHandle::~CompositorContextHandle()
     m_host.destroy_context(m_context_id);
 }
 
-void CompositorContextHandle::set_parent_context(Optional<CompositorContextId> parent_context_id)
+void CompositorContextHandle::set_parent_context(Optional<Web::CompositorContextId> parent_context_id)
 {
     m_host.set_parent_context(m_context_id, parent_context_id);
 }
@@ -32,17 +33,14 @@ void CompositorContextHandle::stop_presenting_to_client()
     m_host.stop_presenting_to_client(m_context_id);
 }
 
-void CompositorContextHandle::update_display_list(NonnullRefPtr<Painting::DisplayList> display_list, Painting::AccumulatedVisualContextTree visual_context_tree, Painting::DisplayListResourceTransaction&& resource_transaction, Painting::ScrollStateSnapshot&& scroll_state_snapshot)
+void CompositorContextHandle::submit_frame(CompositorFrame&& frame)
 {
+    frame.context_id = m_context_id;
     // Pending canvas commands (and present markers) must reach the Compositor
     // before a display list that samples the presented canvas surfaces.
-    m_host.flush_canvas_2d_stream();
-    m_host.update_display_list(m_context_id, move(display_list), move(visual_context_tree), move(resource_transaction), move(scroll_state_snapshot));
-}
-
-void CompositorContextHandle::update_visual_context_tree(Painting::AccumulatedVisualContextTree visual_context_tree)
-{
-    m_host.update_visual_context_tree(m_context_id, move(visual_context_tree));
+    if (frame.display_list_update.has_value() || frame.present_viewport_rect.has_value())
+        m_host.flush_canvas_2d_stream();
+    m_host.submit_frame(move(frame));
 }
 
 void CompositorContextHandle::add_video_sink(Media::VideoSinkHandle video_sink_handle)
@@ -55,14 +53,14 @@ void CompositorContextHandle::remove_video_sink(Media::VideoSinkHandle video_sin
     m_host.remove_video_sink(video_sink_handle);
 }
 
-void CompositorContextHandle::set_video_update_flags(Media::VideoSinkHandle video_sink_handle, VideoUpdateFlags flags)
+void CompositorContextHandle::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
 {
-    m_host.set_video_update_flags(video_sink_handle, flags);
+    m_host.set_video_sink_ticking(video_sink_handle, should_tick);
 }
 
-void CompositorContextHandle::update_scroll_state(Painting::ScrollStateSnapshot&& scroll_state_snapshot)
+void CompositorContextHandle::invalidate_keyboard_scroll_state(u64 generation)
 {
-    m_host.update_scroll_state(m_context_id, move(scroll_state_snapshot));
+    m_host.invalidate_keyboard_scroll_state(m_context_id, generation);
 }
 
 void CompositorContextHandle::invalidate_wheel_event_listener_state(u64 generation)
@@ -70,36 +68,40 @@ void CompositorContextHandle::invalidate_wheel_event_listener_state(u64 generati
     m_host.invalidate_wheel_event_listener_state(m_context_id, generation);
 }
 
-AsyncScrollEnqueueResult CompositorContextHandle::async_scroll_by(UniqueNodeID expected_document_id, Gfx::FloatPoint position,
-    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, AsyncScrollOperationTracking operation_tracking)
+Compositing::AsyncScrollEnqueueResult CompositorContextHandle::async_scroll_by(UniqueNodeID expected_document_id, Gfx::FloatPoint position,
+    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking)
 {
-    return m_host.async_scroll_by(m_context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, operation_tracking);
+    return m_host.async_scroll_by(m_context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking);
 }
 
-AsyncScrollEnqueueResult CompositorContextHandle::smooth_scroll_to(AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel)
+Compositing::AsyncScrollEnqueueResult CompositorContextHandle::smooth_scroll_to(Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::FloatPoint main_thread_offset_in_device_pixels, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator)
 {
-    return m_host.smooth_scroll_to(m_context_id, stable_node_id, offset_in_device_pixels, viewport_rect, device_pixels_per_css_pixel);
+    return m_host.smooth_scroll_to(m_context_id, stable_node_id, offset_in_device_pixels, main_thread_offset_in_device_pixels, viewport_rect, animation_kind, initiator);
 }
 
-void CompositorContextHandle::cancel_smooth_scroll(AsyncScrollNodeStableID stable_node_id)
+void CompositorContextHandle::cancel_smooth_scroll(Web::AsyncScrollNodeStableID stable_node_id)
 {
     m_host.cancel_smooth_scroll(m_context_id, stable_node_id);
 }
 
-PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates()
+Compositing::PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates(Compositing::AsyncScrollUpdateFreshness freshness)
 {
-    return m_host.take_pending_async_scroll_updates(m_context_id);
+    return m_host.take_pending_async_scroll_updates(m_context_id, freshness);
 }
 
-void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, WindowResizingInProgress window_resize_in_progress)
+void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     m_host.viewport_size_updated(m_context_id, viewport_size, window_resize_in_progress);
 }
 
-void CompositorContextHandle::present_frame(Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
+bool CompositorContextHandle::request_rendering_opportunity(double maximum_frames_per_second)
 {
-    m_host.flush_canvas_2d_stream();
-    m_host.present_frame(m_context_id, viewport_rect, damage_rect);
+    return m_host.request_rendering_opportunity(m_context_id, maximum_frames_per_second);
+}
+
+void CompositorContextHandle::hurry_rendering_opportunity()
+{
+    m_host.hurry_rendering_opportunity(m_context_id);
 }
 
 void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)
@@ -109,13 +111,13 @@ void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::PaintingSurf
 }
 
 CompositorHost::CompositorHost()
-    : m_canvas_2d_stream(adopt_ref(*new Painting::Canvas2DCommandStream()))
+    : m_canvas_2d_stream(adopt_ref(*new Compositing::Canvas2DCommandStream()))
 {
 }
 
 CompositorHost::~CompositorHost() = default;
 
-OwnPtr<CompositorContextHandle> CompositorHost::create_context(CompositorContextId context_id)
+OwnPtr<CompositorContextHandle> CompositorHost::create_context(Web::CompositorContextId context_id)
 {
     return adopt_own(*new CompositorContextHandle(*this, context_id));
 }

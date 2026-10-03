@@ -9,21 +9,21 @@
 
 #include <AK/IPv4Address.h>
 #include <AK/IPv6Address.h>
+#include <LibGC/Heap.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/Bindings/DOMURL.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/DOMURL/DOMURL.h>
-#include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/Infra/SerializedURL.h>
+#include <LibWeb/Page/Page.h>
 
 namespace Web::DOMURL {
 
 GC_DEFINE_ALLOCATOR(DOMURL);
 
-GC::Ref<DOMURL> DOMURL::create(JS::Realm& realm, URL::URL url, GC::Ref<URLSearchParams> query)
+GC::Ref<DOMURL> DOMURL::create(URL::URL url)
 {
-    return realm.create<DOMURL>(realm, move(url), query);
+    return GC::Heap::the().allocate<DOMURL>(move(url));
 }
 
 // https://url.spec.whatwg.org/#api-url-parser
@@ -49,29 +49,15 @@ static Optional<URL::URL> parse_api_url(Utf16View url, Optional<Utf16String> con
 }
 
 // https://url.spec.whatwg.org/#url-initialize
-GC::Ref<DOMURL> DOMURL::initialize_a_url(JS::Realm& realm, URL::URL const& url_record)
+GC::Ref<DOMURL> DOMURL::initialize_a_url(URL::URL const& url_record)
 {
-    // 1. Let query be urlRecord’s query, if that is non-null; otherwise the empty string.
-    auto query = url_record.query().value_or(String {});
-
-    // 2. Set url’s URL to urlRecord.
-    // 3. Set url’s query object to a new URLSearchParams object.
-    auto query_object = URLSearchParams::create_from_byte_string(realm, query.bytes_as_string_view());
-
-    // 4. Initialize url’s query object with query.
-    auto result_url = DOMURL::create(realm, url_record, move(query_object));
-
-    // 5. Set url’s query object’s URL object to url.
-    result_url->m_query->m_url = result_url;
-
-    return result_url;
+    // OPTIMIZATION: Defer creating and initializing the query object until searchParams is accessed.
+    return DOMURL::create(url_record);
 }
 
 // https://url.spec.whatwg.org/#dom-url-parse
-GC::Ptr<DOMURL> DOMURL::parse_for_bindings(JS::VM& vm, Utf16String const& url, Optional<Utf16String> const& base)
+GC::Ptr<DOMURL> DOMURL::parse_for_bindings(Utf16String const& url, Optional<Utf16String> const& base)
 {
-    auto& realm = *vm.current_realm();
-
     // 1. Let parsedURL be the result of running the API URL parser on url with base, if given.
     auto parsed_url = parse_api_url(url.utf16_view(), base);
 
@@ -82,11 +68,11 @@ GC::Ptr<DOMURL> DOMURL::parse_for_bindings(JS::VM& vm, Utf16String const& url, O
     // 3. Let url be a new URL object.
     // 4. Initialize url with parsedURL.
     // 5. Return url.
-    return initialize_a_url(realm, parsed_url.value());
+    return initialize_a_url(parsed_url.value());
 }
 
 // https://url.spec.whatwg.org/#dom-url-url
-WebIDL::ExceptionOr<GC::Ref<DOMURL>> DOMURL::construct_impl(JS::Realm& realm, Utf16String const& url, Optional<Utf16String> const& base)
+WebIDL::ExceptionOr<GC::Ref<DOMURL>> DOMURL::create_from_url(Utf16String const& url, Optional<Utf16String> const& base)
 {
     // 1. Let parsedURL be the result of running the API URL parser on url with base, if given.
     auto parsed_url = parse_api_url(url.utf16_view(), base);
@@ -96,39 +82,31 @@ WebIDL::ExceptionOr<GC::Ref<DOMURL>> DOMURL::construct_impl(JS::Realm& realm, Ut
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid URL"_utf16 };
 
     // 3. Initialize this with parsedURL.
-    return initialize_a_url(realm, parsed_url.value());
+    return initialize_a_url(parsed_url.value());
 }
 
-DOMURL::DOMURL(JS::Realm& realm, URL::URL url, GC::Ref<URLSearchParams> query)
-    : PlatformObject(realm)
-    , m_url(move(url))
-    , m_query(move(query))
+DOMURL::DOMURL(URL::URL url)
+    : m_url(move(url))
 {
 }
 
 DOMURL::~DOMURL() = default;
 
-void DOMURL::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE_WITH_CUSTOM_NAME(DOMURL, URL);
-    Base::initialize(realm);
-}
-
-void DOMURL::visit_edges(Cell::Visitor& visitor)
+void DOMURL::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_query);
 }
 
 // https://w3c.github.io/FileAPI/#dfn-createObjectURL
-WebIDL::ExceptionOr<Utf16String> DOMURL::create_object_url(JS::VM& vm, FileAPI::BlobURLEntry::Object object)
+WebIDL::ExceptionOr<Utf16String> DOMURL::create_object_url(FileAPI::BlobURLEntry::Object object)
 {
     // The createObjectURL(obj) static method must return the result of adding an entry to the blob URL store for obj.
-    return TRY_OR_THROW_OOM(vm, FileAPI::add_entry_to_blob_url_store(object));
+    return TRY_OR_THROW_OOM(JS::VM::the(), FileAPI::add_entry_to_blob_url_store(object));
 }
 
 // https://w3c.github.io/FileAPI/#dfn-revokeObjectURL
-void DOMURL::revoke_object_url(JS::VM&, Utf16String const& url)
+void DOMURL::revoke_object_url(Utf16String const& url)
 {
     // 1. Let url record be the result of parsing url.
     auto url_record = parse(url.utf16_view());
@@ -141,6 +119,11 @@ void DOMURL::revoke_object_url(JS::VM&, Utf16String const& url)
     if (url_record->scheme() != "blob"sv)
         return;
 
+    // NB: The browser process runs steps 3 to 7 over every process's entries. The steps below run them again here,
+    //     for the entry this process created.
+    auto& settings = HTML::current_settings_object();
+    Bindings::principal_host_defined_page(settings.realm()).client().page_did_remove_blob_url_entries(settings, { utf16_string_from_url_ascii(url_record->serialize()) });
+
     // 3. Let entry be urlRecord’s blob URL entry.
     auto const& entry = url_record->blob_url_entry();
 
@@ -149,7 +132,7 @@ void DOMURL::revoke_object_url(JS::VM&, Utf16String const& url)
         return;
 
     // 5. Let isAuthorized be the result of checking for same-partition blob URL usage with entry and the current settings object.
-    bool is_authorized = FileAPI::check_for_same_partition_blob_url_usage(entry.value(), HTML::current_settings_object());
+    bool is_authorized = FileAPI::check_for_same_partition_blob_url_usage(entry->environment.origin, HTML::current_settings_object());
 
     // 6. If isAuthorized is false, then return.
     if (!is_authorized)
@@ -161,7 +144,7 @@ void DOMURL::revoke_object_url(JS::VM&, Utf16String const& url)
 }
 
 // https://url.spec.whatwg.org/#dom-url-canparse
-bool DOMURL::can_parse(JS::VM&, Utf16String const& url, Optional<Utf16String> const& base)
+bool DOMURL::can_parse(Utf16String const& url, Optional<Utf16String> const& base)
 {
     // 1. Let parsedURL be the result of running the API URL parser on url with base, if given.
     auto parsed_url = parse_api_url(url.utf16_view(), base);
@@ -201,15 +184,17 @@ WebIDL::ExceptionOr<void> DOMURL::set_href(Utf16String const& value)
     // 3. Set this’s URL to parsedURL.
     m_url = parsed_url.release_value();
 
-    // 4. Empty this’s query object’s list.
-    m_query->m_list.clear();
+    if (m_query) {
+        // 4. Empty this’s query object’s list.
+        m_query->m_list.clear();
 
-    // 5. Let query be this’s URL’s query.
-    auto query = m_url.query();
+        // 5. Let query be this’s URL’s query.
+        auto query = m_url.query();
 
-    // 6. If query is non-null, then set this’s query object’s list to the result of parsing query.
-    if (query.has_value())
-        m_query->m_list = url_decode(*query);
+        // 6. If query is non-null, then set this’s query object’s list to the result of parsing query.
+        if (query.has_value())
+            m_query->m_list = url_decode(*query);
+    }
     return {};
 }
 
@@ -233,7 +218,7 @@ void DOMURL::set_protocol(Utf16String const& protocol)
     // The protocol setter steps are to basic URL parse the given value, followed by U+003A (:), with this’s URL as
     // url and scheme start state as state override.
     auto protocol_with_colon = Utf16String::formatted("{}:", protocol);
-    (void)URL::Parser::basic_parse(protocol_with_colon.utf16_view(), {}, &m_url, URL::Parser::State::SchemeStart);
+    (void)URL::Parser::basic_parse(protocol_with_colon.utf16_view(), m_url, URL::Parser::State::SchemeStart);
 }
 
 // https://url.spec.whatwg.org/#dom-url-username
@@ -298,7 +283,7 @@ void DOMURL::set_host(Utf16String const& host)
         return;
 
     // 2. Basic URL parse the given value with this’s URL as url and host state as state override.
-    (void)URL::Parser::basic_parse(host.utf16_view(), {}, &m_url, URL::Parser::State::Host);
+    (void)URL::Parser::basic_parse(host.utf16_view(), m_url, URL::Parser::State::Host);
 }
 
 // https://url.spec.whatwg.org/#dom-url-hostname
@@ -320,7 +305,7 @@ void DOMURL::set_hostname(Utf16String const& hostname)
         return;
 
     // 2. Basic URL parse the given value with this’s URL as url and hostname state as state override.
-    (void)URL::Parser::basic_parse(hostname.utf16_view(), {}, &m_url, URL::Parser::State::Hostname);
+    (void)URL::Parser::basic_parse(hostname.utf16_view(), m_url, URL::Parser::State::Hostname);
 }
 
 // https://url.spec.whatwg.org/#dom-url-port
@@ -347,7 +332,7 @@ void DOMURL::set_port(Utf16String const& port)
     }
     // 3. Otherwise, basic URL parse the given value with this’s URL as url and port state as state override.
     else {
-        (void)URL::Parser::basic_parse(port.utf16_view(), {}, &m_url, URL::Parser::State::Port);
+        (void)URL::Parser::basic_parse(port.utf16_view(), m_url, URL::Parser::State::Port);
     }
 }
 
@@ -366,10 +351,10 @@ void DOMURL::set_pathname(Utf16String const& pathname)
         return;
 
     // 2. Empty this’s URL’s path.
-    m_url.set_paths({});
+    m_url.set_path({});
 
     // 3. Basic URL parse the given value with this’s URL as url and path start state as state override.
-    (void)URL::Parser::basic_parse(pathname.utf16_view(), {}, &m_url, URL::Parser::State::PathStart);
+    (void)URL::Parser::basic_parse(pathname.utf16_view(), m_url, URL::Parser::State::PathStart);
 }
 
 // https://url.spec.whatwg.org/#dom-url-search
@@ -392,7 +377,8 @@ void DOMURL::set_search(Utf16String const& search)
     // 2. If the given value is the empty string, then set url’s query to null, empty this’s query object’s list, and return.
     if (search.is_empty()) {
         url.set_query({});
-        m_query->m_list.clear();
+        if (m_query)
+            m_query->m_list.clear();
         return;
     }
 
@@ -401,20 +387,27 @@ void DOMURL::set_search(Utf16String const& search)
     auto input = search_as_utf16_view.substring_view(search_as_utf16_view.starts_with('?'));
 
     // 4. Set url’s query to the empty string.
-    url.set_query(String {});
+    url.set_query(""sv);
 
     // 5. Basic URL parse input with url as url and query state as state override.
-    (void)URL::Parser::basic_parse(input, {}, &url, URL::Parser::State::Query);
+    (void)URL::Parser::basic_parse(input, url, URL::Parser::State::Query);
 
     // 6. Set this’s query object’s list to the result of parsing input.
-    m_query->m_list = url_decode(input);
+    if (m_query)
+        m_query->m_list = url_decode(input);
 }
 
 // https://url.spec.whatwg.org/#dom-url-searchparams
-GC::Ref<URLSearchParams const> DOMURL::search_params() const
+GC::Ref<URLSearchParams const> DOMURL::search_params()
 {
     // The searchParams getter steps are to return this’s query object.
-    return m_query;
+    if (!m_query) {
+        auto query = m_url.query().value_or(String {});
+        m_query = URLSearchParams::create(query);
+        m_query->m_url = this;
+    }
+
+    return *m_query;
 }
 
 // https://url.spec.whatwg.org/#dom-url-hash
@@ -442,19 +435,16 @@ void DOMURL::set_hash(Utf16String const& hash)
     auto input = hash_as_utf16_view.substring_view(hash_as_utf16_view.starts_with('#'));
 
     // 3. Set this’s URL’s fragment to the empty string.
-    m_url.set_fragment(String {});
+    m_url.set_fragment(""sv);
 
     // 4. Basic URL parse input with this’s URL as url and fragment state as state override.
-    (void)URL::Parser::basic_parse(input, {}, &m_url, URL::Parser::State::Fragment);
+    (void)URL::Parser::basic_parse(input, m_url, URL::Parser::State::Fragment);
 }
 
 // https://url.spec.whatwg.org/#concept-url-parser
-Optional<URL::URL> parse_from_byte_string(StringView input, Optional<URL::URL const&> base_url, Optional<StringView> encoding)
+static Optional<URL::URL> finish_parsing(Optional<URL::URL> url)
 {
     // FIXME: We should probably have an extended version of URL::URL for LibWeb instead of standalone functions like this.
-
-    // 1. Let url be the result of running the basic URL parser on input with base and encoding.
-    auto url = URL::Parser::basic_parse(input, base_url, {}, {}, encoding);
 
     // 2. If url is failure, return failure.
     if (!url.has_value())
@@ -465,35 +455,28 @@ Optional<URL::URL> parse_from_byte_string(StringView input, Optional<URL::URL co
         return url.release_value();
 
     // 4. Set url’s blob URL entry to the result of resolving the blob URL url, if that did not return failure, and null otherwise.
-    auto blob_url_entry = FileAPI::resolve_a_blob_url(*url);
-    if (blob_url_entry.has_value()) {
-        url->set_blob_url_entry(URL::BlobURLEntry {
-            .object = blob_url_entry->object.visit(
-                [](GC::Ref<FileAPI::Blob> const& blob) -> URL::BlobURLEntry::Object {
-                    return URL::BlobURLEntry::Blob {
-                        .type = blob->type().to_utf8(),
-                        .data = MUST(ByteBuffer::copy(blob->raw_bytes())),
-                    };
-                },
-                [](GC::Ref<MediaSourceExtensions::MediaSource> const&) -> URL::BlobURLEntry::Object { return URL::BlobURLEntry::MediaSource {}; }),
-            .environment { .origin = blob_url_entry->environment->origin() },
-        });
-    }
+    url->set_blob_url_entry(FileAPI::resolve_a_blob_url(*url));
 
     // 5. Return url
     return url.release_value();
 }
 
+Optional<URL::URL> parse_from_byte_string(StringView input, Optional<URL::URL const&> base_url, Optional<StringView> encoding)
+{
+    // 1. Let url be the result of running the basic URL parser on input with base and encoding.
+    return finish_parsing(URL::Parser::basic_parse(input, base_url, encoding));
+}
+
 Optional<URL::URL> parse(Utf16View input, Optional<URL::URL const&> base_url, Optional<Utf16View> encoding)
 {
-    auto input_utf8 = MUST(input.to_utf8());
     Optional<String> encoding_utf8;
     Optional<StringView> encoding_view;
     if (encoding.has_value()) {
         encoding_utf8 = MUST(encoding->to_utf8());
         encoding_view = encoding_utf8->bytes_as_string_view();
     }
-    return parse_from_byte_string(input_utf8.bytes_as_string_view(), base_url, encoding_view);
+    // 1. Let url be the result of running the basic URL parser on input with base and encoding.
+    return finish_parsing(URL::Parser::basic_parse(input, base_url, encoding_view));
 }
 
 // FIXME: At time of writing, still open spec MR: https://github.com/whatwg/url/pull/892

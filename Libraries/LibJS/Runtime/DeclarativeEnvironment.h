@@ -46,8 +46,6 @@ public:
     virtual ThrowCompletionOr<Value> get_binding_value(VM&, Utf16FlyString const& name, bool strict) override;
     virtual ThrowCompletionOr<bool> delete_binding(VM&, Utf16FlyString const& name) override;
 
-    ThrowCompletionOr<void> initialize_or_set_mutable_binding(VM&, Utf16FlyString const& name, Value value);
-
     // This is not a method defined in the spec! Do not use this in any LibJS (or other spec related) code.
     [[nodiscard]] Vector<Utf16FlyString> bindings() const
     {
@@ -72,6 +70,16 @@ public:
         }
 
         return names;
+    }
+
+    bool binding_is_mutable_by_name(Utf16FlyString const&) const;
+
+    Optional<size_t> binding_index(Utf16FlyString const& name) const
+    {
+        auto binding_and_index = find_binding_and_index(name);
+        if (!binding_and_index.has_value())
+            return {};
+        return binding_and_index->index();
     }
 
     ThrowCompletionOr<void> initialize_binding_direct(VM&, size_t index, Value, InitializeBindingHint);
@@ -101,6 +109,8 @@ public:
 
 private:
     struct RareData {
+        AK_ALLOC_WITH_KMALLOC;
+
         void visit_edges(Visitor&) const;
         [[nodiscard]] size_t external_memory_size() const;
         [[nodiscard]] bool is_empty() const;
@@ -227,6 +237,13 @@ inline ThrowCompletionOr<Value> DeclarativeEnvironment::get_binding_value_direct
         return vm.throw_completion<ReferenceError>(ErrorType::BindingNotInitialized, binding_name(index));
 
     return m_binding_values[index];
+}
+
+inline bool DeclarativeEnvironment::binding_is_mutable_by_name(Utf16FlyString const& name) const
+{
+    auto binding = find_binding_and_index(name);
+    VERIFY(binding.has_value());
+    return binding->binding().mutable_;
 }
 
 inline ThrowCompletionOr<Value> DeclarativeEnvironment::get_binding_value_direct(VM&, Binding const& binding) const

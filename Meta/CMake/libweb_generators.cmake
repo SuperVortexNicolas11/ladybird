@@ -20,30 +20,11 @@ function (generate_css_implementation)
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Enums.json"
     )
 
-    invoke_py_generator(
-        "EnvironmentVariable.cpp"
-        "generate_libweb_css_environment_variables.py"
-        "${LIBWEB_INPUT_FOLDER}/CSS/EnvironmentVariables.json"
-        "CSS/EnvironmentVariable.h"
-        "CSS/EnvironmentVariable.cpp"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/EnvironmentVariables.json"
-    )
-
-    invoke_py_generator(
-        "MathFunctions.cpp"
-        "generate_libweb_css_math_functions.py"
-        "${LIBWEB_INPUT_FOLDER}/CSS/MathFunctions.json"
-        "CSS/MathFunctions.h"
-        "CSS/MathFunctions.cpp"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/MathFunctions.json"
-    )
-
-    invoke_py_generator(
-        "MediaFeatureID.cpp"
+    invoke_py_header_generator(
+        "MediaFeatureID.h"
         "generate_libweb_css_media_feature_id.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/MediaFeatures.json"
         "CSS/MediaFeatureID.h"
-        "CSS/MediaFeatureID.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/MediaFeatures.json"
     )
 
@@ -57,14 +38,14 @@ function (generate_css_implementation)
                   -e "${LIBWEB_INPUT_FOLDER}/CSS/Enums.json"
                   -g "${LIBWEB_INPUT_FOLDER}/CSS/LogicalPropertyGroups.json"
         dependencies "${LIBWEB_INPUT_FOLDER}/CSS/Enums.json" "${LIBWEB_INPUT_FOLDER}/CSS/LogicalPropertyGroups.json"
+                     "${LADYBIRD_SOURCE_DIR}/Meta/Utils/utils.py"
     )
 
-    invoke_py_generator(
-        "PseudoClass.cpp"
+    invoke_py_header_generator(
+        "PseudoClass.h"
         "generate_libweb_css_pseudo_class.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/PseudoClasses.json"
         "CSS/PseudoClass.h"
-        "CSS/PseudoClass.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/PseudoClasses.json"
     )
 
@@ -87,17 +68,6 @@ function (generate_css_implementation)
     )
 
     invoke_py_generator(
-        "GeneratedValueTypesParsing.cpp"
-        "generate_libweb_css_value_types_parsing.py"
-        "${LIBWEB_INPUT_FOLDER}/CSS/ValueTypes.json"
-        "CSS/Parser/GeneratedValueTypesParsing.h"
-        "CSS/Parser/GeneratedValueTypesParsing.cpp"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/ValueTypes.json"
-                  -u "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
-        dependencies "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
-    )
-
-    invoke_py_generator(
         "Units.cpp"
         "generate_libweb_css_units.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
@@ -113,6 +83,7 @@ function (generate_css_implementation)
         "CSS/Keyword.h"
         "CSS/Keyword.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Keywords.json"
+        dependencies "${LADYBIRD_SOURCE_DIR}/Meta/Utils/utils.py"
     )
 
     invoke_py_idl_generator(
@@ -171,11 +142,9 @@ function (generate_css_implementation)
 
     set(CSS_GENERATED_HEADERS
        "CSS/Enums.h"
-       "CSS/EnvironmentVariable.h"
        "CSS/GeneratedCSSStyleProperties.h"
        "CSS/GeneratedCSSNumericFactoryMethods.h"
        "CSS/Keyword.h"
-       "CSS/MathFunctions.h"
        "CSS/MediaFeatureID.h"
        "CSS/PropertyID.h"
        "CSS/PseudoClass.h"
@@ -242,41 +211,19 @@ function (generate_html_implementation)
 endfunction()
 
 function (generate_webgl_implementation)
-    set(LIBWEB_INPUT_FOLDER "${CMAKE_CURRENT_SOURCE_DIR}")
-
-    invoke_py_generator(
-        "GLFunctions.cpp"
-        "generate_libweb_webgl_functions.py"
-        "${LIBWEB_INPUT_FOLDER}/WebGL/GLFunctions.json"
-        "WebGL/GLFunctions.h"
-        "WebGL/GLFunctions.cpp"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/WebGL/GLFunctions.json"
-        dependencies "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_webgl.py"
-    )
-
-    invoke_py_generator(
-        "WebGLCommands.cpp"
-        "generate_libweb_webgl_commands.py"
-        "${LIBWEB_INPUT_FOLDER}/WebGL/GLFunctions.json"
-        "WebGL/WebGLCommands.h"
-        "WebGL/WebGLCommands.cpp"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/WebGL/GLFunctions.json"
-        dependencies "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_webgl.py"
-    )
+    set(LIBCOMPOSITING_INPUT_FOLDER "${LADYBIRD_SOURCE_DIR}/Libraries/LibCompositing")
 
     invoke_py_generator(
         "WebGLContextProxy.cpp"
         "generate_libweb_webgl_proxy.py"
-        "${LIBWEB_INPUT_FOLDER}/WebGL/GLFunctions.json"
+        "${LIBCOMPOSITING_INPUT_FOLDER}/WebGL/GLFunctions.json"
         "WebGL/WebGLContextProxy.h"
         "WebGL/WebGLContextProxy.cpp"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/WebGL/GLFunctions.json"
+        arguments -j "${LIBCOMPOSITING_INPUT_FOLDER}/WebGL/GLFunctions.json"
         dependencies "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_webgl.py"
     )
 
     set(WEBGL_GENERATED_HEADERS
-       "WebGL/GLFunctions.h"
-       "WebGL/WebGLCommands.h"
        "WebGL/WebGLContextProxy.h"
     )
     list(TRANSFORM WEBGL_GENERATED_HEADERS PREPEND "${CMAKE_CURRENT_BINARY_DIR}/")
@@ -293,6 +240,9 @@ function (generate_js_bindings target)
     set(generated_idl_targets ${LIBWEB_ALL_GENERATED_IDL})
     list(TRANSFORM generated_idl_targets PREPEND "generate_")
     set(LIBWEB_ALL_BINDINGS_SOURCES)
+    set(LIBWEB_ALL_COMMON_BINDINGS_HEADERS)
+    get_target_property(libwebcommon_binary_dir LibWebCommon BINARY_DIR)
+    set(LIBWEB_COMMON_BINDINGS_DIRECTORY "${libwebcommon_binary_dir}/Bindings")
     set(LIBWEB_ALL_IDL_FILES)
     set(LIBWEB_ALL_PARSED_IDL_FILES)
     macro(libweb_add_bindings_source class)
@@ -312,6 +262,14 @@ function (generate_js_bindings target)
 
         list(APPEND LIBWEB_ALL_BINDINGS_SOURCES ${BINDINGS_SOURCES})
         set(LIBWEB_ALL_BINDINGS_SOURCES ${LIBWEB_ALL_BINDINGS_SOURCES} PARENT_SCOPE)
+
+        # The module's enumerations, which LibWebCommon provides so that processes without LibWeb can use them.
+        set(COMMON_BINDINGS_HEADER "${LIBWEB_COMMON_BINDINGS_DIRECTORY}/${basename}.h")
+        if (ENABLE_INSTALL_HEADERS)
+            install(FILES ${COMMON_BINDINGS_HEADER} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/LibWebCommon/Bindings")
+        endif()
+        list(APPEND LIBWEB_ALL_COMMON_BINDINGS_HEADERS ${COMMON_BINDINGS_HEADER})
+        set(LIBWEB_ALL_COMMON_BINDINGS_HEADERS ${LIBWEB_ALL_COMMON_BINDINGS_HEADERS} PARENT_SCOPE)
     endmacro()
 
     function(libweb_js_bindings class)
@@ -353,6 +311,7 @@ function (generate_js_bindings target)
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/namespaces.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/operations.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/overload_resolution.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/structured_serialize.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/to_idl_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/to_js_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Utils/lexer.py"
@@ -362,9 +321,11 @@ function (generate_js_bindings target)
     set(exposed_interface_sources
         Forward.h
         IntrinsicDefinitions.cpp IntrinsicDefinitions.h
+        AudioWorkletExposedInterfaces.cpp AudioWorkletExposedInterfaces.h
         DedicatedWorkerExposedInterfaces.cpp DedicatedWorkerExposedInterfaces.h
         SharedWorkerExposedInterfaces.cpp SharedWorkerExposedInterfaces.h
-        WindowExposedInterfaces.cpp WindowExposedInterfaces.h)
+        WindowExposedInterfaces.cpp WindowExposedInterfaces.h
+        WrapperFactory.cpp)
     list(TRANSFORM exposed_interface_sources PREPEND "Bindings/")
     target_sources(${target} PRIVATE ${exposed_interface_sources})
 
@@ -382,6 +343,20 @@ function (generate_js_bindings target)
     include("idl_files.cmake")
     list(REMOVE_DUPLICATES LIBWEB_ALL_PARSED_IDL_FILES)
 
+    set(GLOBAL_MIXIN_HEADERS
+        "${CMAKE_CURRENT_BINARY_DIR}/Bindings/DedicatedWorkerGlobalScopeGlobalMixin.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/Bindings/SharedWorkerGlobalScopeGlobalMixin.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/Bindings/WindowGlobalMixin.h")
+    if (ENABLE_INSTALL_HEADERS)
+        install(FILES ${GLOBAL_MIXIN_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/LibWeb/Bindings")
+    endif()
+    list(APPEND LIBWEB_ALL_GENERATED_HEADERS ${GLOBAL_MIXIN_HEADERS})
+    list(APPEND LIBWEB_ALL_BINDINGS_SOURCES ${GLOBAL_MIXIN_HEADERS})
+
+    set(STRUCTURED_SERIALIZE_BINDINGS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/Bindings/StructuredSerializeBindings.cpp")
+    target_sources(${target} PRIVATE ${STRUCTURED_SERIALIZE_BINDINGS_SOURCE})
+    list(APPEND LIBWEB_ALL_BINDINGS_SOURCES ${STRUCTURED_SERIALIZE_BINDINGS_SOURCE})
+
     set(LIBWEB_ALL_IDL_FILES_ARGUMENT ${LIBWEB_ALL_IDL_FILES})
     set(LIBWEB_ALL_PARSED_IDL_FILES_ARGUMENT ${LIBWEB_ALL_PARSED_IDL_FILES})
     set(LIBWEB_BINDINGS_DEPFILE "${CMAKE_CURRENT_BINARY_DIR}/Bindings/LibWebBindings.d")
@@ -396,9 +371,10 @@ function (generate_js_bindings target)
     endif()
 
     add_custom_command(
-        OUTPUT ${LIBWEB_ALL_BINDINGS_SOURCES} ${exposed_interface_sources}
+        OUTPUT ${LIBWEB_ALL_BINDINGS_SOURCES} ${LIBWEB_ALL_COMMON_BINDINGS_HEADERS} ${exposed_interface_sources}
         COMMAND "${CMAKE_COMMAND}" -E make_directory "Bindings"
         COMMAND "${Python3_EXECUTABLE}" "${bindings_generator}" -o "Bindings"
+                --common-output-path "${LIBWEB_COMMON_BINDINGS_DIRECTORY}"
                 --depfile "${LIBWEB_BINDINGS_DEPFILE}"
                 ${LIBWEB_ALL_PARSED_IDL_FILES_ARGUMENT}
         VERBATIM
@@ -407,7 +383,7 @@ function (generate_js_bindings target)
         DEPENDS ${bindings_generator_dependencies} ${LIBWEB_ALL_IDL_FILES} ${LIBWEB_ALL_PARSED_IDL_FILES}
     )
 
-    add_custom_target(generate_bindings DEPENDS ${LIBWEB_ALL_BINDINGS_SOURCES})
+    add_custom_target(generate_bindings DEPENDS ${LIBWEB_ALL_BINDINGS_SOURCES} ${LIBWEB_ALL_COMMON_BINDINGS_HEADERS})
     add_dependencies(ladybird_codegen_accumulator generate_bindings)
     add_dependencies(${target} generate_bindings)
     add_dependencies(generate_bindings ${generated_idl_targets})

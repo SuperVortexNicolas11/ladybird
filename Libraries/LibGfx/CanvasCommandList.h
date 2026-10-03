@@ -60,7 +60,22 @@ using CanvasPaintStyle = Variant<Color, CanvasLinearGradient, CanvasRadialGradie
 
 inline constexpr i64 max_canvas_area = 16384 * 16384;
 
+struct CanvasGlyph {
+    FloatPoint position;
+    u32 glyph_id { 0 };
+};
+
 namespace CanvasCommands {
+
+struct DrawGlyphRun {
+    u64 font_id { 0 };
+    Vector<CanvasGlyph> glyphs;
+    FloatPoint translation;
+    CanvasPaintStyle style;
+    Optional<Filter> filter;
+    float global_alpha { 1 };
+    CompositingAndBlendingOperator compositing_and_blending_operator { CompositingAndBlendingOperator::SourceOver };
+};
 
 struct ClearRect {
     FloatRect rect;
@@ -132,9 +147,14 @@ struct ClipPath {
 
 struct Reset { };
 
+struct ClearCanvas {
+    Color color;
+};
+
 }
 
 using CanvasCommand = Variant<
+    CanvasCommands::DrawGlyphRun,
     CanvasCommands::ClearRect,
     CanvasCommands::FillRect,
     CanvasCommands::DrawBitmap,
@@ -145,7 +165,8 @@ using CanvasCommand = Variant<
     CanvasCommands::Save,
     CanvasCommands::Restore,
     CanvasCommands::ClipPath,
-    CanvasCommands::Reset>;
+    CanvasCommands::Reset,
+    CanvasCommands::ClearCanvas>;
 
 class CanvasCommandList {
 public:
@@ -171,6 +192,15 @@ CanvasPaintStyle to_canvas_paint_style(PaintStyle const&);
 }
 
 namespace IPC {
+
+template<>
+ErrorOr<void> encode(Encoder&, Gfx::CanvasGlyph const&);
+template<>
+ErrorOr<Gfx::CanvasGlyph> decode(Decoder&);
+template<>
+ErrorOr<void> encode(Encoder&, Gfx::CanvasCommands::DrawGlyphRun const&);
+template<>
+ErrorOr<Gfx::CanvasCommands::DrawGlyphRun> decode(Decoder&);
 
 template<>
 ErrorOr<void> encode(Encoder&, Gfx::CanvasLinearGradient const&);
@@ -246,6 +276,11 @@ template<>
 ErrorOr<void> encode(Encoder&, Gfx::CanvasCommands::Reset const&);
 template<>
 ErrorOr<Gfx::CanvasCommands::Reset> decode(Decoder&);
+
+template<>
+ErrorOr<void> encode(Encoder&, Gfx::CanvasCommands::ClearCanvas const&);
+template<>
+ErrorOr<Gfx::CanvasCommands::ClearCanvas> decode(Decoder&);
 
 template<>
 ErrorOr<void> encode(Encoder&, Gfx::CanvasCommandList const&);

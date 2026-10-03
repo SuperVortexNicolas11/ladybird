@@ -1,8 +1,13 @@
+// https://w3c.github.io/IndexedDB/#factory-interface
+partial interface mixin WindowOrWorkerGlobalScope {
+    [SameObject] readonly attribute IDBFactory indexedDB;
+};
+
 // https://w3c.github.io/IndexedDB/#idbfactory
 [Exposed=(Window,Worker)]
 interface IDBFactory {
-    [NewObject] IDBOpenDBRequest open(Utf16DOMString name, optional [EnforceRange] unsigned long long version);
-    [NewObject] IDBOpenDBRequest deleteDatabase(Utf16DOMString name);
+    [NewObject] IDBOpenDBRequest open(DOMString name, optional [EnforceRange] unsigned long long version);
+    [NewObject] IDBOpenDBRequest deleteDatabase(DOMString name);
 
     Promise<sequence<IDBDatabaseInfo>> databases();
 
@@ -10,6 +15,6 @@ interface IDBFactory {
 };
 
 dictionary IDBDatabaseInfo {
-    Utf16DOMString name;
+    DOMString name;
     unsigned long long version;
 };

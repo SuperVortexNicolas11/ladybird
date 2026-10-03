@@ -109,7 +109,11 @@ Optional<HourCycle> default_hour_cycle(Utf16View locale)
     if (!locale_data.has_value())
         return {};
 
-    auto hour_cycle = locale_data->date_time_pattern_generator().getDefaultHourCycle(status);
+    auto pattern_generator = locale_data->date_time_pattern_generator();
+    if (!pattern_generator.has_value())
+        return {};
+
+    auto hour_cycle = pattern_generator->getDefaultHourCycle(status);
     if (icu_failure(status))
         return {};
 
@@ -672,7 +676,7 @@ static bool is_formatted_range_actually_a_range(icu::FormattedDateInterval const
 
 class DateTimeFormatImpl : public DateTimeFormat {
 public:
-    DateTimeFormatImpl(icu::Locale& locale, icu::UnicodeString const& pattern, Utf16View time_zone_identifier, NonnullOwnPtr<icu::SimpleDateFormat> formatter)
+    DateTimeFormatImpl(icu::Locale const& locale, icu::UnicodeString const& pattern, Utf16View time_zone_identifier, NonnullOwnPtr<icu::SimpleDateFormat> formatter)
         : m_locale(locale)
         , m_pattern(CalendarPattern::create_from_pattern(icu_string_to_string(pattern)))
         , m_formatter(move(formatter))
@@ -875,7 +879,7 @@ private:
         }
     }
 
-    icu::Locale& m_locale;
+    icu::Locale m_locale;
     CalendarPattern m_pattern;
 
     NonnullOwnPtr<icu::SimpleDateFormat> m_formatter;
@@ -918,7 +922,7 @@ NonnullOwnPtr<DateTimeFormat> DateTimeFormat::create_for_date_and_time_style(
     verify_icu_success(status);
 
     if (apply_hour_cycle_to_skeleton(skeleton, hour_cycle, hour12)) {
-        pattern = locale_data->date_time_pattern_generator().getBestPattern(skeleton, UDATPG_MATCH_ALL_FIELDS_LENGTH, status);
+        pattern = locale_data->date_time_pattern_generator()->getBestPattern(skeleton, UDATPG_MATCH_ALL_FIELDS_LENGTH, status);
         verify_icu_success(status);
 
         apply_hour_cycle_to_skeleton(pattern, hour_cycle, hour12);
@@ -946,7 +950,7 @@ NonnullOwnPtr<DateTimeFormat> DateTimeFormat::create_for_pattern_options(
         pattern = icu_string(*options.pattern);
     } else {
         auto skeleton = icu_string(options.to_pattern());
-        pattern = locale_data->date_time_pattern_generator().getBestPattern(skeleton, UDATPG_MATCH_ALL_FIELDS_LENGTH, status);
+        pattern = locale_data->date_time_pattern_generator()->getBestPattern(skeleton, UDATPG_MATCH_ALL_FIELDS_LENGTH, status);
         verify_icu_success(status);
     }
 

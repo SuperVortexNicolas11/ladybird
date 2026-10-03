@@ -6,11 +6,12 @@
  */
 
 #include <AK/NonnullOwnPtr.h>
-#include <LibJS/Runtime/Array.h>
+#include <LibGC/WeakInlines.h>
 #include <LibWeb/ARIA/ARIAMixin.h>
 #include <LibWeb/ARIA/Roles.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
-#include <LibWeb/Infra/CharacterTypes.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
 
 namespace Web::ARIA {
 
@@ -28,14 +29,6 @@ static void for_each_ascii_whitespace_separated_token(Utf16View input, Function<
             return;
         start = i + 1;
     }
-}
-
-void ARIAMixin::visit_edges(GC::Cell::Visitor& visitor)
-{
-#define __ENUMERATE_ARIA_ATTRIBUTE(attribute, referencing_attribute) \
-    visitor.visit(m_cached_##attribute);
-    ENUMERATE_ARIA_ELEMENT_LIST_REFERENCING_ATTRIBUTES
-#undef __ENUMERATE_ARIA_ATTRIBUTE
 }
 
 // https://www.w3.org/TR/wai-aria-1.2/#introroles
@@ -284,41 +277,39 @@ Vector<Utf16String> ARIAMixin::parse_id_reference_list(Optional<Utf16String> con
 #define __ENUMERATE_ARIA_ATTRIBUTE(attribute, referencing_attribute) \
     GC::Ptr<DOM::Element> ARIAMixin::attribute() const               \
     {                                                                \
-        return m_##attribute.ptr();                                  \
+        auto const* rare_data = aria_rare_data();                    \
+        return rare_data ? rare_data->attribute.ptr() : nullptr;     \
     }                                                                \
                                                                      \
     void ARIAMixin::set_##attribute(GC::Ptr<DOM::Element> value)     \
     {                                                                \
-        m_##attribute = value.ptr();                                 \
+        if (!value) {                                                \
+            if (auto* rare_data = aria_rare_data())                  \
+                rare_data->attribute = nullptr;                      \
+            return;                                                  \
+        }                                                            \
+        ensure_aria_rare_data().attribute = value.ptr();             \
     }
 ENUMERATE_ARIA_ELEMENT_REFERENCING_ATTRIBUTES
 #undef __ENUMERATE_ARIA_ATTRIBUTE
 
-#define __ENUMERATE_ARIA_ATTRIBUTE(attribute, referencing_attribute)                 \
-    Optional<Vector<GC::Weak<DOM::Element>> const&> ARIAMixin::attribute() const     \
-    {                                                                                \
-        if (!m_##attribute)                                                          \
-            return {};                                                               \
-        return *m_##attribute;                                                       \
-    }                                                                                \
-                                                                                     \
-    void ARIAMixin::set_##attribute(Optional<Vector<GC::Weak<DOM::Element>>> value)  \
-    {                                                                                \
-        if (!value.has_value()) {                                                    \
-            m_##attribute.clear();                                                   \
-            return;                                                                  \
-        }                                                                            \
-        m_##attribute = make<Vector<GC::Weak<DOM::Element>>>(value.release_value()); \
-    }                                                                                \
-                                                                                     \
-    GC::Ptr<JS::Array> ARIAMixin::cached_##attribute() const                         \
-    {                                                                                \
-        return m_cached_##attribute;                                                 \
-    }                                                                                \
-                                                                                     \
-    void ARIAMixin::set_cached_##attribute(GC::Ptr<JS::Array> value)                 \
-    {                                                                                \
-        m_cached_##attribute = value;                                                \
+#define __ENUMERATE_ARIA_ATTRIBUTE(attribute, referencing_attribute)                                     \
+    Optional<Vector<GC::Weak<DOM::Element>> const&> ARIAMixin::attribute() const                         \
+    {                                                                                                    \
+        auto const* rare_data = aria_rare_data();                                                        \
+        if (!rare_data || !rare_data->attribute)                                                         \
+            return {};                                                                                   \
+        return *rare_data->attribute;                                                                    \
+    }                                                                                                    \
+                                                                                                         \
+    void ARIAMixin::set_##attribute(Optional<Vector<GC::Weak<DOM::Element>>> value)                      \
+    {                                                                                                    \
+        if (!value.has_value()) {                                                                        \
+            if (auto* rare_data = aria_rare_data())                                                      \
+                rare_data->attribute.clear();                                                            \
+            return;                                                                                      \
+        }                                                                                                \
+        ensure_aria_rare_data().attribute = make<Vector<GC::Weak<DOM::Element>>>(value.release_value()); \
     }
 ENUMERATE_ARIA_ELEMENT_LIST_REFERENCING_ATTRIBUTES
 #undef __ENUMERATE_ARIA_ATTRIBUTE

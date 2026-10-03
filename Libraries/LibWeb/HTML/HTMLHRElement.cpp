@@ -5,9 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLHRElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
@@ -25,12 +23,6 @@ HTMLHRElement::HTMLHRElement(DOM::Document& document, DOM::QualifiedName qualifi
 }
 
 HTMLHRElement::~HTMLHRElement() = default;
-
-void HTMLHRElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLHRElement);
-    Base::initialize(realm);
-}
 
 bool HTMLHRElement::is_presentational_hint(Utf16FlyString const& name) const
 {

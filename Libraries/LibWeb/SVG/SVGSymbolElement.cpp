@@ -4,12 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGSymbolElement.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/ShadowRoot.h>
-#include <LibWeb/Layout/SVGGraphicsBox.h>
 #include <LibWeb/SVG/SVGSymbolElement.h>
 #include <LibWeb/SVG/SVGUseElement.h>
 
@@ -22,27 +20,15 @@ SVGSymbolElement::SVGSymbolElement(DOM::Document& document, DOM::QualifiedName q
 {
 }
 
-void SVGSymbolElement::initialize(JS::Realm& realm)
+void SVGSymbolElement::initialize_element()
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGSymbolElement);
-    Base::initialize(realm);
-    SVGFitToViewBox::initialize(realm);
+    SVGFitToViewBox::initialize_fit_to_view_box();
 }
 
 void SVGSymbolElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     SVGFitToViewBox::visit_edges(visitor);
-}
-
-void SVGSymbolElement::adjust_computed_style(CSS::ComputedProperties::Builder& computed_properties)
-{
-    Base::adjust_computed_style(computed_properties);
-
-    if (is_direct_child_of_use_shadow_tree()) {
-        // The generated instance of a ‘symbol’ that is the direct referenced element of a ‘use’ element must always have a computed value of inline for the display property.
-        computed_properties.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::Inline)));
-    }
 }
 
 void SVGSymbolElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -62,14 +48,13 @@ bool SVGSymbolElement::is_direct_child_of_use_shadow_tree() const
     return is<SVGUseElement>(host);
 }
 
-RefPtr<Layout::Node> SVGSymbolElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+CSS::ElementBoxKind SVGSymbolElement::box_kind() const
 {
     // https://svgwg.org/svg2-draft/render.html#TermNeverRenderedElement
     // [..] it also includes a ‘symbol’ element that is not the instance root of a use-element shadow tree.
     if (!is_direct_child_of_use_shadow_tree())
-        return {};
-
-    return make_ref_counted<Layout::SVGGraphicsBox>(document(), *this, style);
+        return CSS::ElementBoxKind::NoBox;
+    return CSS::ElementBoxKind::SvgGraphics;
 }
 
 }

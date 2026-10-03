@@ -29,11 +29,12 @@ constexpr auto document_accept_header_value = "text/html,application/xhtml+xml,a
 // If the sum of contentLength and inflightKeepaliveBytes is greater than 64 kibibytes, then return a network error.
 constexpr auto keepalive_maximum_size = 64 * KiB;
 
-#define ENUMERATE_BOOL_PARAMS                     \
-    __ENUMERATE_BOOL_PARAM(IsAuthenticationFetch) \
-    __ENUMERATE_BOOL_PARAM(IsNewConnectionFetch)  \
-    __ENUMERATE_BOOL_PARAM(MakeCORSPreflight)     \
-    __ENUMERATE_BOOL_PARAM(Recursive)             \
+#define ENUMERATE_BOOL_PARAMS                               \
+    __ENUMERATE_BOOL_PARAM(IsAuthenticationFetch)           \
+    __ENUMERATE_BOOL_PARAM(IsNewConnectionFetch)            \
+    __ENUMERATE_BOOL_PARAM(MakeCORSPreflight)               \
+    __ENUMERATE_BOOL_PARAM(Recursive)                       \
+    __ENUMERATE_BOOL_PARAM(CreateResponseBodyTransferLease) \
     __ENUMERATE_BOOL_PARAM(UseParallelQueue)
 
 #define __ENUMERATE_BOOL_PARAM(Name) \
@@ -44,9 +45,9 @@ constexpr auto keepalive_maximum_size = 64 * KiB;
 ENUMERATE_BOOL_PARAMS
 #undef __ENUMERATE_BOOL_PARAM
 
-WEB_API GC::Ref<Infrastructure::FetchController> fetch(JS::Realm&, Infrastructure::Request&, Infrastructure::FetchAlgorithms const&, UseParallelQueue use_parallel_queue = UseParallelQueue::No);
+WEB_API GC::Ref<Infrastructure::FetchController> fetch(JS::Realm&, Infrastructure::Request&, Infrastructure::FetchAlgorithms const&, UseParallelQueue use_parallel_queue = UseParallelQueue::No, CreateResponseBodyTransferLease = CreateResponseBodyTransferLease::No);
 GC::Ptr<PendingResponse> main_fetch(JS::Realm&, Infrastructure::FetchParams const&, Recursive recursive = Recursive::No);
-void populate_request_from_client(JS::Realm const&, Infrastructure::Request&);
+void populate_request_from_client(Infrastructure::Request&);
 void fetch_response_handover(JS::Realm&, Infrastructure::FetchParams const&, Infrastructure::Response&);
 GC::Ref<PendingResponse> scheme_fetch(JS::Realm&, Infrastructure::FetchParams const&);
 GC::Ref<PendingResponse> http_fetch(JS::Realm&, Infrastructure::FetchParams const&, MakeCORSPreflight make_cors_preflight = MakeCORSPreflight::No);
@@ -59,6 +60,7 @@ void set_sec_fetch_mode_header(Infrastructure::Request&);
 void set_sec_fetch_site_header(Infrastructure::Request&);
 void set_sec_fetch_user_header(Infrastructure::Request&);
 void append_fetch_metadata_headers_for_request(Infrastructure::Request&);
+void append_user_agent_client_hints_for_request(Infrastructure::Request&);
 
 WEB_API void set_http_memory_cache_enabled(bool enabled);
 WEB_API bool http_memory_cache_enabled();

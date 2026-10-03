@@ -17,9 +17,9 @@ namespace URL {
     __URL_ENUMERATE(downloads)  \
     __URL_ENUMERATE(history)    \
     __URL_ENUMERATE(newtab)     \
-    __URL_ENUMERATE(processes)  \
     __URL_ENUMERATE(settings)   \
-    __URL_ENUMERATE(version)
+    __URL_ENUMERATE(version)    \
+    __URL_ENUMERATE(welcome)
 
 #define __URL_ENUMERATE(url)                                        \
     inline URL const& about_##url()                                 \

@@ -13,13 +13,15 @@
 #include <LibGfx/SkiaUtils.h>
 #include <core/SkCanvas.h>
 #include <core/SkPaint.h>
+#include <core/SkTextBlob.h>
 
 namespace Gfx {
 
-CanvasCommandPlayer::CanvasCommandPlayer(RefPtr<SkiaBackendContext> skia_backend_context, IntSize size, BitmapFormat format, AlphaType alpha_type, CanvasSurfaceResolver canvas_surface_resolver)
+CanvasCommandPlayer::CanvasCommandPlayer(RefPtr<SkiaBackendContext> skia_backend_context, IntSize size, BitmapFormat format, AlphaType alpha_type, CanvasSurfaceResolver canvas_surface_resolver, TextBlobResolver text_blob_resolver)
     : m_surface(PaintingSurface::create_with_size(size, format, alpha_type, move(skia_backend_context)))
     , m_painter(make<PainterSkia>(*m_surface))
     , m_canvas_surface_resolver(move(canvas_surface_resolver))
+    , m_text_blob_resolver(move(text_blob_resolver))
 {
 }
 
@@ -39,6 +41,16 @@ void CanvasCommandPlayer::play(CanvasCommandList const& command_list)
 {
     for (auto const& command : command_list.commands())
         command.visit([&](auto const& command) { play_command(command); });
+}
+
+void CanvasCommandPlayer::play_command(CanvasCommands::DrawGlyphRun const& command)
+{
+    if (!m_text_blob_resolver)
+        return;
+    auto blob = m_text_blob_resolver(command.font_id, command.glyphs);
+    if (!blob)
+        return;
+    m_painter->draw_text_blob(*blob, command.translation, resolve_paint_style(command.style), command.filter, command.global_alpha, command.compositing_and_blending_operator);
 }
 
 void CanvasCommandPlayer::play_command(CanvasCommands::ClearRect const& command)
@@ -128,6 +140,31 @@ void CanvasCommandPlayer::play_command(CanvasCommands::ClipPath const& command)
 void CanvasCommandPlayer::play_command(CanvasCommands::Reset const&)
 {
     m_painter->reset();
+}
+
+void CanvasCommandPlayer::play_command(CanvasCommands::ClearCanvas const& command)
+{
+    auto size = m_surface->size();
+    if (size.is_empty())
+        return;
+
+    static constexpr int max_strip_height = 64;
+    auto strip_height = min(size.height(), max_strip_height);
+    auto strip_or_error = Bitmap::create(BitmapFormat::BGRA8888, AlphaType::Premultiplied, { size.width(), strip_height });
+    if (strip_or_error.is_error())
+        return;
+    auto strip = strip_or_error.release_value();
+    auto alpha = command.color.alpha();
+    auto premultiply = [alpha](u8 channel) { return static_cast<u8>((channel * alpha + 127) / 255); };
+    auto pixel = Color(premultiply(command.color.red()), premultiply(command.color.green()), premultiply(command.color.blue()), alpha).value();
+    for (int y = 0; y < strip_height; ++y) {
+        auto* scanline = strip->scanline(y);
+        for (int x = 0; x < size.width(); ++x)
+            scanline[x] = pixel;
+    }
+
+    for (int y = 0; y < size.height(); y += strip_height)
+        m_surface->write_from_bitmap(*strip, { 0, y });
 }
 
 NonnullRefPtr<PaintStyle> CanvasCommandPlayer::resolve_paint_style(CanvasPaintStyle const& style) const

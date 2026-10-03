@@ -26,11 +26,12 @@
 namespace Web::Speech {
 
 class SpeechSynthesisUtterance final : public DOM::EventTarget {
-    WEB_PLATFORM_OBJECT(SpeechSynthesisUtterance, DOM::EventTarget);
+    WEB_WRAPPABLE(SpeechSynthesisUtterance, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(SpeechSynthesisUtterance);
 
 public:
-    static WebIDL::ExceptionOr<GC::Ref<SpeechSynthesisUtterance>> construct_impl(JS::Realm&, Utf16String const& text = {});
+    static constexpr size_t voice_offset() { return offsetof(SpeechSynthesisUtterance, m_voice); }
+    static GC::Ref<SpeechSynthesisUtterance> create(Utf16String const& text = {});
     virtual ~SpeechSynthesisUtterance() override;
 
     // https://wicg.github.io/speech-api/#dom-speechsynthesisutterance-text
@@ -65,9 +66,8 @@ public:
 #undef __ENUMERATE
 
 private:
-    SpeechSynthesisUtterance(JS::Realm&, Utf16String const& text);
+    explicit SpeechSynthesisUtterance(Utf16String const& text);
 
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
     Utf16String m_text;

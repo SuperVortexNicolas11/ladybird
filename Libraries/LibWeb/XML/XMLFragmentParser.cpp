@@ -75,7 +75,8 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> XMLFragmentParser::parse_xml
     feed.append(qualified_name);
     feed.append(">"sv);
 
-    GC::Ptr<DOM::Document> document = DOM::Document::create(context->realm());
+    auto& context_document = context->document();
+    GC::Ptr<DOM::Document> document = DOM::Document::create(context_document.page(), context_document.relevant_global_event_target());
     document->set_document_type(DOM::Document::Type::XML);
 
     XML::Parser parser(feed.string_view(), { .resolve_named_html_entity = resolve_named_html_entity });
@@ -83,20 +84,23 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> XMLFragmentParser::parse_xml
     auto result = parser.parse_with_listener(builder);
 
     // 7. If there is an XML well-formedness or XML namespace well-formedness error, then throw a "SyntaxError" DOMException.
-    if (result.is_error()) {
-        return WebIDL::SyntaxError::create(context->realm(), Utf16String::formatted("{}", result.error()));
-    }
+    // NB: The builder reports the errors it finds while building the tree (a qualified name the DOM rejects, a prefix it
+    // can't resolve) through has_error(), not through the parser's result.
+    if (result.is_error())
+        return WebIDL::SyntaxError::create(Utf16String::formatted("{}", result.error()));
+    if (builder.has_error())
+        return WebIDL::SyntaxError::create("Document is not namespace-well-formed"_utf16);
 
     auto* doc_element = document->document_element();
 
     // 8. If the document element of the resulting Document has any sibling nodes, then throw a "SyntaxError" DOMException.
     if (doc_element->previous_sibling() || doc_element->next_sibling()) {
-        return WebIDL::SyntaxError::create(context->realm(), "Document element has sibling nodes"_utf16);
+        return WebIDL::SyntaxError::create("Document element has sibling nodes"_utf16);
     }
 
     // 9. Let newChildren be the resulting Document node's document element's children, in tree order.
     // 10. Let fragment be a new DocumentFragment whose node document is context's node document.
-    auto fragment = context->realm().create<DOM::DocumentFragment>(context->document());
+    auto fragment = DOM::DocumentFragment::create(context->document());
 
     // 11. For each node of newChildren, in tree order: append node to fragment.
     for (auto* child = doc_element->first_child(); child;) {

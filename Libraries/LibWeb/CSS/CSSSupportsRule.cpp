@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/CSSSupportsRule.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/CSSSupportsRule.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/Dump.h>
@@ -14,26 +13,20 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSSupportsRule);
 
-GC::Ref<CSSSupportsRule> CSSSupportsRule::create(JS::Realm& realm, NonnullRefPtr<Supports>&& supports, CSSRuleList& rules)
+GC::Ref<CSSSupportsRule> CSSSupportsRule::create(RustRule rule, CSSRuleList& rules)
 {
-    return realm.create<CSSSupportsRule>(realm, move(supports), rules);
+    return GC::Heap::the().allocate<CSSSupportsRule>(move(rule), rules);
 }
 
-CSSSupportsRule::CSSSupportsRule(JS::Realm& realm, NonnullRefPtr<Supports>&& supports, CSSRuleList& rules)
-    : CSSConditionRule(realm, rules, Type::Supports)
-    , m_supports(move(supports))
+CSSSupportsRule::CSSSupportsRule(RustRule rule, CSSRuleList& rules)
+    : CSSConditionRule(rules, move(rule))
+    , m_supports(RustQueryHandle::retained(native_rule().payload().supports))
 {
-}
-
-void CSSSupportsRule::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSSupportsRule);
-    Base::initialize(realm);
 }
 
 Utf16String CSSSupportsRule::serialized_condition_text() const
 {
-    return m_supports->to_string();
+    return serialize_supports_condition(m_supports);
 }
 
 // https://www.w3.org/TR/cssom-1/#serialize-a-css-rule
@@ -63,7 +56,7 @@ void CSSSupportsRule::dump(StringBuilder& builder, int indent_levels) const
 {
     Base::dump(builder, indent_levels);
 
-    supports().dump(builder, indent_levels + 1);
+    dump_supports_condition(builder, supports(), indent_levels + 1);
 
     dump_indent(builder, indent_levels + 1);
     builder.appendff("Rules ({}):\n", css_rules().length());

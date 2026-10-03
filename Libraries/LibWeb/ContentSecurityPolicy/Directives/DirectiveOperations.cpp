@@ -12,6 +12,7 @@
 #include <LibWeb/ContentSecurityPolicy/Directives/KeywordSources.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Names.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/SourceExpression.h>
+#include <LibWeb/ContentSecurityPolicy/Policy.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
@@ -21,11 +22,11 @@
 #include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLStyleElement.h>
-#include <LibWeb/Infra/Strings.h>
 #include <LibWeb/SRI/SRI.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
+#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::ContentSecurityPolicy::Directives {
 
@@ -613,7 +614,7 @@ MatchResult does_url_match_expression_in_origin_with_redirect_count(URL::URL con
             //        It should likely use the URL path serializer instead.
             StringBuilder builder;
             builder.append('/');
-            builder.join('/', url.paths());
+            builder.join('/', url.path_segments());
             auto path = MUST(builder.to_string());
 
             // 2. If expression’s path-part does not path-part match path, return "Does Not Match".
@@ -949,7 +950,7 @@ enum class NonceableResult {
     // FIXME: File spec issue to ask if this should include SVGScriptElement.
     if (is<HTML::HTMLScriptElement>(element.ptr())) {
         for (size_t attribute_index = 0; attribute_index < element->attributes()->length(); ++attribute_index) {
-            auto const* attribute = element->attributes()->item(attribute_index);
+            auto attribute = element->attributes()->item(attribute_index);
             VERIFY(attribute);
 
             // 1. If attribute’s name contains an ASCII case-insensitive match for "<script" or "<style", return

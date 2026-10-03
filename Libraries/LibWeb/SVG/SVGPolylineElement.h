@@ -11,7 +11,7 @@
 namespace Web::SVG {
 
 class SVGPolylineElement final : public SVGGeometryElement {
-    WEB_PLATFORM_OBJECT(SVGPolylineElement, SVGGeometryElement);
+    WEB_WRAPPABLE(SVGPolylineElement, SVGGeometryElement);
     GC_DECLARE_ALLOCATOR(SVGPolylineElement);
 
 public:
@@ -19,12 +19,13 @@ public:
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    virtual Gfx::Path get_path(CSSPixelSize viewport_size) override;
+    virtual Gfx::Path get_path(CSSPixelSize viewport_size, CSS::ComputedValues const&) override;
+
+    // The parsed `points` list, as the element publishes it to layout.
+    ReadonlySpan<Gfx::FloatPoint> points() const { return m_points; }
 
 private:
     SVGPolylineElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
 
     Vector<Gfx::FloatPoint> m_points;
 };

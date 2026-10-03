@@ -4,15 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLBRElement.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
-#include <LibWeb/Layout/BreakNode.h>
-#include <LibWeb/Layout/ReplacedBox.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/VisualLines.h>
 
 namespace Web::HTML {
@@ -26,15 +26,9 @@ HTMLBRElement::HTMLBRElement(DOM::Document& document, DOM::QualifiedName qualifi
 
 HTMLBRElement::~HTMLBRElement() = default;
 
-void HTMLBRElement::initialize(JS::Realm& realm)
+CSS::ElementBoxKind HTMLBRElement::box_kind() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLBRElement);
-    Base::initialize(realm);
-}
-
-RefPtr<Layout::Node> HTMLBRElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
-{
-    return make_ref_counted<Layout::BreakNode>(document(), *this, style);
+    return CSS::ElementBoxKind::Break;
 }
 
 bool HTMLBRElement::is_presentational_hint(Utf16FlyString const& name) const
@@ -66,7 +60,7 @@ static bool is_rendered_inline_content(DOM::Node const& node)
 {
     if (auto const* text = as_if<DOM::Text>(node)) {
         for (auto const& line : collect_visual_lines(*text)) {
-            if (!line.fragments.is_empty())
+            if (line.has_fragments)
                 return true;
         }
         return false;
@@ -75,7 +69,7 @@ static bool is_rendered_inline_content(DOM::Node const& node)
         auto const* layout_node = element->layout_node();
         if (!layout_node)
             return false;
-        if (is<Layout::ReplacedBox>(*layout_node))
+        if (layout_node->is_replaced_box())
             return true;
         if (layout_node->display().is_inline_outside() && !layout_node->display().is_flow_inside())
             return true;
@@ -106,16 +100,6 @@ bool HTMLBRElement::represents_empty_line() const
             return false;
     }
     return true;
-}
-
-void HTMLBRElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
-{
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
-    else if (!style.display().is_none())
-        // AD-HOC: Prevent other display values from applying, so that we always create a BreakNode
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::Inline)));
 }
 
 }

@@ -66,7 +66,7 @@ ErrorOr<void> chdir(StringView path)
     return {};
 }
 
-ErrorOr<void*> reserve_address_space(size_t size)
+ErrorOr<void*> reserve_address_space(size_t size, [[maybe_unused]] MemoryTag tag)
 {
     void* ptr = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
     if (!ptr)
@@ -74,14 +74,32 @@ ErrorOr<void*> reserve_address_space(size_t size)
     return ptr;
 }
 
-ErrorOr<void> commit_memory(void* address, size_t size)
+ErrorOr<void*> allocate_anonymous_memory(size_t size, [[maybe_unused]] MemoryTag tag)
+{
+    void* ptr = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!ptr)
+        return Error::from_windows_error();
+    return ptr;
+}
+
+ErrorOr<void> commit_memory(void* address, size_t size, [[maybe_unused]] MemoryTag tag)
 {
     if (!VirtualAlloc(address, size, MEM_COMMIT, PAGE_READWRITE))
         return Error::from_windows_error();
     return {};
 }
 
-ErrorOr<void> decommit_memory(void* address, size_t size)
+ErrorOr<void> protect_memory_readonly(void* address, size_t size)
+{
+    if (size == 0)
+        return {};
+    DWORD previous_protection;
+    if (!VirtualProtect(address, size, PAGE_READONLY, &previous_protection))
+        return Error::from_windows_error();
+    return {};
+}
+
+ErrorOr<void> decommit_memory(void* address, size_t size, [[maybe_unused]] MemoryTag tag)
 {
     if (size == 0)
         return {};
@@ -97,6 +115,12 @@ ErrorOr<void> release_address_space(void* address, size_t size)
     if (!VirtualFree(address, 0, MEM_RELEASE))
         return Error::from_windows_error();
     return {};
+}
+
+ErrorOr<void> map_shared_memory_fixed(void*, size_t, int)
+{
+    // FIXME: Placing a file-mapping view at a fixed address inside a reservation needs the Windows 10+ placeholder APIs.
+    return Error::from_errno(ENOTSUP);
 }
 
 int getpid()

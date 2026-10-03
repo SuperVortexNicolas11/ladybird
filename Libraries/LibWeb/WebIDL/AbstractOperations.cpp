@@ -18,13 +18,15 @@
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/ValueInlines.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/HTML/CrossOrigin/AbstractOperations.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/Buffers.h>
 #include <LibWeb/WebIDL/CallbackType.h>
+#include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/Promise.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::WebIDL {
 
@@ -102,6 +104,11 @@ ErrorOr<ByteBuffer> get_buffer_source_copy(JS::Object const& buffer_source)
     if (es_array_buffer->is_detached())
         return ByteBuffer {};
 
+    // OPTIMIZATION: Copy non-shared data blocks in bulk.
+    // Shared data blocks use the element-wise path to preserve memory ordering.
+    if (!es_array_buffer->is_shared_array_buffer())
+        return es_array_buffer->copy_to_byte_buffer(offset, length);
+
     // 8. Let bytes be a new byte sequence of length equal to length.
     auto bytes = TRY(ByteBuffer::create_zeroed(length));
 
@@ -177,6 +184,13 @@ JS::Completion call_user_object_operation(CallbackType& callback, Utf16FlyString
 
     // 6. Let stored settings be value’s callback context.
     auto& stored_settings = callback.callback_context;
+
+    // AD-HOC: Reject a cross-origin callback object before entering its realm; otherwise the operation lookup below
+    //         throws in that protected realm, exposing it to the caller. See https://github.com/whatwg/webidl/issues/1640.
+    if (HTML::is_cross_origin_platform_object(object)) {
+        auto& caller_realm = *object->vm().current_realm();
+        return throw_completion(caller_realm, WebIDL::SecurityError::create(caller_realm, "Cannot invoke a callback on a cross-origin object"_utf16));
+    }
 
     // 7. Prepare to run script with relevant settings.
     HTML::prepare_to_run_script(relevant_settings);
@@ -346,8 +360,9 @@ JS::Completion invoke_callback(CallbackType& callback, Optional<JS::Value> this_
             // FIXME: 1. Assert: callable’s return type is undefined or any.
 
             // 2. Report an exception completion.[[Value]] for relevant realm’s global object.
-            auto& window_or_worker = as<HTML::WindowOrWorkerGlobalScopeMixin>(relevant_realm.global_object());
-            window_or_worker.report_an_exception(completion.release_value());
+            auto* window_or_worker = HTML::window_or_worker_global_scope_from_global_object(relevant_realm.global_object());
+            VERIFY(window_or_worker);
+            window_or_worker->report_an_exception(completion.release_value());
 
             // 3. Return the unique undefined IDL value.
             return JS::js_undefined();
@@ -562,26 +577,5 @@ template WEB_API JS::ThrowCompletionOr<Long> convert_to_int(JS::VM& vm, JS::Valu
 template WEB_API JS::ThrowCompletionOr<UnsignedLong> convert_to_int(JS::VM& vm, JS::Value, EnforceRange, Clamp);
 template WEB_API JS::ThrowCompletionOr<LongLong> convert_to_int(JS::VM& vm, JS::Value, EnforceRange, Clamp);
 template WEB_API JS::ThrowCompletionOr<UnsignedLongLong> convert_to_int(JS::VM& vm, JS::Value, EnforceRange, Clamp);
-
-// AD-HOC: For same-object caching purposes, this can be used to compare a cached JS array of DOM::Elements with another
-//         list. Either list can be null, in which case they are considered the same only if they are both null.
-bool lists_contain_same_elements(GC::Ptr<JS::Array> array, Optional<GC::RootVector<GC::Ref<DOM::Element>>> const& elements)
-{
-    if (!array || !elements.has_value())
-        return !array && !elements.has_value();
-
-    bool is_equivalent = array->indexed_array_like_size() == elements->size();
-
-    for (size_t i = 0; is_equivalent && i < elements->size(); ++i) {
-        auto cached_value = array->get_without_side_effects(JS::PropertyKey { i });
-        auto const& cached_element = as<DOM::Element>(cached_value.as_object());
-
-        auto it = elements->find_if([&](auto const& element) { return element.ptr() == &cached_element; });
-        if (it == elements->end())
-            is_equivalent = false;
-    }
-
-    return is_equivalent;
-}
 
 }

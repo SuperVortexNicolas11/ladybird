@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/Error.h>
 #include <AK/Function.h>
 #include <AK/Optional.h>
@@ -14,18 +15,16 @@
 #include <AK/String.h>
 #include <AK/StringView.h>
 #include <AK/Vector.h>
+#include <AK/Weakable.h>
 #include <LibCore/Forward.h>
 #include <LibRequests/Forward.h>
+#include <LibURL/URL.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/OmniboxEngagement.h>
-#include <LibWebView/PrivateBrowsing.h>
+#include <LibWebView/Settings.h>
 
 namespace WebView {
-
-struct AutocompleteEngine {
-    StringView name;
-    StringView query_url;
-};
 
 enum class AutocompleteResultKind {
     Intermediate,
@@ -62,7 +61,7 @@ struct WEBVIEW_API AutocompleteSuggestion {
     String text;
     Optional<String> title;
     Optional<String> subtitle;
-    Optional<String> favicon_base64_png;
+    Optional<ByteBuffer> favicon_png;
     String highlight_input;
     AutocompleteMatchClass match_class { AutocompleteMatchClass::None };
     i32 relevance { 0 };
@@ -84,11 +83,9 @@ struct WEBVIEW_API AutocompleteBookmark {
     String url;
     Optional<String> title;
     Optional<String> folder;
-    Optional<String> favicon_base64_png;
+    Optional<ByteBuffer> favicon_png;
 };
 
-WEBVIEW_API ReadonlySpan<AutocompleteEngine> autocomplete_engines();
-WEBVIEW_API Optional<AutocompleteEngine const&> find_autocomplete_engine_by_name(StringView name);
 WEBVIEW_API String autocomplete_suggestion_display_text(AutocompleteSuggestion const&);
 WEBVIEW_API Vector<AutocompleteMatchRange> autocomplete_match_ranges(StringView input, StringView text);
 WEBVIEW_API Vector<String> filter_remote_autocomplete_suggestions(StringView input, Vector<String> suggestions);
@@ -96,10 +93,11 @@ WEBVIEW_API Vector<AutocompleteSuggestion> web_ui_autocomplete_suggestions(Strin
 WEBVIEW_API bool autocomplete_urls_match(StringView left, StringView right);
 WEBVIEW_API bool autocomplete_url_can_complete(StringView query, StringView suggestion);
 
-class WEBVIEW_API Autocomplete {
+class WEBVIEW_API Autocomplete : public Weakable<Autocomplete>
+    , public SettingsObserver {
 public:
     explicit Autocomplete(IsPrivate);
-    ~Autocomplete();
+    virtual ~Autocomplete() override;
 
     Function<void(AutocompleteQueryID, Vector<AutocompleteSuggestion>, AutocompleteResultKind)> on_autocomplete_query_complete;
 
@@ -108,9 +106,12 @@ public:
     void record_engagement(OmniboxEngagement);
 
 private:
-    static ErrorOr<Vector<String>> received_autocomplete_respsonse(AutocompleteEngine const&, Optional<ByteString const&> content_type, StringView response);
-    void start_remote_query(AutocompleteQueryID, AutocompleteEngine, String query);
+    virtual void search_engine_settings_changed() override;
+
+    static ErrorOr<Vector<String>> received_autocomplete_response(SearchSuggestions const&, Optional<ByteString const&> content_type, StringView response);
+    void start_remote_query(AutocompleteQueryID, SearchEngine, String query);
     void local_query_complete(AutocompleteQueryID, Vector<AutocompleteSuggestion>);
+    void external_url_handler_query_complete(AutocompleteQueryID, RefPtr<ExternalURLHandler>);
     void deliver_current_result();
     void invoke_autocomplete_query_complete(AutocompleteQueryID, Vector<AutocompleteSuggestion> suggestions, AutocompleteResultKind) const;
 
@@ -122,6 +123,9 @@ private:
     size_t m_max_suggestions { default_autocomplete_suggestion_limit };
     bool m_local_query_complete { false };
     bool m_remote_query_complete { false };
+    bool m_external_url_handler_query_complete { true };
+    bool m_external_url_has_handler { false };
+    Optional<URL::URL> m_external_url;
     Vector<AutocompleteSuggestion> m_local_suggestions;
     Vector<String> m_remote_suggestions;
     RefPtr<Core::Timer> m_remote_query_timer;

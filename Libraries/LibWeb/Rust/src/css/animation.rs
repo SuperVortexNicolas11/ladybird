@@ -11,11 +11,13 @@
 
 use std::sync::Arc;
 
+use crate::css::easing::{FfiEasingDescriptor, FfiEasingKind, FfiLinearEasingPoint, evaluate_easing_descriptor};
 use crate::css::property_metadata::{property_animation_type, property_numeric_ranges};
 use crate::css::style_value::{
-    ColorBase, GridTrackEntryKind, RetainedGridTrackEntry, RetainedGridTrackEntryList, RetainedNumericRangeList,
-    RetainedShapePoint, RetainedShapePointList, RetainedStyleValueData, RetainedStyleValueDataList,
-    RetainedUtf16FlyString, RetainedUtf16FlyStringList, StyleValueData,
+    BasicShapeData, ColorBase, CssString, CssStringList, FILTER_KIND_BLUR, FILTER_KIND_COLOR, FILTER_KIND_DROP_SHADOW,
+    FILTER_KIND_HUE_ROTATE, GridTrackEntryKind, OwnedBasicShapeData, RetainedGridTrackEntry,
+    RetainedGridTrackEntryList, RetainedNumericRangeList, RetainedShapePoint, RetainedShapePointList,
+    RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData,
 };
 
 pub(crate) const ANIMATION_TYPE_DISCRETE: u8 = 0;
@@ -57,10 +59,6 @@ const TRANSFORM_FUNCTION_SKEW_Y: u8 = 20;
 const OPEN_TYPE_MODE_FONT_VARIATION_SETTINGS: u8 = 1;
 const FONT_STYLE_NORMAL: u8 = 0;
 const FONT_STYLE_OBLIQUE: u8 = 4;
-const STEP_POSITION_JUMP_START: u8 = 0;
-const STEP_POSITION_JUMP_NONE: u8 = 2;
-const STEP_POSITION_JUMP_BOTH: u8 = 3;
-const STEP_POSITION_START: u8 = 4;
 const GRID_REPEAT_FIXED: u8 = 2;
 const BASIC_SHAPE_INSET: u8 = 0;
 const BASIC_SHAPE_CIRCLE: u8 = 3;
@@ -123,231 +121,58 @@ pub struct FfiAnimationValueResult {
     pub handled: bool,
 }
 
-#[derive(Clone, Copy)]
-#[repr(u8)]
-pub enum FfiEasingKind {
-    Linear,
-    CubicBezier,
-    Steps,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiLinearEasingPoint {
-    pub input: f64,
-    pub output: f64,
-}
-
-#[repr(C)]
-pub struct FfiEasingDescriptor {
-    pub kind: FfiEasingKind,
-    pub linear_points: *const FfiLinearEasingPoint,
-    pub linear_point_count: usize,
-    pub x1: f64,
-    pub y1: f64,
-    pub x2: f64,
-    pub y2: f64,
-    pub interval_count: i32,
-    pub step_position: u8,
-}
-
-fn evaluate_linear_easing(points: &[FfiLinearEasingPoint], input_progress: f64, before_flag: bool) -> f64 {
-    // https://drafts.csswg.org/css-easing/#linear-easing-function-output
-    // To calculate linear easing output progress for a given linear easing function func,
-    // an input progress value inputProgress, and an optional before flag (defaulting to false),
-    // perform the following:
-
-    // 1. Let points be func’s control points.
-
-    // 2. If points holds only a single item, return the output progress value of that item.
-    if points.len() == 1 {
-        return points[0].output;
-    }
-
-    // 3. If inputProgress matches the input progress value of the first point in points,
-    // and the before flag is true, return the first point’s output progress value.
-    if input_progress == points[0].input && before_flag {
-        return points[0].output;
-    }
-
-    // 4. If inputProgress matches the input progress value of at least one point in points,
-    // return the output progress value of the last such point.
-    if let Some(point) = points.iter().rfind(|point| input_progress == point.input) {
-        return point.output;
-    }
-
-    // 5. Otherwise, find two control points in points, A and B, which will be used for interpolation:
-    let (a, b) = if input_progress < points[0].input {
-        // 1. If inputProgress is smaller than any input progress value in points,
-        // let A and B be the first two items in points.
-        // If A and B have the same input progress value, return A’s output progress value.
-        let (a, b) = (&points[0], &points[1]);
-        if a.input == b.input {
-            return a.output;
+/// Construct a CSS value from resolved animation easing parameters.
+///
+/// # Safety
+/// The descriptor and its control-point slice must remain valid during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_value_from_easing(descriptor: &FfiEasingDescriptor) -> *const StyleValueData {
+    use crate::css::style_value::{RetainedLinearEasingStop, RetainedLinearEasingStopList};
+    let retain = |value| unsafe { RetainedStyleValueData::from_retained_pointer(Arc::into_raw(Arc::new(value))) };
+    let mut stops = Vec::new();
+    let mut x1 = empty_retained_style_value();
+    let mut y1 = empty_retained_style_value();
+    let mut x2 = empty_retained_style_value();
+    let mut y2 = empty_retained_style_value();
+    let mut number_of_intervals = empty_retained_style_value();
+    match descriptor.kind {
+        FfiEasingKind::Linear => {
+            assert!(descriptor.linear_point_count > 0);
+            let points = unsafe { std::slice::from_raw_parts(descriptor.linear_points, descriptor.linear_point_count) };
+            stops = points
+                .iter()
+                .map(|point| {
+                    RetainedLinearEasingStop::from_retained_values(
+                        retain(StyleValueData::Number { value: point.output }),
+                        retain(StyleValueData::Percentage {
+                            value: point.input * 100.0,
+                        }),
+                    )
+                })
+                .collect();
         }
-        (a, b)
-    } else if input_progress > points[points.len() - 1].input {
-        // 2. If inputProgress is larger than any input progress value in points,
-        // let A and B be the last two items in points.
-        // If A and B have the same input progress value, return B’s output progress value.
-        let (a, b) = (&points[points.len() - 2], &points[points.len() - 1]);
-        if a.input == b.input {
-            return b.output;
+        FfiEasingKind::CubicBezier => {
+            x1 = retain(StyleValueData::Number { value: descriptor.x1 });
+            y1 = retain(StyleValueData::Number { value: descriptor.y1 });
+            x2 = retain(StyleValueData::Number { value: descriptor.x2 });
+            y2 = retain(StyleValueData::Number { value: descriptor.y2 });
         }
-        (a, b)
-    } else {
-        // 3. Otherwise, let A be the last control point whose input progress value is smaller than inputProgress,
-        // and let B be the first control point whose input progress value is larger than inputProgress.
-        let a = points
-            .iter()
-            .rfind(|point| point.input < input_progress)
-            .expect("canonical linear easing has a preceding point");
-        let b = points
-            .iter()
-            .find(|point| point.input > input_progress)
-            .expect("canonical linear easing has a following point");
-        (a, b)
-    };
-
-    // 6. Linearly interpolate (or extrapolate) inputProgress along the line defined by A and B, and return the result.
-    let factor = (input_progress - a.input) / (b.input - a.input);
-    a.output + factor * (b.output - a.output)
-}
-
-fn cubic_bezier_at(first: f64, second: f64, parameter: f64) -> f64 {
-    let a = 1.0 - 3.0 * second + 3.0 * first;
-    let b = 3.0 * second - 6.0 * first;
-    let c = 3.0 * first;
-    (a * parameter * parameter * parameter) + (b * parameter * parameter) + (c * parameter)
-}
-
-fn evaluate_cubic_bezier_easing(x1: f64, y1: f64, x2: f64, y2: f64, input_progress: f64) -> f64 {
-    // https://drafts.csswg.org/css-easing-1/#cubic-bezier-algo
-    // For input progress values outside the range [0, 1], the curve is extended infinitely using tangent of the curve
-    // at the closest endpoint as follows:
-
-    // - For input progress values less than zero,
-    if input_progress < 0.0 {
-        // 1. If the x value of P1 is greater than zero, use a straight line that passes through P1 and P0 as the
-        //    tangent.
-        if x1 > 0.0 {
-            return y1 / x1 * input_progress;
+        FfiEasingKind::Steps => {
+            number_of_intervals = retain(StyleValueData::Integer {
+                value: descriptor.interval_count,
+            });
         }
-
-        // 2. Otherwise, if the x value of P2 is greater than zero, use a straight line that passes through P2 and P0 as
-        //    the tangent.
-        if x2 > 0.0 {
-            return y2 / x2 * input_progress;
-        }
-
-        // 3. Otherwise, let the output progress value be zero for all input progress values in the range [-∞, 0).
-        return 0.0;
     }
-
-    // - For input progress values greater than one,
-    if input_progress > 1.0 {
-        // 1. If the x value of P2 is less than one, use a straight line that passes through P2 and P3 as the tangent.
-        if x2 < 1.0 {
-            return (1.0 - y2) / (1.0 - x2) * (input_progress - 1.0) + 1.0;
-        }
-
-        // 2. Otherwise, if the x value of P1 is less than one, use a straight line that passes through P1 and P3 as the
-        //    tangent.
-        if x1 < 1.0 {
-            return (1.0 - y1) / (1.0 - x1) * (input_progress - 1.0) + 1.0;
-        }
-
-        // 3. Otherwise, let the output progress value be one for all input progress values in the range (1, ∞].
-        return 1.0;
-    }
-
-    // The evaluation of this curve is covered in many sources such as [FUND-COMP-GRAPHICS].
-    // NB: Use Newton-Raphson iteration to solve x(t) = inputProgress, then fall back to bisection.
-    let derivative = |parameter: f64| {
-        let a = 1.0 - 3.0 * x2 + 3.0 * x1;
-        let b = 3.0 * x2 - 6.0 * x1;
-        let c = 3.0 * x1;
-        3.0 * a * parameter * parameter + 2.0 * b * parameter + c
-    };
-    let epsilon = 1e-7;
-    let mut parameter = input_progress;
-    for _ in 0..8 {
-        let difference = cubic_bezier_at(x1, x2, parameter) - input_progress;
-        if difference.abs() < epsilon {
-            return cubic_bezier_at(y1, y2, parameter);
-        }
-        let derivative = derivative(parameter);
-        if derivative.abs() < 1e-12 {
-            break;
-        }
-        parameter -= difference / derivative;
-    }
-
-    let mut low = 0.0;
-    let mut high = 1.0;
-    parameter = input_progress;
-    for _ in 0..64 {
-        let value = cubic_bezier_at(x1, x2, parameter);
-        if (value - input_progress).abs() < epsilon {
-            return cubic_bezier_at(y1, y2, parameter);
-        }
-        if input_progress > value {
-            low = parameter;
-        } else {
-            high = parameter;
-        }
-        parameter = (low + high) / 2.0;
-    }
-    cubic_bezier_at(y1, y2, parameter)
-}
-
-fn evaluate_steps_easing(interval_count: i32, position: u8, input_progress: f64, before_flag: bool) -> f64 {
-    // https://drafts.csswg.org/css-easing-1/#step-easing-algo
-    let mut current_step = (input_progress * f64::from(interval_count)).floor();
-
-    // 2. If the step position property is one of:
-    //    - jump-start,
-    //    - jump-both,
-    //    increment current step by one.
-    if matches!(
-        position,
-        STEP_POSITION_JUMP_START | STEP_POSITION_START | STEP_POSITION_JUMP_BOTH
-    ) {
-        current_step += 1.0;
-    }
-
-    // 3. If both of the following conditions are true:
-    //    - the before flag is set, and
-    //    - input progress value × steps mod 1 equals zero (that is, if input progress value × steps is integral), then
-    //    decrement current step by one.
-    let step_progress = input_progress * f64::from(interval_count);
-    if before_flag && step_progress.trunc() == step_progress {
-        current_step -= 1.0;
-    }
-
-    // 4. If input progress value ≥ 0 and current step < 0, let current step be zero.
-    if input_progress >= 0.0 && current_step < 0.0 {
-        current_step = 0.0;
-    }
-
-    // 5. Calculate jumps based on the step position as follows:
-
-    //    jump-start or jump-end -> steps
-    //    jump-none -> steps - 1
-    //    jump-both -> steps + 1
-    let jumps = match position {
-        STEP_POSITION_JUMP_NONE => interval_count - 1,
-        STEP_POSITION_JUMP_BOTH => interval_count + 1,
-        _ => interval_count,
-    };
-
-    // 6. If input progress value ≤ 1 and current step > jumps, let current step be jumps.
-    if input_progress <= 1.0 && current_step > f64::from(jumps) {
-        current_step = f64::from(jumps);
-    }
-
-    // 7. The output progress value is current step / jumps.
-    current_step / f64::from(jumps)
+    Arc::into_raw(Arc::new(StyleValueData::Easing {
+        kind: descriptor.kind as u8,
+        linear_stops: RetainedLinearEasingStopList::from_retained_elements(stops),
+        x1,
+        y1,
+        x2,
+        y2,
+        number_of_intervals,
+        step_position: descriptor.step_position,
+    }))
 }
 
 /// Evaluate a resolved easing descriptor without consulting C++.
@@ -361,32 +186,10 @@ pub unsafe extern "C" fn rust_evaluate_easing(
     input_progress: f64,
     before_flag: bool,
 ) -> f64 {
-    crate::abort_on_panic(|| evaluate_easing_descriptor(unsafe { &*descriptor }, input_progress, before_flag))
+    evaluate_easing_descriptor(unsafe { &*descriptor }, input_progress, before_flag)
 }
 
-fn evaluate_easing_descriptor(descriptor: &FfiEasingDescriptor, input_progress: f64, before_flag: bool) -> f64 {
-    match descriptor.kind {
-        FfiEasingKind::Linear => {
-            let points = unsafe { std::slice::from_raw_parts(descriptor.linear_points, descriptor.linear_point_count) };
-            assert!(!points.is_empty());
-            evaluate_linear_easing(points, input_progress, before_flag)
-        }
-        FfiEasingKind::CubicBezier => evaluate_cubic_bezier_easing(
-            descriptor.x1,
-            descriptor.y1,
-            descriptor.x2,
-            descriptor.y2,
-            input_progress,
-        ),
-        FfiEasingKind::Steps => evaluate_steps_easing(
-            descriptor.interval_count,
-            descriptor.step_position,
-            input_progress,
-            before_flag,
-        ),
-    }
-}
-
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct FfiAnimationFontMetrics {
     pub font_size: f64,
@@ -396,6 +199,7 @@ pub struct FfiAnimationFontMetrics {
     pub line_height: f64,
 }
 
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct FfiAnimationLengthResolutionContext {
     pub viewport_width: f64,
@@ -406,6 +210,7 @@ pub struct FfiAnimationLengthResolutionContext {
     pub root_font_metrics_depend_on_viewport_metrics: bool,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiAnimationContext {
     pub allow_discrete: bool,
@@ -428,6 +233,8 @@ pub struct FfiAnimationKeyframeValue {
 #[repr(C)]
 pub struct FfiAnimationValueInput {
     pub property_id: u16,
+    pub custom_name_id: u32,
+    pub result_of_transition: bool,
     pub underlying: *const StyleValueData,
     pub initial: *const StyleValueData,
     pub current_key: f64,
@@ -435,28 +242,72 @@ pub struct FfiAnimationValueInput {
     pub keyframe_count: usize,
 }
 
+/// The version of an effect a preparation was made from.
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-pub struct FfiAnimationBatch {
-    pub declarations: *const FfiAnimationDeclaration,
-    pub declaration_count: usize,
-    pub writing_mode: u8,
-    pub direction: u8,
-    pub important_property_bitmap: *const u8,
-    pub important_property_bitmap_length: usize,
+pub struct FfiAnimationPreparationEffect {
+    pub identity: u64,
+    pub generation: u64,
+}
+
+/// One effect a sample composes, in composite order: the version a preparation is keyed by, and
+/// where the effect is.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiSampledAnimationEffect {
+    pub effect: FfiAnimationPreparationEffect,
+    pub current_key: f64,
 }
 
 #[repr(C)]
 pub struct FfiComputedAnimationBatch {
     pub context: FfiAnimationContext,
-    pub values: *const FfiAnimationValueInput,
-    pub value_count: usize,
-    pub results: *mut FfiAnimatedProperty,
-    pub result_capacity: usize,
+    pub sampled_effects: *const FfiSampledAnimationEffect,
+    pub sampled_effect_count: usize,
+    /// The identities of the custom-property environments of the element and of the one it
+    /// inherits from, which a preparation that substituted keyframe values against the element was
+    /// made under.
+    pub custom_property_environments: [u64; 2],
+    pub cache_preparation: bool,
+    /// Whether the preparation substituted keyframe values against the element, so that it holds
+    /// only under the custom-property environments its key names.
+    pub preparation_reads_custom_property_environments: bool,
+    pub resolved_animation_storage: *mut std::ffi::c_void,
+    pub computed_keyframe_storage: *mut std::ffi::c_void,
+    pub underlying_longhand_table: *const std::ffi::c_void,
+    pub overlay: *mut std::ffi::c_void,
+    pub custom_underlying_values: *const *const StyleValueData,
+    pub custom_initial_values: *const *const StyleValueData,
+    pub custom_value_count: usize,
+    pub custom_results: *mut FfiAnimatedCustomProperty,
+    pub custom_result_count: *mut usize,
+}
+
+#[repr(C)]
+pub struct FfiAnimatedCustomProperty {
+    pub custom_name_id: u32,
+    pub value: *const StyleValueData,
+}
+
+#[repr(C)]
+pub struct FfiAnimationEffect {
+    pub first_keyframe_index: usize,
+    pub keyframe_count: usize,
+    pub current_key: f64,
+    pub result_of_transition: bool,
+}
+
+#[repr(C)]
+pub struct FfiAnimationKeyframe {
+    pub key: i64,
+    pub easing: FfiEasingDescriptor,
+    pub composite: FfiCompositeOperation,
 }
 
 #[repr(C)]
 pub struct FfiAnimatedProperty {
     pub property_id: u16,
+    pub custom_name_id: u32,
     pub value: *const StyleValueData,
     pub progress: f32,
     pub start_index: usize,
@@ -466,20 +317,35 @@ pub struct FfiAnimatedProperty {
 }
 
 #[repr(C)]
-pub struct FfiAnimationCallbacks {
-    pub context: *mut std::ffi::c_void,
-    pub compute_values: unsafe extern "C" fn(
-        context: *mut std::ffi::c_void,
-        properties: *const FfiResolvedAnimationProperty,
-        property_count: usize,
-    ) -> FfiComputedAnimationBatch,
+#[derive(Clone, Copy)]
+pub struct FfiAnimationStyleSheetResourceContext {
+    pub base_url: *const u8,
+    pub base_url_length: usize,
+    pub has_value: bool,
+    pub origin_clean: bool,
+}
+
+impl FfiAnimationStyleSheetResourceContext {
+    #[cfg(test)]
+    const fn empty() -> Self {
+        Self {
+            base_url: std::ptr::null(),
+            base_url_length: 0,
+            has_value: false,
+            origin_clean: false,
+        }
+    }
 }
 
 #[repr(C)]
 pub struct FfiAnimationDeclaration {
     pub keyframe_index: usize,
     pub property_id: u16,
+    pub custom_name_id: u32,
+    pub custom_is_inherited: bool,
+    pub custom_is_important: bool,
     pub value: *const StyleValueData,
+    pub style_sheet_resource_context: FfiAnimationStyleSheetResourceContext,
     pub use_initial: bool,
     pub is_transition: bool,
 }
@@ -487,10 +353,14 @@ pub struct FfiAnimationDeclaration {
 struct AnimationPropertyConflictCandidate {
     keyframe_index: usize,
     physical_property_id: u16,
+    custom_name_id: u32,
+    custom_is_inherited: bool,
     source_property_id: u16,
     source_longhand_id: u16,
     value: RetainedStyleValueData,
+    style_sheet_resource_context: FfiAnimationStyleSheetResourceContext,
     use_initial: bool,
+    is_transition: bool,
     suppressed_by_important: bool,
 }
 
@@ -517,7 +387,7 @@ pub enum FfiAnimationSpecifiedValueSource {
     Underlying,
 }
 
-fn animation_specified_value_source(value: &StyleValueData, property_id: u16) -> FfiAnimationSpecifiedValueSource {
+fn animation_specified_value_source(value: &StyleValueData, is_inherited: bool) -> FfiAnimationSpecifiedValueSource {
     let StyleValueData::Keyword { keyword } = value else {
         return FfiAnimationSpecifiedValueSource::Value;
     };
@@ -533,7 +403,7 @@ fn animation_specified_value_source(value: &StyleValueData, property_id: u16) ->
     // If the cascaded value of a property is the unset keyword, then if it is an inherited
     // property, this is treated as inherit, and if it is not, this is treated as initial.
     if *keyword == crate::css::style_compute::keyword::UNSET {
-        return if crate::css::property_metadata::property_is_inherited(property_id) {
+        return if is_inherited {
             FfiAnimationSpecifiedValueSource::Inherited
         } else {
             FfiAnimationSpecifiedValueSource::Initial
@@ -564,11 +434,20 @@ fn resolve_animation_property_conflicts(
     assert_eq!(candidates.len(), value_sources.len());
     selected.fill(false);
     for (candidate, source) in candidates.iter().zip(value_sources.iter_mut()) {
-        *source = animation_specified_value_source(candidate.value.data(), candidate.physical_property_id);
+        let is_inherited = if candidate.custom_name_id != 0 {
+            candidate.custom_is_inherited
+        } else {
+            crate::css::property_metadata::property_is_inherited(candidate.physical_property_id)
+        };
+        *source = animation_specified_value_source(candidate.value.data(), is_inherited);
     }
-    let mut winners = std::collections::HashMap::<(usize, u16), usize>::new();
+    let mut winners = std::collections::HashMap::<(usize, u16, u32), usize>::new();
     for (candidate_index, candidate) in candidates.iter().enumerate() {
-        let key = (candidate.keyframe_index, candidate.physical_property_id);
+        let key = (
+            candidate.keyframe_index,
+            candidate.physical_property_id,
+            candidate.custom_name_id,
+        );
         let Some(&winner_index) = winners.get(&key) else {
             winners.insert(key, candidate_index);
             selected[candidate_index] = true;
@@ -596,13 +475,54 @@ fn resolve_animation_property_conflicts(
 pub struct FfiResolvedAnimationProperty {
     pub keyframe_index: usize,
     pub physical_property_id: u16,
+    pub custom_name_id: u32,
     pub source_longhand_id: u16,
     pub value: *const StyleValueData,
     pub value_source: FfiAnimationSpecifiedValueSource,
+    pub style_sheet_resource_context: FfiAnimationStyleSheetResourceContext,
+    pub is_transition: bool,
+}
+
+/// The `SUBSTITUTION_MARK_*` bits of the arbitrary-substitution functions a written value holds.
+fn substitution_marks_of(written: &StyleValueData) -> u8 {
+    use crate::css::style_compute::{
+        SUBSTITUTION_MARK_ATTR, SUBSTITUTION_MARK_CUSTOM_FUNCTION, SUBSTITUTION_MARK_IF, SUBSTITUTION_MARK_INHERIT,
+        SUBSTITUTION_MARK_VAR,
+    };
+    let StyleValueData::Unresolved {
+        presence_var,
+        presence_attr,
+        presence_if,
+        presence_inherit,
+        presence_dashed_function,
+        ..
+    } = written
+    else {
+        return 0;
+    };
+    [
+        (*presence_var, SUBSTITUTION_MARK_VAR),
+        (*presence_attr, SUBSTITUTION_MARK_ATTR),
+        (*presence_if, SUBSTITUTION_MARK_IF),
+        (*presence_inherit, SUBSTITUTION_MARK_INHERIT),
+        (*presence_dashed_function, SUBSTITUTION_MARK_CUSTOM_FUNCTION),
+    ]
+    .into_iter()
+    .filter(|&(present, _)| present)
+    .fold(0, |marks, (_, mark)| marks | mark)
+}
+
+#[repr(C)]
+pub struct FfiAnimationUnfixedRandomSharing {
+    pub source: *const StyleValueData,
+    pub name: *const std::ffi::c_void,
+    pub element_shared: bool,
 }
 
 fn resolve_animation_declarations(
     declarations: &[FfiAnimationDeclaration],
+    effects: &[FfiAnimationEffect],
+    keyframes: &[FfiAnimationKeyframe],
     writing_mode: u8,
     direction: u8,
     important_property_bitmap: &[u8],
@@ -613,6 +533,26 @@ fn resolve_animation_declarations(
             !declaration.value.is_null(),
             "animation declaration value must not be null"
         );
+        if declaration.custom_name_id != 0 {
+            candidates.push(AnimationPropertyConflictCandidate {
+                keyframe_index: declaration.keyframe_index,
+                physical_property_id: declaration.property_id,
+                custom_name_id: declaration.custom_name_id,
+                custom_is_inherited: declaration.custom_is_inherited,
+                source_property_id: declaration.property_id,
+                source_longhand_id: declaration.property_id,
+                value: unsafe {
+                    RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
+                        declaration.value.cast(),
+                    ))
+                },
+                style_sheet_resource_context: declaration.style_sheet_resource_context,
+                use_initial: declaration.use_initial,
+                is_transition: declaration.is_transition,
+                suppressed_by_important: !declaration.is_transition && declaration.custom_is_important,
+            });
+            continue;
+        }
         crate::css::style_compute::expand_shorthands_with(
             declaration.property_id,
             declaration.value.cast(),
@@ -623,14 +563,18 @@ fn resolve_animation_declarations(
                 candidates.push(AnimationPropertyConflictCandidate {
                     keyframe_index: declaration.keyframe_index,
                     physical_property_id,
+                    custom_name_id: 0,
+                    custom_is_inherited: false,
                     source_property_id: declaration.property_id,
                     source_longhand_id: longhand_id,
                     value: unsafe {
-                        RetainedStyleValueData::from_retained_pointer(crate::css::style_value::rust_style_value_retain(
+                        RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
                             data.cast(),
                         ))
                     },
+                    style_sheet_resource_context: declaration.style_sheet_resource_context,
                     use_initial: declaration.use_initial,
+                    is_transition: declaration.is_transition,
                     // OPTIMIZATION: Values resulting from animations other than CSS transitions
                     // are overridden by important properties, so there is no need to compute or
                     // evaluate them.
@@ -654,22 +598,178 @@ fn resolve_animation_declarations(
             properties.push(FfiResolvedAnimationProperty {
                 keyframe_index: candidate.keyframe_index,
                 physical_property_id: candidate.physical_property_id,
+                custom_name_id: candidate.custom_name_id,
                 source_longhand_id: candidate.source_longhand_id,
                 value: candidate.value.pointer(),
                 value_source,
+                style_sheet_resource_context: candidate.style_sheet_resource_context,
+                is_transition: candidate.is_transition,
             });
             retained_values.push(candidate.value);
         }
     }
+    let mut value_plans = Vec::new();
+    for (effect_index, effect) in effects.iter().enumerate() {
+        let keyframe_end = effect
+            .first_keyframe_index
+            .checked_add(effect.keyframe_count)
+            .expect("animation keyframe range must not overflow");
+        assert!(keyframe_end <= keyframes.len());
+        let mut properties_by_id = std::collections::BTreeMap::<(u16, u32), Vec<usize>>::new();
+        for (index, property) in properties.iter().enumerate() {
+            if (effect.first_keyframe_index..keyframe_end).contains(&property.keyframe_index) {
+                properties_by_id
+                    .entry((property.physical_property_id, property.custom_name_id))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        for ((property_id, custom_name_id), mut property_indices) in properties_by_id {
+            if property_indices.len() < 2
+                || (custom_name_id == 0
+                    && !(crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID
+                        ..=crate::css::property_metadata::LAST_LONGHAND_PROPERTY_ID)
+                        .contains(&property_id))
+            {
+                continue;
+            }
+            property_indices.sort_by_key(|index| properties[*index].keyframe_index);
+            value_plans.push(AnimationValuePlan {
+                property_id,
+                custom_name_id,
+                result_of_transition: effect.result_of_transition,
+                effect_index,
+                property_indices,
+            });
+        }
+    }
+
+    let mut uses_tree_counting_function = false;
+    let mut container_relative_length_unit_mask = 0;
+    let mut needs_document_base_url = false;
+    let mut random_sharing_sources = Vec::new();
+    for property in &properties {
+        if property.value_source != FfiAnimationSpecifiedValueSource::Value {
+            continue;
+        }
+        if property.custom_name_id != 0 {
+            continue;
+        }
+        let value = unsafe { &*property.value };
+        if matches!(
+            value,
+            StyleValueData::Unresolved { .. } | StyleValueData::PendingSubstitution { .. }
+        ) {
+            continue;
+        }
+        let dependencies = crate::css::style_compute::external_value_dependencies(value);
+        uses_tree_counting_function |= dependencies.uses_tree_counting_function;
+        container_relative_length_unit_mask |= dependencies.container_relative_length_unit_mask;
+        needs_document_base_url |= dependencies.needs_document_base_url;
+        if dependencies.has_unfixed_random_sharing {
+            crate::css::style_compute::collect_unfixed_random_sharings_in_value(value, &mut random_sharing_sources);
+        }
+    }
+    let unfixed_random_sharings = random_sharing_sources
+        .into_iter()
+        .map(|source| {
+            let sharing = unsafe { &*source };
+            let StyleValueData::RandomValueSharing { has_name, name, .. } = sharing else {
+                unreachable!();
+            };
+            FfiAnimationUnfixedRandomSharing {
+                source,
+                name: if *has_name { name.as_ptr() } else { std::ptr::null() },
+                element_shared: crate::css::style_compute::random_caching_key(sharing).1,
+            }
+        })
+        .collect();
     ResolvedAnimationDeclarations {
         properties,
         _retained_values: retained_values,
+        keyframes: keyframes.iter().map(AnimationKeyframePlan::from_ffi).collect(),
+        value_plans,
+        uses_tree_counting_function,
+        container_relative_length_unit_mask,
+        needs_document_base_url,
+        unfixed_random_sharings,
+        ..ResolvedAnimationDeclarations::default()
     }
 }
 
-struct ResolvedAnimationDeclarations {
-    properties: Vec<FfiResolvedAnimationProperty>,
+/// The declarations of the effects an element samples, resolved into what the animation core
+/// interpolates.
+#[derive(Default)]
+pub(crate) struct ResolvedAnimationDeclarations {
+    pub(crate) properties: Vec<FfiResolvedAnimationProperty>,
     _retained_values: Vec<RetainedStyleValueData>,
+    /// The base URLs the properties' resource contexts point into.
+    _base_urls: Vec<std::sync::Arc<[u8]>>,
+    keyframes: Vec<AnimationKeyframePlan>,
+    value_plans: Vec<AnimationValuePlan>,
+    pub(crate) uses_tree_counting_function: bool,
+    pub(crate) container_relative_length_unit_mask: u8,
+    pub(crate) needs_document_base_url: bool,
+    pub(crate) unfixed_random_sharings: Vec<FfiAnimationUnfixedRandomSharing>,
+}
+
+struct AnimationValuePlan {
+    property_id: u16,
+    custom_name_id: u32,
+    result_of_transition: bool,
+    effect_index: usize,
+    property_indices: Vec<usize>,
+}
+
+struct AnimationKeyframePlan {
+    key: i64,
+    easing_kind: FfiEasingKind,
+    linear_points: Vec<FfiLinearEasingPoint>,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    interval_count: i32,
+    step_position: u8,
+    composite: FfiCompositeOperation,
+}
+
+impl AnimationKeyframePlan {
+    fn from_ffi(keyframe: &FfiAnimationKeyframe) -> Self {
+        let easing = &keyframe.easing;
+        let linear_points = if easing.linear_point_count == 0 {
+            Vec::new()
+        } else {
+            assert!(!easing.linear_points.is_null());
+            unsafe { std::slice::from_raw_parts(easing.linear_points, easing.linear_point_count) }.to_vec()
+        };
+        Self {
+            key: keyframe.key,
+            easing_kind: easing.kind,
+            linear_points,
+            x1: easing.x1,
+            y1: easing.y1,
+            x2: easing.x2,
+            y2: easing.y2,
+            interval_count: easing.interval_count,
+            step_position: easing.step_position,
+            composite: keyframe.composite,
+        }
+    }
+
+    fn easing_descriptor(&self) -> FfiEasingDescriptor {
+        FfiEasingDescriptor {
+            kind: self.easing_kind,
+            linear_points: self.linear_points.as_ptr(),
+            linear_point_count: self.linear_points.len(),
+            x1: self.x1,
+            y1: self.y1,
+            x2: self.x2,
+            y2: self.y2,
+            interval_count: self.interval_count,
+            step_position: self.step_position,
+        }
+    }
 }
 
 #[repr(u8)]
@@ -683,6 +783,9 @@ pub enum FfiCompositeOperation {
 fn accepted_range(property_id: u16, value_type: u8, range_overrides: &[NumericRangeOverride]) -> Option<(f64, f64)> {
     if let Some(range) = range_overrides.iter().find(|range| range.value_type == value_type) {
         return Some((range.min, range.max));
+    }
+    if property_id == crate::css::property_metadata::property_id::CUSTOM {
+        return None;
     }
     property_numeric_ranges(property_id)
         .iter()
@@ -827,7 +930,7 @@ fn handled_without_value() -> FfiAnimationValueResult {
 }
 
 fn handled_retained_value(value: RetainedStyleValueData) -> FfiAnimationValueResult {
-    let pointer = unsafe { crate::css::style_value::rust_style_value_retain(value.data()) };
+    let pointer = unsafe { crate::css::style_value::retain_style_value(value.data()) };
     FfiAnimationValueResult {
         value: pointer,
         handled: true,
@@ -845,7 +948,7 @@ fn discrete_value(
     }
     let value = if delta < 0.5 { from } else { to };
     FfiAnimationValueResult {
-        value: unsafe { crate::css::style_value::rust_style_value_retain(value) },
+        value: unsafe { crate::css::style_value::retain_style_value(value) },
         handled: true,
     }
 }
@@ -864,7 +967,7 @@ fn interpolate_visibility(
 
     if from_keyword == to_keyword {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -884,7 +987,7 @@ fn interpolate_visibility(
             to
         };
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(value) },
+            value: unsafe { crate::css::style_value::retain_style_value(value) },
             handled: true,
         };
     }
@@ -906,7 +1009,7 @@ fn interpolate_content_visibility(
 
     if from_keyword == to_keyword {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -928,7 +1031,7 @@ fn interpolate_content_visibility(
             from
         };
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(value) },
+            value: unsafe { crate::css::style_value::retain_style_value(value) },
             handled: true,
         };
     }
@@ -948,7 +1051,7 @@ fn interpolate_display(
 
     if from_raw == to_raw {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -974,12 +1077,39 @@ fn interpolate_display(
             from
         };
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(value) },
+            value: unsafe { crate::css::style_value::retain_style_value(value) },
             handled: true,
         };
     }
 
     discrete_value(context, from, to, delta)
+}
+
+fn decode_scale_components(value: &StyleValueData) -> Option<Vec<f64>> {
+    if matches!(value, StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::none_keyword()) {
+        return Some(vec![1.0, 1.0]);
+    }
+    let StyleValueData::Transformation { values, .. } = value else {
+        return None;
+    };
+    if !matches!(values.as_slice().len(), 2 | 3) {
+        return None;
+    }
+    values
+        .as_slice()
+        .iter()
+        .map(|value| match value.data() {
+            StyleValueData::Number { value } => Some(*value),
+            StyleValueData::Percentage { value } => Some(*value / 100.0),
+            calculated @ StyleValueData::Calculated { .. } => {
+                crate::css::calc::resolve_calculated_number_without_context(calculated).or_else(|| {
+                    crate::css::calc::resolve_calculated_percentage_without_context(calculated)
+                        .map(|value| value / 100.0)
+                })
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
 }
 
 fn interpolate_scale(from: &StyleValueData, to: &StyleValueData, delta: f32) -> FfiAnimationValueResult {
@@ -988,7 +1118,7 @@ fn interpolate_scale(from: &StyleValueData, to: &StyleValueData, delta: f32) -> 
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
     {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -1002,33 +1132,7 @@ fn interpolate_scale(from: &StyleValueData, to: &StyleValueData, delta: f32) -> 
     // during serialization of specified and computed values.
     // When translate, rotate or scale are animating or transitioning, and the from value or to value (but not both) is
     // none, the value none is replaced by the equivalent identity value (0px for translate, 0deg for rotate, 1 for scale).
-    let decode = |value: &StyleValueData| {
-        if matches!(value, StyleValueData::Keyword { keyword } if *keyword == none) {
-            return Some(vec![1.0, 1.0]);
-        }
-        let StyleValueData::Transformation { values, .. } = value else {
-            return None;
-        };
-        if !matches!(values.as_slice().len(), 2 | 3) {
-            return None;
-        }
-        values
-            .as_slice()
-            .iter()
-            .map(|value| match value.data() {
-                StyleValueData::Number { value } => Some(*value),
-                StyleValueData::Percentage { value } => Some(*value / 100.0),
-                calculated @ StyleValueData::Calculated { .. } => {
-                    crate::css::calc::resolve_calculated_number_without_context(calculated).or_else(|| {
-                        crate::css::calc::resolve_calculated_percentage_without_context(calculated)
-                            .map(|value| value / 100.0)
-                    })
-                }
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-    };
-    let (Some(mut from), Some(mut to)) = (decode(from), decode(to)) else {
+    let (Some(mut from), Some(mut to)) = (decode_scale_components(from), decode_scale_components(to)) else {
         return not_handled();
     };
     let is_3d = from.len() == 3 || to.len() == 3;
@@ -1216,13 +1320,32 @@ fn interpolate_translate_component(
     Some(retained_length_percentage_calculation(calculation, resolved_type))
 }
 
+fn decode_translate_components(value: &StyleValueData) -> Option<Vec<RetainedStyleValueData>> {
+    if matches!(value, StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::none_keyword()) {
+        return Some(vec![retained_zero_px(), retained_zero_px()]);
+    }
+    let StyleValueData::Transformation { values, .. } = value else {
+        return None;
+    };
+    if !matches!(values.as_slice().len(), 2 | 3) {
+        return None;
+    }
+    Some(
+        values
+            .as_slice()
+            .iter()
+            .map(|value| value.clone_retained())
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn interpolate_translate(from: &StyleValueData, to: &StyleValueData, delta: f32) -> FfiAnimationValueResult {
     let none = crate::css::style_compute::none_keyword();
     if matches!(from, StyleValueData::Keyword { keyword } if *keyword == none)
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
     {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -1235,32 +1358,7 @@ fn interpolate_translate(from: &StyleValueData, to: &StyleValueData, delta: f32)
     // Otherwise, this specifies a 3d translation, equivalent to the translate3d() function.
     // When translate, rotate or scale are animating or transitioning, and the from value or to value (but not both) is
     // none, the value none is replaced by the equivalent identity value (0px for translate, 0deg for rotate, 1 for scale).
-    let decode = |value: &StyleValueData| {
-        let zero = || {
-            let zero = Arc::into_raw(Arc::new(StyleValueData::Length {
-                value: 0.0,
-                unit: crate::css::calc::canonical_pixel_unit(),
-            }));
-            unsafe { RetainedStyleValueData::from_retained_pointer(zero) }
-        };
-        if matches!(value, StyleValueData::Keyword { keyword } if *keyword == none) {
-            return Some(vec![zero(), zero()]);
-        }
-        let StyleValueData::Transformation { values, .. } = value else {
-            return None;
-        };
-        if !matches!(values.as_slice().len(), 2 | 3) {
-            return None;
-        }
-        Some(
-            values
-                .as_slice()
-                .iter()
-                .map(|value| value.clone_retained())
-                .collect::<Vec<_>>(),
-        )
-    };
-    let (Some(mut from), Some(mut to)) = (decode(from), decode(to)) else {
+    let (Some(mut from), Some(mut to)) = (decode_translate_components(from), decode_translate_components(to)) else {
         return not_handled();
     };
     let is_3d = from.len() == 3 || to.len() == 3;
@@ -1301,13 +1399,18 @@ fn interpolate_translate(from: &StyleValueData, to: &StyleValueData, delta: f32)
     })
 }
 
-fn interpolate_individual_rotate(from: &StyleValueData, to: &StyleValueData, delta: f32) -> FfiAnimationValueResult {
+fn interpolate_individual_rotate(
+    context: Option<&FfiAnimationContext>,
+    from: &StyleValueData,
+    to: &StyleValueData,
+    delta: f32,
+) -> FfiAnimationValueResult {
     let none = crate::css::style_compute::none_keyword();
     if matches!(from, StyleValueData::Keyword { keyword } if *keyword == none)
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
     {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -1321,7 +1424,8 @@ fn interpolate_individual_rotate(from: &StyleValueData, to: &StyleValueData, del
     let is_2d = |value: &StyleValueData| {
         is_none(value)
             || matches!(value, StyleValueData::Transformation { transform_function, values, .. }
-                if *transform_function == TRANSFORM_FUNCTION_ROTATE && values.as_slice().len() == 1)
+                if matches!(*transform_function, TRANSFORM_FUNCTION_ROTATE | TRANSFORM_FUNCTION_ROTATE_Z)
+                    && values.as_slice().len() == 1)
     };
     if is_2d(from) && is_2d(to) {
         let angle = |value: &StyleValueData| {
@@ -1334,10 +1438,7 @@ fn interpolate_individual_rotate(from: &StyleValueData, to: &StyleValueData, del
             let [angle] = values.as_slice() else {
                 return None;
             };
-            match angle.data() {
-                StyleValueData::Angle { value, unit } => angle_to_degrees(*value, *unit),
-                _ => None,
-            }
+            resolve_animation_angle(context, angle.data())
         };
         let (Some(from), Some(to)) = (angle(from), angle(to)) else {
             return not_handled();
@@ -1355,6 +1456,14 @@ fn interpolate_individual_rotate(from: &StyleValueData, to: &StyleValueData, del
         });
     }
 
+    let axis_rotation = |x: f64, y: f64, z: f64, angle: &RetainedStyleValueData| {
+        Some(RetainedStyleValueDataList::from_retained_values(vec![
+            retained_number(x),
+            retained_number(y),
+            retained_number(z),
+            angle.clone_retained(),
+        ]))
+    };
     let normalize = |value: &StyleValueData| {
         if is_none(value) {
             let angle = Arc::into_raw(Arc::new(StyleValueData::Angle { value: 0.0, unit: 0 }));
@@ -1374,12 +1483,9 @@ fn interpolate_individual_rotate(from: &StyleValueData, to: &StyleValueData, del
             return None;
         };
         match (*transform_function, values.as_slice()) {
-            (TRANSFORM_FUNCTION_ROTATE, [angle]) => Some(RetainedStyleValueDataList::from_retained_values(vec![
-                retained_number(0.0),
-                retained_number(0.0),
-                retained_number(1.0),
-                angle.clone_retained(),
-            ])),
+            (TRANSFORM_FUNCTION_ROTATE | TRANSFORM_FUNCTION_ROTATE_Z, [angle]) => axis_rotation(0.0, 0.0, 1.0, angle),
+            (TRANSFORM_FUNCTION_ROTATE_X, [angle]) => axis_rotation(1.0, 0.0, 0.0, angle),
+            (TRANSFORM_FUNCTION_ROTATE_Y, [angle]) => axis_rotation(0.0, 1.0, 0.0, angle),
             (TRANSFORM_FUNCTION_ROTATE_3D, [..]) if values.as_slice().len() == 4 => {
                 Some(RetainedStyleValueDataList::from_retained_values(
                     values
@@ -1396,6 +1502,7 @@ fn interpolate_individual_rotate(from: &StyleValueData, to: &StyleValueData, del
         return not_handled();
     };
     interpolate_rotate_3d(
+        context,
         crate::css::property_metadata::property_id::ROTATE,
         TRANSFORM_FUNCTION_ROTATE_3D,
         &from,
@@ -1450,52 +1557,21 @@ fn radius_components_equal(first: &StyleValueData, second: &StyleValueData) -> b
 
 struct ExpandedGridTrack<'a> {
     track: &'a RetainedGridTrackEntry,
-    line_names: Option<&'a RetainedUtf16FlyStringList>,
+    line_names: Option<&'a CssStringList>,
 }
 
 fn empty_retained_style_value() -> RetainedStyleValueData {
     unsafe { RetainedStyleValueData::from_retained_optional_pointer(std::ptr::null()) }
 }
 
-fn empty_grid_line_names() -> RetainedUtf16FlyStringList {
-    RetainedUtf16FlyStringList::from_retained_strings(Vec::new())
+fn empty_grid_line_names() -> CssStringList {
+    CssStringList::from_strings(Vec::new())
 }
 
-fn grid_nested_entries(entry: &RetainedGridTrackEntry) -> &[RetainedGridTrackEntry] {
-    if entry.repeat_entries_pointer.is_null() {
-        return &[];
-    }
-    unsafe { std::slice::from_raw_parts(entry.repeat_entries_pointer, entry.repeat_entries_length) }
-}
-
-fn grid_entries_into_raw_parts(entries: Vec<RetainedGridTrackEntry>) -> (*mut RetainedGridTrackEntry, usize) {
-    let entries = entries.into_boxed_slice();
-    let length = entries.len();
-    (Box::into_raw(entries) as *mut RetainedGridTrackEntry, length)
-}
-
-fn clone_grid_track_entry(entry: &RetainedGridTrackEntry) -> RetainedGridTrackEntry {
-    let (repeat_entries_pointer, repeat_entries_length) =
-        grid_entries_into_raw_parts(grid_nested_entries(entry).iter().map(clone_grid_track_entry).collect());
-    RetainedGridTrackEntry {
-        kind: entry.kind,
-        names: entry.names.clone_retained(),
-        size_value: entry.size_value.clone_retained(),
-        min_value: entry.min_value.clone_retained(),
-        max_value: entry.max_value.clone_retained(),
-        repeat_type: entry.repeat_type,
-        repeat_count: entry.repeat_count.clone_retained(),
-        repeat_is_subgrid: entry.repeat_is_subgrid,
-        repeat_preserve_line_name_sets: entry.repeat_preserve_line_name_sets,
-        repeat_entries_pointer,
-        repeat_entries_length,
-    }
-}
-
-fn grid_line_names_entry(names: &RetainedUtf16FlyStringList) -> RetainedGridTrackEntry {
+fn grid_line_names_entry(names: &CssStringList) -> RetainedGridTrackEntry {
     RetainedGridTrackEntry {
         kind: GridTrackEntryKind::LineNames,
-        names: names.clone_retained(),
+        names: names.clone(),
         size_value: empty_retained_style_value(),
         min_value: empty_retained_style_value(),
         max_value: empty_retained_style_value(),
@@ -1503,8 +1579,7 @@ fn grid_line_names_entry(names: &RetainedUtf16FlyStringList) -> RetainedGridTrac
         repeat_count: empty_retained_style_value(),
         repeat_is_subgrid: false,
         repeat_preserve_line_name_sets: false,
-        repeat_entries_pointer: std::ptr::null_mut(),
-        repeat_entries_length: 0,
+        repeat_entries: RetainedGridTrackEntryList::from_retained_entries(Vec::new()),
     }
 }
 
@@ -1548,7 +1623,7 @@ fn expand_grid_tracks_and_lines(entries: &[RetainedGridTrackEntry]) -> Option<Ve
 fn append_grid_track_with_line_names(
     result: &mut Vec<RetainedGridTrackEntry>,
     track: RetainedGridTrackEntry,
-    line_names: Option<&RetainedUtf16FlyStringList>,
+    line_names: Option<&CssStringList>,
 ) {
     result.push(track);
     if let Some(line_names) = line_names {
@@ -1616,12 +1691,11 @@ fn interpolate_grid_track_entries(
                 let nested = interpolate_grid_track_entries(
                     property_id,
                     from.track.repeat_is_subgrid,
-                    grid_nested_entries(from.track),
+                    from.track.repeat_entries(),
                     to.track.repeat_is_subgrid,
-                    grid_nested_entries(to.track),
+                    to.track.repeat_entries(),
                     delta,
                 )?;
-                let (repeat_entries_pointer, repeat_entries_length) = grid_entries_into_raw_parts(nested);
                 RetainedGridTrackEntry {
                     kind: GridTrackEntryKind::Repeat,
                     names: empty_grid_line_names(),
@@ -1632,8 +1706,7 @@ fn interpolate_grid_track_entries(
                     repeat_count: from.track.repeat_count.clone_retained(),
                     repeat_is_subgrid: false,
                     repeat_preserve_line_name_sets: false,
-                    repeat_entries_pointer,
-                    repeat_entries_length,
+                    repeat_entries: RetainedGridTrackEntryList::from_retained_entries(nested),
                 }
             }
             (GridTrackEntryKind::Repeat, _) | (_, GridTrackEntryKind::Repeat) => return None,
@@ -1647,8 +1720,7 @@ fn interpolate_grid_track_entries(
                 repeat_count: empty_retained_style_value(),
                 repeat_is_subgrid: false,
                 repeat_preserve_line_name_sets: false,
-                repeat_entries_pointer: std::ptr::null_mut(),
-                repeat_entries_length: 0,
+                repeat_entries: RetainedGridTrackEntryList::from_retained_entries(Vec::new()),
             },
             (GridTrackEntryKind::Size, GridTrackEntryKind::Size) => RetainedGridTrackEntry {
                 kind: GridTrackEntryKind::Size,
@@ -1665,14 +1737,13 @@ fn interpolate_grid_track_entries(
                 repeat_count: empty_retained_style_value(),
                 repeat_is_subgrid: false,
                 repeat_preserve_line_name_sets: false,
-                repeat_entries_pointer: std::ptr::null_mut(),
-                repeat_entries_length: 0,
+                repeat_entries: RetainedGridTrackEntryList::from_retained_entries(Vec::new()),
             },
             _ => {
                 if delta < 0.5 {
-                    clone_grid_track_entry(from.track)
+                    from.track.clone()
                 } else {
-                    clone_grid_track_entry(to.track)
+                    to.track.clone()
                 }
             }
         };
@@ -1750,12 +1821,11 @@ fn composite_grid_track_entries(
                 }
                 let nested = composite_grid_track_entries(
                     underlying.track.repeat_is_subgrid,
-                    grid_nested_entries(underlying.track),
+                    underlying.track.repeat_entries(),
                     animated.track.repeat_is_subgrid,
-                    grid_nested_entries(animated.track),
+                    animated.track.repeat_entries(),
                     operation,
                 )?;
-                let (repeat_entries_pointer, repeat_entries_length) = grid_entries_into_raw_parts(nested);
                 RetainedGridTrackEntry {
                     kind: GridTrackEntryKind::Repeat,
                     names: empty_grid_line_names(),
@@ -1766,8 +1836,7 @@ fn composite_grid_track_entries(
                     repeat_count: underlying.track.repeat_count.clone_retained(),
                     repeat_is_subgrid: false,
                     repeat_preserve_line_name_sets: false,
-                    repeat_entries_pointer,
-                    repeat_entries_length,
+                    repeat_entries: RetainedGridTrackEntryList::from_retained_entries(nested),
                 }
             }
             (GridTrackEntryKind::Repeat, _) | (_, GridTrackEntryKind::Repeat) => return None,
@@ -1781,8 +1850,7 @@ fn composite_grid_track_entries(
                 repeat_count: empty_retained_style_value(),
                 repeat_is_subgrid: false,
                 repeat_preserve_line_name_sets: false,
-                repeat_entries_pointer: std::ptr::null_mut(),
-                repeat_entries_length: 0,
+                repeat_entries: RetainedGridTrackEntryList::from_retained_entries(Vec::new()),
             },
             (GridTrackEntryKind::Size, GridTrackEntryKind::Size) => RetainedGridTrackEntry {
                 kind: GridTrackEntryKind::Size,
@@ -1798,10 +1866,9 @@ fn composite_grid_track_entries(
                 repeat_count: empty_retained_style_value(),
                 repeat_is_subgrid: false,
                 repeat_preserve_line_name_sets: false,
-                repeat_entries_pointer: std::ptr::null_mut(),
-                repeat_entries_length: 0,
+                repeat_entries: RetainedGridTrackEntryList::from_retained_entries(Vec::new()),
             },
-            _ => clone_grid_track_entry(animated.track),
+            _ => animated.track.clone(),
         };
         append_grid_track_with_line_names(&mut result, track, animated.line_names);
     }
@@ -2070,7 +2137,28 @@ fn legacy_srgb_components(value: &StyleValueData) -> Option<([f32; 4], [bool; 4]
     Some((components, missing))
 }
 
-fn interpolate_modern_color(from: &StyleValueData, to: &StyleValueData, delta: f32) -> Option<StyleValueData> {
+// How two colors are combined channel-wise: linear interpolation at a given progress, or addition
+// of both inputs for effect composition.
+#[derive(Clone, Copy)]
+enum ColorCombination {
+    Interpolate(f32),
+    Add,
+}
+
+impl ColorCombination {
+    fn combine(self, from: f32, to: f32) -> f32 {
+        match self {
+            ColorCombination::Interpolate(delta) => from + (to - from) * delta,
+            ColorCombination::Add => from + to,
+        }
+    }
+}
+
+fn combine_modern_color(
+    from: &StyleValueData,
+    to: &StyleValueData,
+    combination: ColorCombination,
+) -> Option<StyleValueData> {
     // https://drafts.csswg.org/css-color-4/#interpolation
     // 1. checking the two colors for analogous components and analogous sets which will be carried forward
     let from = native_color_components(from)?;
@@ -2094,11 +2182,12 @@ fn interpolate_modern_color(from: &StyleValueData, to: &StyleValueData, delta: f
 
     // 4. (if required) re-inserting carried forward values in the converted colors
     substitute_missing_components(&mut from_components, &mut to_components, from_missing, to_missing);
-    let interpolate = |from: f32, to: f32| from + (to - from) * delta;
-    let interpolated_alpha = interpolate(from_components[3], to_components[3]).clamp(0.0, 1.0);
+    let combined_alpha = combination
+        .combine(from_components[3], to_components[3])
+        .clamp(0.0, 1.0);
 
     // https://drafts.csswg.org/css-color-4/#interpolation
-    let result = if interpolated_alpha == 0.0 {
+    let result = if combined_alpha == 0.0 {
         // OPTIMIZATION: Fully transparent results can skip the premultiply/interpolate/unpremultiply cycle.
         [0.0, 0.0, 0.0, 0.0]
     } else {
@@ -2118,17 +2207,17 @@ fn interpolate_modern_color(from: &StyleValueData, to: &StyleValueData, delta: f
 
         // 7. linearly interpolating each component of the computed value of the color separately
         let premultiplied = [
-            interpolate(from_premultiplied[0], to_premultiplied[0]),
-            interpolate(from_premultiplied[1], to_premultiplied[1]),
-            interpolate(from_premultiplied[2], to_premultiplied[2]),
+            combination.combine(from_premultiplied[0], to_premultiplied[0]),
+            combination.combine(from_premultiplied[1], to_premultiplied[1]),
+            combination.combine(from_premultiplied[2], to_premultiplied[2]),
         ];
 
         // 8. undoing premultiplication
         [
-            premultiplied[0] / interpolated_alpha,
-            premultiplied[1] / interpolated_alpha,
-            premultiplied[2] / interpolated_alpha,
-            interpolated_alpha,
+            premultiplied[0] / combined_alpha,
+            premultiplied[1] / combined_alpha,
+            premultiplied[2] / combined_alpha,
+            combined_alpha,
         ]
     };
 
@@ -2163,7 +2252,11 @@ fn interpolate_modern_color(from: &StyleValueData, to: &StyleValueData, delta: f
     })
 }
 
-fn interpolate_legacy_rgb(from: &StyleValueData, to: &StyleValueData, delta: f32) -> Option<StyleValueData> {
+fn combine_legacy_rgb(
+    from: &StyleValueData,
+    to: &StyleValueData,
+    combination: ColorCombination,
+) -> Option<StyleValueData> {
     // https://drafts.csswg.org/css-color-4/#interpolation-space
     // If the host syntax does not define what color space interpolation should take place in, it defaults to Oklab.
     // However, user agents must handle interpolation between legacy sRGB color formats (hex colors, named colors,
@@ -2171,11 +2264,10 @@ fn interpolate_legacy_rgb(from: &StyleValueData, to: &StyleValueData, delta: f32
     let (mut from, from_missing) = legacy_srgb_components(from)?;
     let (mut to, to_missing) = legacy_srgb_components(to)?;
     substitute_missing_components(&mut from, &mut to, from_missing, to_missing);
-    let interpolate = |from: f32, to: f32| from + (to - from) * delta;
-    let interpolated_alpha = interpolate(from[3], to[3]).clamp(0.0, 1.0);
+    let combined_alpha = combination.combine(from[3], to[3]).clamp(0.0, 1.0);
 
     // https://drafts.csswg.org/css-color-4/#interpolation
-    let result = if interpolated_alpha == 0.0 {
+    let result = if combined_alpha == 0.0 {
         // OPTIMIZATION: Fully transparent results can skip the premultiply/interpolate/unpremultiply cycle.
         [0.0, 0.0, 0.0, 0.0]
     } else {
@@ -2187,17 +2279,17 @@ fn interpolate_legacy_rgb(from: &StyleValueData, to: &StyleValueData, delta: f32
 
         // 7. linearly interpolating each component of the computed value of the color separately
         let premultiplied = [
-            interpolate(from_premultiplied[0], to_premultiplied[0]),
-            interpolate(from_premultiplied[1], to_premultiplied[1]),
-            interpolate(from_premultiplied[2], to_premultiplied[2]),
+            combination.combine(from_premultiplied[0], to_premultiplied[0]),
+            combination.combine(from_premultiplied[1], to_premultiplied[1]),
+            combination.combine(from_premultiplied[2], to_premultiplied[2]),
         ];
 
         // 8. undoing premultiplication
         [
-            premultiplied[0] / interpolated_alpha,
-            premultiplied[1] / interpolated_alpha,
-            premultiplied[2] / interpolated_alpha,
-            interpolated_alpha,
+            premultiplied[0] / combined_alpha,
+            premultiplied[1] / combined_alpha,
+            premultiplied[2] / combined_alpha,
+            combined_alpha,
         ]
     };
 
@@ -2225,8 +2317,8 @@ fn empty_shape_points() -> RetainedShapePointList {
     RetainedShapePointList::from_retained_points(Vec::new())
 }
 
-fn empty_retained_fly_string() -> RetainedUtf16FlyString {
-    unsafe { RetainedUtf16FlyString::from_leaked_raw(0) }
+fn empty_retained_fly_string() -> CssString {
+    CssString::none()
 }
 
 fn interpolate_basic_shape_component(
@@ -2317,7 +2409,7 @@ fn interpolate_basic_shape(
     delta: f32,
 ) -> Option<StyleValueData> {
     let (
-        StyleValueData::BasicShape {
+        Some(BasicShapeData {
             kind: from_kind,
             v0: from_v0,
             v1: from_v1,
@@ -2327,8 +2419,8 @@ fn interpolate_basic_shape(
             fill_rule: from_fill_rule,
             points: from_points,
             ..
-        },
-        StyleValueData::BasicShape {
+        }),
+        Some(BasicShapeData {
             kind: to_kind,
             v0: to_v0,
             v1: to_v1,
@@ -2338,8 +2430,8 @@ fn interpolate_basic_shape(
             fill_rule: to_fill_rule,
             points: to_points,
             ..
-        },
-    ) = (from, to)
+        }),
+    ) = (from.basic_shape(), to.basic_shape())
     else {
         return None;
     };
@@ -2354,15 +2446,17 @@ fn interpolate_basic_shape(
         BASIC_SHAPE_INSET => {
             // If both shapes are of type inset(), interpolate between each value in the shape functions.
             Some(StyleValueData::BasicShape {
-                kind: *from_kind,
-                v0: interpolate_basic_shape_component(property_id, from_v0, to_v0, delta),
-                v1: interpolate_basic_shape_component(property_id, from_v1, to_v1, delta),
-                v2: interpolate_basic_shape_component(property_id, from_v2, to_v2, delta),
-                v3: interpolate_basic_shape_component(property_id, from_v3, to_v3, delta),
-                v4: interpolate_basic_shape_component(property_id, from_v4, to_v4, delta),
-                fill_rule: 0,
-                points: empty_shape_points(),
-                path_string: empty_retained_fly_string(),
+                shape: OwnedBasicShapeData::new(BasicShapeData {
+                    kind: *from_kind,
+                    v0: interpolate_basic_shape_component(property_id, from_v0, to_v0, delta),
+                    v1: interpolate_basic_shape_component(property_id, from_v1, to_v1, delta),
+                    v2: interpolate_basic_shape_component(property_id, from_v2, to_v2, delta),
+                    v3: interpolate_basic_shape_component(property_id, from_v3, to_v3, delta),
+                    v4: interpolate_basic_shape_component(property_id, from_v4, to_v4, delta),
+                    fill_rule: 0,
+                    points: empty_shape_points(),
+                    path: crate::css::css_path::CssPath::none(),
+                }),
             })
         }
         BASIC_SHAPE_CIRCLE | BASIC_SHAPE_ELLIPSE => {
@@ -2402,15 +2496,17 @@ fn interpolate_basic_shape(
                 }
             };
             Some(StyleValueData::BasicShape {
-                kind: *from_kind,
-                v0: radius,
-                v1: position,
-                v2: empty(),
-                v3: empty(),
-                v4: empty(),
-                fill_rule: 0,
-                points: empty_shape_points(),
-                path_string: empty_retained_fly_string(),
+                shape: OwnedBasicShapeData::new(BasicShapeData {
+                    kind: *from_kind,
+                    v0: radius,
+                    v1: position,
+                    v2: empty(),
+                    v3: empty(),
+                    v4: empty(),
+                    fill_rule: 0,
+                    points: empty_shape_points(),
+                    path: crate::css::css_path::CssPath::none(),
+                }),
             })
         }
         BASIC_SHAPE_POLYGON => {
@@ -2433,15 +2529,17 @@ fn interpolate_basic_shape(
                 })
                 .collect();
             Some(StyleValueData::BasicShape {
-                kind: *from_kind,
-                v0: empty(),
-                v1: empty(),
-                v2: empty(),
-                v3: empty(),
-                v4: empty(),
-                fill_rule: *from_fill_rule,
-                points: RetainedShapePointList::from_retained_points(points),
-                path_string: empty_retained_fly_string(),
+                shape: OwnedBasicShapeData::new(BasicShapeData {
+                    kind: *from_kind,
+                    v0: empty(),
+                    v1: empty(),
+                    v2: empty(),
+                    v3: empty(),
+                    v4: empty(),
+                    fill_rule: *from_fill_rule,
+                    points: RetainedShapePointList::from_retained_points(points),
+                    path: crate::css::css_path::CssPath::none(),
+                }),
             })
         }
         _ => None,
@@ -2515,7 +2613,7 @@ fn composite_basic_shape(
     operation: FfiCompositeOperation,
 ) -> Option<StyleValueData> {
     let (
-        StyleValueData::BasicShape {
+        Some(BasicShapeData {
             kind: underlying_kind,
             v0: underlying_v0,
             v1: underlying_v1,
@@ -2525,8 +2623,8 @@ fn composite_basic_shape(
             fill_rule: underlying_fill_rule,
             points: underlying_points,
             ..
-        },
-        StyleValueData::BasicShape {
+        }),
+        Some(BasicShapeData {
             kind: animated_kind,
             v0: animated_v0,
             v1: animated_v1,
@@ -2536,8 +2634,8 @@ fn composite_basic_shape(
             fill_rule: animated_fill_rule,
             points: animated_points,
             ..
-        },
-    ) = (underlying, animated)
+        }),
+    ) = (underlying.basic_shape(), animated.basic_shape())
     else {
         return None;
     };
@@ -2548,15 +2646,17 @@ fn composite_basic_shape(
     let empty = empty_retained_style_value;
     match *underlying_kind {
         BASIC_SHAPE_INSET => Some(StyleValueData::BasicShape {
-            kind: *underlying_kind,
-            v0: composite_retained_value(underlying_v0, animated_v0, operation)?,
-            v1: composite_retained_value(underlying_v1, animated_v1, operation)?,
-            v2: composite_retained_value(underlying_v2, animated_v2, operation)?,
-            v3: composite_retained_value(underlying_v3, animated_v3, operation)?,
-            v4: composite_retained_value(underlying_v4, animated_v4, operation)?,
-            fill_rule: 0,
-            points: empty_shape_points(),
-            path_string: empty_retained_fly_string(),
+            shape: OwnedBasicShapeData::new(BasicShapeData {
+                kind: *underlying_kind,
+                v0: composite_retained_value(underlying_v0, animated_v0, operation)?,
+                v1: composite_retained_value(underlying_v1, animated_v1, operation)?,
+                v2: composite_retained_value(underlying_v2, animated_v2, operation)?,
+                v3: composite_retained_value(underlying_v3, animated_v3, operation)?,
+                v4: composite_retained_value(underlying_v4, animated_v4, operation)?,
+                fill_rule: 0,
+                points: empty_shape_points(),
+                path: crate::css::css_path::CssPath::none(),
+            }),
         }),
         BASIC_SHAPE_CIRCLE | BASIC_SHAPE_ELLIPSE => {
             let position = match (underlying_v1.optional_data(), animated_v1.optional_data()) {
@@ -2580,15 +2680,17 @@ fn composite_basic_shape(
                 }
             };
             Some(StyleValueData::BasicShape {
-                kind: *underlying_kind,
-                v0: composite_retained_value(underlying_v0, animated_v0, operation)?,
-                v1: position,
-                v2: empty(),
-                v3: empty(),
-                v4: empty(),
-                fill_rule: 0,
-                points: empty_shape_points(),
-                path_string: empty_retained_fly_string(),
+                shape: OwnedBasicShapeData::new(BasicShapeData {
+                    kind: *underlying_kind,
+                    v0: composite_retained_value(underlying_v0, animated_v0, operation)?,
+                    v1: position,
+                    v2: empty(),
+                    v3: empty(),
+                    v4: empty(),
+                    fill_rule: 0,
+                    points: empty_shape_points(),
+                    path: crate::css::css_path::CssPath::none(),
+                }),
             })
         }
         BASIC_SHAPE_POLYGON => {
@@ -2611,19 +2713,270 @@ fn composite_basic_shape(
                 })
                 .collect::<Option<Vec<_>>>()?;
             Some(StyleValueData::BasicShape {
-                kind: *underlying_kind,
-                v0: empty(),
-                v1: empty(),
-                v2: empty(),
-                v3: empty(),
-                v4: empty(),
-                fill_rule: *underlying_fill_rule,
-                points: RetainedShapePointList::from_retained_points(points),
-                path_string: empty_retained_fly_string(),
+                shape: OwnedBasicShapeData::new(BasicShapeData {
+                    kind: *underlying_kind,
+                    v0: empty(),
+                    v1: empty(),
+                    v2: empty(),
+                    v3: empty(),
+                    v4: empty(),
+                    fill_rule: *underlying_fill_rule,
+                    points: RetainedShapePointList::from_retained_points(points),
+                    path: crate::css::css_path::CssPath::none(),
+                }),
             })
         }
         _ => None,
     }
+}
+
+fn is_individual_transform_property(property: u16) -> bool {
+    matches!(
+        property,
+        crate::css::property_metadata::property_id::ROTATE
+            | crate::css::property_metadata::property_id::SCALE
+            | crate::css::property_metadata::property_id::TRANSLATE
+    )
+}
+
+// Decode a computed rotate property value into an unnormalized axis and an angle in degrees.
+fn decode_rotation(value: &StyleValueData) -> Option<([f64; 3], f64)> {
+    if matches!(value, StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::none_keyword()) {
+        return Some(([0.0, 0.0, 1.0], 0.0));
+    }
+    let StyleValueData::Transformation {
+        transform_function,
+        values,
+        ..
+    } = value
+    else {
+        return None;
+    };
+    match (*transform_function, values.as_slice()) {
+        (TRANSFORM_FUNCTION_ROTATE | TRANSFORM_FUNCTION_ROTATE_Z, [angle]) => {
+            Some(([0.0, 0.0, 1.0], resolve_animation_angle(None, angle.data())?))
+        }
+        (TRANSFORM_FUNCTION_ROTATE_X, [angle]) => Some(([1.0, 0.0, 0.0], resolve_animation_angle(None, angle.data())?)),
+        (TRANSFORM_FUNCTION_ROTATE_Y, [angle]) => Some(([0.0, 1.0, 0.0], resolve_animation_angle(None, angle.data())?)),
+        (TRANSFORM_FUNCTION_ROTATE_3D, [x, y, z, angle]) => Some((
+            [
+                resolve_animation_number(None, x.data())?,
+                resolve_animation_number(None, y.data())?,
+                resolve_animation_number(None, z.data())?,
+            ],
+            resolve_animation_angle(None, angle.data())?,
+        )),
+        _ => None,
+    }
+}
+
+// Find a shared rotation axis for two rotations, treating a rotation with a zero axis or a zero
+// angle as contributing no rotation. Returns the shared normalized axis with both angles, or None
+// when the axes genuinely differ.
+fn common_rotation_axis(
+    underlying_axis: [f64; 3],
+    underlying_angle: f64,
+    animated_axis: [f64; 3],
+    animated_angle: f64,
+) -> Option<([f64; 3], f64, f64)> {
+    let epsilon = 1e-4;
+    let length_squared = |axis: [f64; 3]| axis.iter().map(|component| component * component).sum::<f64>();
+    let normalize = |axis: [f64; 3]| {
+        let length = length_squared(axis).sqrt();
+        [axis[0] / length, axis[1] / length, axis[2] / length]
+    };
+    let underlying_axis_is_zero = length_squared(underlying_axis) < epsilon * epsilon;
+    let animated_axis_is_zero = length_squared(animated_axis) < epsilon * epsilon;
+    let (underlying_is_zero, animated_is_zero) = if underlying_axis_is_zero || animated_axis_is_zero {
+        (underlying_axis_is_zero, animated_axis_is_zero)
+    } else {
+        (underlying_angle.abs() < epsilon, animated_angle.abs() < epsilon)
+    };
+    if underlying_is_zero && animated_is_zero {
+        return Some(([0.0, 0.0, 1.0], 0.0, 0.0));
+    }
+    if underlying_is_zero {
+        return Some((normalize(animated_axis), 0.0, animated_angle));
+    }
+    if animated_is_zero {
+        return Some((normalize(underlying_axis), underlying_angle, 0.0));
+    }
+    let dot = underlying_axis[0] * animated_axis[0]
+        + underlying_axis[1] * animated_axis[1]
+        + underlying_axis[2] * animated_axis[2];
+    if dot < 0.0 {
+        return None;
+    }
+    let error = (1.0 - (dot * dot) / (length_squared(underlying_axis) * length_squared(animated_axis))).abs();
+    if error > epsilon {
+        return None;
+    }
+    Some((normalize(underlying_axis), underlying_angle, animated_angle))
+}
+
+fn individual_rotation_value(axis: [f64; 3], angle_degrees: f64) -> StyleValueData {
+    let angle = Arc::into_raw(Arc::new(StyleValueData::Angle {
+        value: angle_degrees,
+        unit: 0,
+    }));
+    let angle = unsafe { RetainedStyleValueData::from_retained_pointer(angle) };
+    if axis == [0.0, 0.0, 1.0] {
+        return StyleValueData::Transformation {
+            property: crate::css::property_metadata::property_id::ROTATE,
+            transform_function: TRANSFORM_FUNCTION_ROTATE,
+            values: RetainedStyleValueDataList::from_retained_values(vec![angle]),
+        };
+    }
+    StyleValueData::Transformation {
+        property: crate::css::property_metadata::property_id::ROTATE,
+        transform_function: TRANSFORM_FUNCTION_ROTATE_3D,
+        values: RetainedStyleValueDataList::from_retained_values(vec![
+            retained_number(axis[0]),
+            retained_number(axis[1]),
+            retained_number(axis[2]),
+            angle,
+        ]),
+    }
+}
+
+fn composite_rotate(underlying: &StyleValueData, animated: &StyleValueData) -> Option<StyleValueData> {
+    let (underlying_axis, underlying_angle) = decode_rotation(underlying)?;
+    let (animated_axis, animated_angle) = decode_rotation(animated)?;
+
+    if let Some((axis, underlying_angle, animated_angle)) =
+        common_rotation_axis(underlying_axis, underlying_angle, animated_axis, animated_angle)
+    {
+        return Some(individual_rotation_value(axis, underlying_angle + animated_angle));
+    }
+
+    let to_quaternion = |axis: [f64; 3], angle_degrees: f64| {
+        let length = axis.iter().map(|component| component * component).sum::<f64>().sqrt();
+        let half_angle = angle_degrees.to_radians() / 2.0;
+        let sin_half_angle = half_angle.sin();
+        [
+            axis[0] / length * sin_half_angle,
+            axis[1] / length * sin_half_angle,
+            axis[2] / length * sin_half_angle,
+            half_angle.cos(),
+        ]
+    };
+    let [x1, y1, z1, w1] = to_quaternion(underlying_axis, underlying_angle);
+    let [x2, y2, z2, w2] = to_quaternion(animated_axis, animated_angle);
+
+    let mut product = [
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ];
+    if product[3] < 0.0 {
+        product = product.map(|component| -component);
+    }
+    let angle = 2.0 * product[3].clamp(-1.0, 1.0).acos();
+    let sin_half_angle = (1.0 - product[3] * product[3]).max(0.0).sqrt();
+    let axis = if sin_half_angle < 1e-5 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [
+            product[0] / sin_half_angle,
+            product[1] / sin_half_angle,
+            product[2] / sin_half_angle,
+        ]
+    };
+    Some(individual_rotation_value(axis, angle.to_degrees()))
+}
+
+fn composite_scale(
+    underlying: &StyleValueData,
+    animated: &StyleValueData,
+    operation: FfiCompositeOperation,
+) -> Option<StyleValueData> {
+    let (Some(mut underlying), Some(mut animated)) =
+        (decode_scale_components(underlying), decode_scale_components(animated))
+    else {
+        return None;
+    };
+    let is_3d = underlying.len() == 3 || animated.len() == 3;
+    if is_3d {
+        underlying.resize(3, 1.0);
+        animated.resize(3, 1.0);
+    }
+    let values = underlying
+        .into_iter()
+        .zip(animated)
+        .map(|(underlying, animated)| {
+            let value = match operation {
+                FfiCompositeOperation::Accumulate => underlying + animated - 1.0,
+                _ => underlying * animated,
+            };
+            retained_number(value)
+        })
+        .collect();
+    Some(StyleValueData::Transformation {
+        property: crate::css::property_metadata::property_id::SCALE,
+        transform_function: if is_3d {
+            TRANSFORM_FUNCTION_SCALE_3D
+        } else {
+            TRANSFORM_FUNCTION_SCALE
+        },
+        values: RetainedStyleValueDataList::from_retained_values(values),
+    })
+}
+
+fn composite_translate(
+    underlying: &StyleValueData,
+    animated: &StyleValueData,
+    operation: FfiCompositeOperation,
+) -> Option<StyleValueData> {
+    let (Some(mut underlying), Some(mut animated)) = (
+        decode_translate_components(underlying),
+        decode_translate_components(animated),
+    ) else {
+        return None;
+    };
+    let is_3d = underlying.len() == 3 || animated.len() == 3;
+    if is_3d {
+        underlying.resize_with(3, retained_zero_px);
+        animated.resize_with(3, retained_zero_px);
+    }
+    let values = underlying
+        .iter()
+        .zip(animated.iter())
+        .map(|(underlying, animated)| {
+            let result = composite_scalar_value(underlying.data(), animated.data(), operation);
+            if !result.handled || result.value.is_null() {
+                return None;
+            }
+            Some(unsafe { RetainedStyleValueData::from_retained_pointer(result.value) })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(StyleValueData::Transformation {
+        property: crate::css::property_metadata::property_id::TRANSLATE,
+        transform_function: if is_3d {
+            TRANSFORM_FUNCTION_TRANSLATE_3D
+        } else {
+            TRANSFORM_FUNCTION_TRANSLATE
+        },
+        values: RetainedStyleValueDataList::from_retained_values(values),
+    })
+}
+
+fn composite_individual_transform(
+    property: u16,
+    underlying: &StyleValueData,
+    animated: &StyleValueData,
+    operation: FfiCompositeOperation,
+) -> Option<StyleValueData> {
+    if property == crate::css::property_metadata::property_id::ROTATE {
+        return composite_rotate(underlying, animated);
+    }
+    if property == crate::css::property_metadata::property_id::SCALE {
+        return composite_scale(underlying, animated, operation);
+    }
+    if property == crate::css::property_metadata::property_id::TRANSLATE {
+        return composite_translate(underlying, animated, operation);
+    }
+    None
 }
 
 fn composite_scalar_value(
@@ -2668,8 +3021,12 @@ fn composite_scalar_value(
 
     match (underlying, animated) {
         (StyleValueData::ColorFunction { .. }, StyleValueData::ColorFunction { .. }) => {
-            // FIXME: Implement color addition and accumulation.
-            handled_without_value()
+            // AD-HOC: css-values-4 states that the <color> type is not additive, but other engines
+            // combine colors by adding their premultiplied components in the interpolation color space,
+            // and WPT css/css-color/animation/color-composition.html expects that behavior.
+            combine_legacy_rgb(underlying, animated, ColorCombination::Add)
+                .or_else(|| combine_modern_color(underlying, animated, ColorCombination::Add))
+                .map_or_else(handled_without_value, owned)
         }
         (StyleValueData::BasicShape { .. }, StyleValueData::BasicShape { .. }) => {
             composite_basic_shape(underlying, animated, operation).map_or_else(handled_without_value, owned)
@@ -3096,13 +3453,13 @@ fn composite_scalar_value(
         }
         (
             StyleValueData::OpenTypeTagged {
-                tag: underlying_tag,
+                tag_name: underlying_tag,
                 packed_tag: underlying_packed_tag,
                 value: underlying_value,
                 ..
             },
             StyleValueData::OpenTypeTagged {
-                tag: animated_tag,
+                tag_name: animated_tag,
                 value: animated_value,
                 ..
             },
@@ -3110,7 +3467,7 @@ fn composite_scalar_value(
             // https://drafts.csswg.org/web-animations-1/#animating-properties
             // Corresponding individual components of the computed values are combined (interpolated, added, or accumulated) using the indicated procedure for that value type (see CSS Values 4 § 3 Combining Values: Interpolation, Addition, and Accumulation).
             // If the number of components or the types of corresponding components do not match, or if any component value uses discrete animation and the two corresponding values do not match, then the property values combine as discrete.
-            if underlying_tag.raw() != animated_tag.raw() {
+            if underlying_tag != animated_tag {
                 return handled_without_value();
             }
             let value = composite_scalar_value(underlying_value.data(), animated_value.data(), operation);
@@ -3122,7 +3479,7 @@ fn composite_scalar_value(
             }
             owned(StyleValueData::OpenTypeTagged {
                 mode: OPEN_TYPE_MODE_FONT_VARIATION_SETTINGS,
-                tag: unsafe { RetainedUtf16FlyString::from_borrowed_raw(underlying_tag.raw()) },
+                tag_name: underlying_tag.clone(),
                 packed_tag: *underlying_packed_tag,
                 value: unsafe { RetainedStyleValueData::from_retained_pointer(value.value) },
             })
@@ -3140,7 +3497,7 @@ fn composite_scalar_value(
             // https://drafts.csswg.org/web-animations-1/#animating-properties
             // Corresponding individual components of the computed values are combined (interpolated, added, or accumulated) using the indicated procedure for that value type (see CSS Values 4 § 3 Combining Values: Interpolation, Addition, and Accumulation).
             // If the number of components or the types of corresponding components do not match, or if any component value uses discrete animation and the two corresponding values do not match, then the property values combine as discrete.
-            if underlying_name.raw() != animated_name.raw() {
+            if underlying_name != animated_name {
                 return handled_without_value();
             }
             let value = composite_scalar_value(underlying_value.data(), animated_value.data(), operation);
@@ -3151,7 +3508,7 @@ fn composite_scalar_value(
                 return handled_without_value();
             }
             owned(StyleValueData::Function {
-                name: unsafe { RetainedUtf16FlyString::from_borrowed_raw(underlying_name.raw()) },
+                name: underlying_name.clone(),
                 value: unsafe { RetainedStyleValueData::from_retained_pointer(value.value) },
             })
         }
@@ -3250,6 +3607,37 @@ fn composite_scalar_value(
                 entries: RetainedGridTrackEntryList::from_retained_entries(entries),
             })
         }
+        (
+            StyleValueData::Transformation {
+                property: underlying_property,
+                ..
+            },
+            StyleValueData::Transformation {
+                property: animated_property,
+                ..
+            },
+        ) if underlying_property == animated_property && is_individual_transform_property(*underlying_property) => {
+            composite_individual_transform(*underlying_property, underlying, animated, operation)
+                .map_or_else(handled_without_value, owned)
+        }
+        // none is the identity value of the individual transform properties, so composing onto or
+        // with it yields the other value unchanged.
+        (StyleValueData::Keyword { keyword }, StyleValueData::Transformation { property, .. })
+            if *keyword == crate::css::style_compute::none_keyword() && is_individual_transform_property(*property) =>
+        {
+            FfiAnimationValueResult {
+                value: unsafe { crate::css::style_value::retain_style_value(animated) },
+                handled: true,
+            }
+        }
+        (StyleValueData::Transformation { property, .. }, StyleValueData::Keyword { keyword })
+            if *keyword == crate::css::style_compute::none_keyword() && is_individual_transform_property(*property) =>
+        {
+            FfiAnimationValueResult {
+                value: unsafe { crate::css::style_value::retain_style_value(underlying) },
+                handled: true,
+            }
+        }
         _ => handled_without_value(),
     }
 }
@@ -3311,8 +3699,8 @@ fn interpolate_scalar_value(
 
     match (from, to) {
         (StyleValueData::ColorFunction { .. }, StyleValueData::ColorFunction { .. }) => {
-            interpolate_legacy_rgb(from, to, delta)
-                .or_else(|| interpolate_modern_color(from, to, delta))
+            combine_legacy_rgb(from, to, ColorCombination::Interpolate(delta))
+                .or_else(|| combine_modern_color(from, to, ColorCombination::Interpolate(delta)))
                 .map_or_else(not_handled, owned)
         }
         (StyleValueData::BasicShape { .. }, StyleValueData::BasicShape { .. }) => {
@@ -3358,7 +3746,7 @@ fn interpolate_scalar_value(
             if from == to =>
         {
             FfiAnimationValueResult {
-                value: unsafe { crate::css::style_value::rust_style_value_retain(from_value) },
+                value: unsafe { crate::css::style_value::retain_style_value(from_value) },
                 handled: true,
             }
         }
@@ -3815,13 +4203,13 @@ fn interpolate_scalar_value(
         }
         (
             StyleValueData::OpenTypeTagged {
-                tag: from_tag,
+                tag_name: from_tag,
                 packed_tag: from_packed_tag,
                 value: from_value,
                 ..
             },
             StyleValueData::OpenTypeTagged {
-                tag: to_tag,
+                tag_name: to_tag,
                 value: to_value,
                 ..
             },
@@ -3829,7 +4217,7 @@ fn interpolate_scalar_value(
             // https://drafts.csswg.org/web-animations-1/#animating-properties
             // Corresponding individual components of the computed values are combined (interpolated, added, or accumulated) using the indicated procedure for that value type (see CSS Values 4 § 3 Combining Values: Interpolation, Addition, and Accumulation).
             // If the number of components or the types of corresponding components do not match, or if any component value uses discrete animation and the two corresponding values do not match, then the property values combine as discrete.
-            if from_tag.raw() != to_tag.raw() {
+            if from_tag != to_tag {
                 return handled_without_value();
             }
             let value =
@@ -3842,7 +4230,7 @@ fn interpolate_scalar_value(
             }
             owned(StyleValueData::OpenTypeTagged {
                 mode: OPEN_TYPE_MODE_FONT_VARIATION_SETTINGS,
-                tag: unsafe { RetainedUtf16FlyString::from_borrowed_raw(from_tag.raw()) },
+                tag_name: from_tag.clone(),
                 packed_tag: *from_packed_tag,
                 value: unsafe { RetainedStyleValueData::from_retained_pointer(value.value) },
             })
@@ -3860,7 +4248,7 @@ fn interpolate_scalar_value(
             // https://drafts.csswg.org/web-animations-1/#animating-properties
             // Corresponding individual components of the computed values are combined (interpolated, added, or accumulated) using the indicated procedure for that value type (see CSS Values 4 § 3 Combining Values: Interpolation, Addition, and Accumulation).
             // If the number of components or the types of corresponding components do not match, or if any component value uses discrete animation and the two corresponding values do not match, then the property values combine as discrete.
-            if from_name.raw() != to_name.raw() {
+            if from_name != to_name {
                 return handled_without_value();
             }
             let value =
@@ -3872,7 +4260,7 @@ fn interpolate_scalar_value(
                 return handled_without_value();
             }
             owned(StyleValueData::Function {
-                name: unsafe { RetainedUtf16FlyString::from_borrowed_raw(from_name.raw()) },
+                name: from_name.clone(),
                 value: unsafe { RetainedStyleValueData::from_retained_pointer(value.value) },
             })
         }
@@ -4004,6 +4392,7 @@ fn interpolate_scalar_value(
 }
 
 fn interpolate_rotate_3d(
+    context: Option<&FfiAnimationContext>,
     property: u16,
     transform_function: u8,
     from_arguments: &RetainedStyleValueDataList,
@@ -4015,38 +4404,18 @@ fn interpolate_rotate_3d(
     else {
         return None;
     };
-    let (
-        StyleValueData::Number { value: from_x },
-        StyleValueData::Number { value: from_y },
-        StyleValueData::Number { value: from_z },
-        StyleValueData::Angle {
-            value: from_angle,
-            unit: from_angle_unit,
-        },
-        StyleValueData::Number { value: to_x },
-        StyleValueData::Number { value: to_y },
-        StyleValueData::Number { value: to_z },
-        StyleValueData::Angle {
-            value: to_angle,
-            unit: to_angle_unit,
-        },
-    ) = (
-        from_x.data(),
-        from_y.data(),
-        from_z.data(),
-        from_angle.data(),
-        to_x.data(),
-        to_y.data(),
-        to_z.data(),
-        to_angle.data(),
-    )
-    else {
-        return None;
-    };
-    let from_angle = angle_to_degrees(*from_angle, *from_angle_unit)?.to_radians();
-    let to_angle = angle_to_degrees(*to_angle, *to_angle_unit)?.to_radians();
-    let from_axis = [*from_x, *from_y, *from_z];
-    let to_axis = [*to_x, *to_y, *to_z];
+    let from_angle = resolve_animation_angle(context, from_angle.data())?.to_radians();
+    let to_angle = resolve_animation_angle(context, to_angle.data())?.to_radians();
+    let from_axis = [
+        resolve_animation_number(context, from_x.data())?,
+        resolve_animation_number(context, from_y.data())?,
+        resolve_animation_number(context, from_z.data())?,
+    ];
+    let to_axis = [
+        resolve_animation_number(context, to_x.data())?,
+        resolve_animation_number(context, to_y.data())?,
+        resolve_animation_number(context, to_z.data())?,
+    ];
 
     let length = |vector: [f64; 3]| vector.iter().map(|component| component * component).sum::<f64>().sqrt();
     let normalize = |vector: [f64; 3]| {
@@ -4096,16 +4465,25 @@ fn interpolate_rotate_3d(
                 half_angle.cos(),
             ]
         };
-        let from_quaternion = to_quaternion(from_axis_normalized, from_angle);
+        let mut from_quaternion = to_quaternion(from_axis_normalized, from_angle);
         let to_quaternion = to_quaternion(to_axis_normalized, to_angle);
 
         // https://drafts.csswg.org/css-transforms-2/#interpolation-of-decomposed-3d-matrix-values
-        let product = from_quaternion
+        let mut product = from_quaternion
             .iter()
             .zip(to_quaternion)
             .map(|(from, to)| from * to)
             .sum::<f64>()
             .clamp(-1.0, 1.0);
+
+        // AD-HOC: The specification's slerp pseudocode interpolates the quaternions as given, but a
+        // quaternion and its negation represent the same rotation. A negative dot product means
+        // the interpolation would travel the long way around the sphere. Negate one input to take
+        // the shortest path, as other engines do.
+        if product < 0.0 {
+            from_quaternion = from_quaternion.map(|component| -component);
+            product = -product;
+        }
         let interpolated_quaternion = if product.abs() >= 1.0 {
             from_quaternion
         } else {
@@ -4132,6 +4510,9 @@ fn interpolate_rotate_3d(
         let angle = 2.0 * interpolated_quaternion[3].clamp(-1.0, 1.0).acos();
         if sin_half_angle >= epsilon {
             axis = axis.map(|component| component / sin_half_angle);
+        } else {
+            // The rotation angle is zero, so the axis is arbitrary.
+            axis = [0.0, 0.0, 1.0];
         }
         (axis, angle)
     };
@@ -5145,6 +5526,7 @@ fn interpolate_transform_list(
                     .collect(),
             );
             let transformation = interpolate_rotate_3d(
+                context,
                 *from_property,
                 transform_function,
                 &from_arguments,
@@ -5233,6 +5615,13 @@ fn animation_length_resolution_context(
         root_font_metrics: font_metrics(&animation_context.root_font_metrics),
         font_metrics_depend_on_viewport_metrics: animation_context.font_metrics_depend_on_viewport_metrics,
         root_font_metrics_depend_on_viewport_metrics: animation_context.root_font_metrics_depend_on_viewport_metrics,
+        has_container_width_basis: false,
+        has_container_height_basis: false,
+        container_width_basis: 0.0,
+        container_height_basis: 0.0,
+        container_width_basis_depends_on_viewport_metrics: false,
+        container_height_basis_depends_on_viewport_metrics: false,
+        subject_inline_axis_is_horizontal: true,
         resolved_viewport_relative_length: std::ptr::null_mut(),
     })
 }
@@ -5302,7 +5691,7 @@ fn resolve_animation_color(
     if current_color.is_null() {
         return None;
     }
-    let retained = unsafe { crate::css::style_value::rust_style_value_retain(current_color) };
+    let retained = unsafe { crate::css::style_value::retain_style_value(current_color) };
     Some(unsafe { RetainedStyleValueData::from_retained_pointer(retained) })
 }
 
@@ -5551,11 +5940,6 @@ fn interpolate_shadow_list(
         },
     })
 }
-
-const FILTER_KIND_BLUR: u8 = 0;
-const FILTER_KIND_DROP_SHADOW: u8 = 1;
-const FILTER_KIND_HUE_ROTATE: u8 = 2;
-const FILTER_KIND_COLOR: u8 = 3;
 
 fn retained_filter(kind: u8, color_operation: u8, value: RetainedStyleValueData) -> RetainedStyleValueData {
     let value = Arc::into_raw(Arc::new(StyleValueData::Filter {
@@ -6065,6 +6449,15 @@ pub(crate) fn interpolate_value(
     to: &StyleValueData,
     delta: f32,
 ) -> FfiAnimationValueResult {
+    if property_id == crate::css::property_metadata::property_id::CUSTOM {
+        // https://drafts.css-houdini.org/css-properties-values-api/#animation-behavior-of-custom-properties
+        // When referenced by animations and transitions, custom property values interpolate by computed value, in accordance with the type that they parsed as.
+        let result = interpolate_scalar_value(property_id, from, to, delta, &[]);
+        if !result.handled || result.value.is_null() && context.is_some_and(|context| context.allow_discrete) {
+            return discrete_value(context, from, to, delta);
+        }
+        return result;
+    }
     let animation_type = property_animation_type(property_id);
     if animation_type == ANIMATION_TYPE_NONE {
         // https://www.w3.org/TR/web-animations-1/#not-animatable
@@ -6072,7 +6465,7 @@ pub(crate) fn interpolate_value(
         // NB: Such values are normally filtered before evaluation. Preserve the C++ scalar API's
         //     existing endpoint behavior if one reaches this lower-level operation.
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(to) },
+            value: unsafe { crate::css::style_value::retain_style_value(to) },
             handled: true,
         };
     }
@@ -6294,7 +6687,7 @@ pub(crate) fn interpolate_value(
         }
     }
     if animation_type == ANIMATION_TYPE_CUSTOM && property_id == crate::css::property_metadata::property_id::ROTATE {
-        let result = interpolate_individual_rotate(from, to, delta);
+        let result = interpolate_individual_rotate(context, from, to, delta);
         if result.handled {
             return result;
         }
@@ -6443,6 +6836,7 @@ fn evaluate_animation_value(
         if start_keyframe.value.is_null() {
             return FfiAnimatedProperty {
                 property_id: input.property_id,
+                custom_name_id: input.custom_name_id,
                 value: std::ptr::null(),
                 progress,
                 start_index,
@@ -6453,7 +6847,8 @@ fn evaluate_animation_value(
         }
         return FfiAnimatedProperty {
             property_id: input.property_id,
-            value: unsafe { crate::css::style_value::rust_style_value_retain(start_keyframe.value) },
+            custom_name_id: input.custom_name_id,
+            value: unsafe { crate::css::style_value::retain_style_value(start_keyframe.value) },
             progress,
             start_index,
             end_index,
@@ -6476,6 +6871,7 @@ fn evaluate_animation_value(
     assert!(result.handled);
     FfiAnimatedProperty {
         property_id: input.property_id,
+        custom_name_id: input.custom_name_id,
         value: result.value,
         progress,
         start_index,
@@ -6485,71 +6881,682 @@ fn evaluate_animation_value(
     }
 }
 
-/// Resolve an element's keyframe declarations, request their computed values in one C++ batch,
-/// then evaluate and compose every animation interval without consulting C++ or the DOM again.
-///
-/// Computed values are requested in at most one callback. Results are written into caller-owned
-/// storage returned with the computed values, transferring every non-null result value.
+/// One effect an element samples: its description, and how far along it is on the scale the host
+/// keys keyframes by.
+pub(crate) struct SelectedEffect<'a> {
+    pub(crate) effect: &'a crate::css::style::effect_descriptions::PublishedEffect,
+    pub(crate) current_key: f64,
+}
+
+/// The custom-property stores the keyframes of an element being sampled read.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyframeStores {
+    /// The store the element holds now, which a keyframe's substitution reads, as the host's
+    /// resolver read it.
+    pub(crate) substitution: *const std::ffi::c_void,
+    /// The same beneath this sample's animations, which an animation composes over.
+    pub(crate) base: *const std::ffi::c_void,
+    /// The store of the element the sampled one inherits from, which a keyframe saying `inherit`
+    /// takes from.
+    pub(crate) inheritance: *const std::ffi::c_void,
+    /// Whether the element declares custom properties of its own, which may be important.
+    pub(crate) element_declares_custom_properties: bool,
+}
+
+impl KeyframeStores {
+    /// # Safety
+    /// `store` must be null or a live custom-property store.
+    unsafe fn store<'a>(
+        store: *const std::ffi::c_void,
+    ) -> Option<&'a crate::css::custom_properties::CustomPropertyStore> {
+        unsafe {
+            store
+                .cast::<crate::css::custom_properties::CustomPropertyStore>()
+                .as_ref()
+        }
+    }
+}
+
+/// The custom properties the effects an element samples declare, each minted into the number the
+/// animation core keys it by, with what the element's environment and the document's registry say
+/// of it.
+pub(crate) struct AnimatedCustomProperties {
+    stores: KeyframeStores,
+    names: Vec<crate::css::retained_fly_string::RetainedUtf16FlyString>,
+    units: Vec<Vec<u16>>,
+}
+
+type Registry = crate::css::custom_properties::CustomPropertyRegistry;
+
+impl AnimatedCustomProperties {
+    /// The number a name animates under, minting one where it is new.
+    fn mint(&mut self, name: &crate::css::retained_fly_string::RetainedUtf16FlyString) -> u32 {
+        if let Some(index) = self.names.iter().position(|minted| minted == name) {
+            return index as u32 + 1;
+        }
+        // SAFETY: the name owns one reference to a live fly string.
+        self.units
+            .push(match unsafe { ak::utf16_string_units(name.raw_word()) } {
+                ak::Utf16StringUnits::Ascii(bytes) => bytes.iter().map(|&unit| u16::from(unit)).collect(),
+                ak::Utf16StringUnits::Utf16(units) => units.to_vec(),
+            });
+        self.names.push(name.clone());
+        self.names.len() as u32
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    pub(crate) fn name(&self, name_id: u32) -> &crate::css::retained_fly_string::RetainedUtf16FlyString {
+        &self.names[name_id as usize - 1]
+    }
+
+    fn units(&self, name_id: u32) -> &[u16] {
+        &self.units[name_id as usize - 1]
+    }
+
+    /// Whether the element declares the name `!important` itself, which keeps an animation from
+    /// animating it.
+    fn is_important(&self, name_id: u32) -> bool {
+        let name_raw = self.name(name_id).raw();
+        self.stores.element_declares_custom_properties
+            && unsafe { KeyframeStores::store(self.stores.base) }.is_some_and(|store| {
+                store.declared_names.contains(&name_raw)
+                    && store.own_values.get(&name_raw).is_some_and(|entry| entry.important)
+            })
+    }
+
+    fn initial_value(&self, registry: &Registry, name_id: u32) -> RetainedStyleValueData {
+        registry.initial_value(self.units(name_id))
+    }
+
+    /// The value an animation of a name composes over: the element's own beneath this sample's
+    /// animations, and otherwise the initial value.
+    fn underlying_value(&self, registry: &Registry, name_id: u32) -> RetainedStyleValueData {
+        unsafe { KeyframeStores::store(self.stores.base) }
+            .and_then(|store| store.get(self.name(name_id).raw()))
+            .map_or_else(|| self.initial_value(registry, name_id), |entry| entry.value.clone())
+    }
+
+    /// What a keyframe saying `inherit` takes: the whole environment the element inherits from,
+    /// which makes `inherit` on a name registered `inherits: false` take the parent's value, and
+    /// otherwise the initial value.
+    fn inherited_value(&self, registry: &Registry, name_id: u32) -> RetainedStyleValueData {
+        unsafe { KeyframeStores::store(self.stores.inheritance) }
+            .and_then(|store| store.get(self.name(name_id).raw()))
+            .map_or_else(|| self.initial_value(registry, name_id), |entry| entry.value.clone())
+    }
+
+    /// The buffers the evaluation indexes by name number: what an animation of each name composes
+    /// over, and what a keyframe saying `initial` takes.
+    pub(crate) fn underlying_and_initial_values(
+        &self,
+        registry: &Registry,
+    ) -> (Vec<RetainedStyleValueData>, Vec<RetainedStyleValueData>) {
+        (1..=self.names.len() as u32)
+            .map(|name_id| {
+                (
+                    self.underlying_value(registry, name_id),
+                    self.initial_value(registry, name_id),
+                )
+            })
+            .unzip()
+    }
+
+    /// The computed value of one resolved custom-property declaration: the value its source names,
+    /// computed against a registration's syntax in the element's computation context, which is
+    /// what gives a registered name its typed interpolation, and as written otherwise.
+    pub(crate) fn computed_value(
+        &self,
+        registry: &Registry,
+        property: &FfiResolvedAnimationProperty,
+        finalization: &crate::css::custom_properties::CustomPropertyFinalization<'_>,
+    ) -> RetainedStyleValueData {
+        let name_id = property.custom_name_id;
+        let value = match property.value_source {
+            FfiAnimationSpecifiedValueSource::Inherited => self.inherited_value(registry, name_id),
+            FfiAnimationSpecifiedValueSource::Initial => self.initial_value(registry, name_id),
+            FfiAnimationSpecifiedValueSource::Underlying => self.underlying_value(registry, name_id),
+            // SAFETY: a resolved declaration's value is retained by the resolution's storage.
+            FfiAnimationSpecifiedValueSource::Value => unsafe {
+                RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
+                    property.value,
+                ))
+            },
+        };
+        if !registry.name_has_syntax(self.units(name_id)) {
+            return value;
+        }
+        registry
+            .finalize_custom_property_value(
+                unsafe { KeyframeStores::store(self.stores.inheritance) },
+                self.name(name_id).raw(),
+                self.units(name_id),
+                value,
+                finalization,
+            )
+            .map_or_else(|fallback| fallback, |(value, _)| value)
+    }
+}
+
+/// The declarations of the effects an element samples, resolved, and what resolving them read.
+pub(crate) struct PublishedAnimationDeclarations {
+    pub(crate) resolved: Box<ResolvedAnimationDeclarations>,
+    pub(crate) custom_properties: AnimatedCustomProperties,
+    /// The `SUBSTITUTION_MARK_*` bits of what the values and easings substituted against the
+    /// element held.
+    pub(crate) substitution_marks: u8,
+    /// The custom properties a substituted `style()` query read.
+    pub(crate) style_query_dependencies: Option<Box<crate::css::custom_properties::StyleQueryDependencies>>,
+}
+
+/// Substitute a keyframe value written as a token stream against an element, for the compositor,
+/// which offloads an animation only where the value is what a sample on the main thread would
+/// substitute it to: against the custom-property store the element holds now and the one it
+/// inherits from. Returns a retained value, guaranteed-invalid where the value does not
+/// substitute, or null where the engine knows no such element.
 ///
 /// # Safety
-/// `batch` and `callbacks` must point to live values. Their declaration and bitmap ranges and every
-/// input style value returned by `compute_values` must remain live for the call. Its result storage
-/// must have room for every input value, and C++ must adopt every non-null result after return.
+/// `style_engine` must point to a live style engine, each store must be null or live, and `value`
+/// must be a live style value.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_evaluate_animations(
-    batch: *const FfiAnimationBatch,
-    callbacks: *const FfiAnimationCallbacks,
-) -> usize {
-    crate::abort_on_panic(|| {
-        crate::css::ffi_stats::rust_style_ffi_note_animation_evaluation();
-        let batch = unsafe { &*batch };
-        let callbacks = unsafe { &*callbacks };
-        let declarations = unsafe { std::slice::from_raw_parts(batch.declarations, batch.declaration_count) };
-        let important_property_bitmap = unsafe {
-            std::slice::from_raw_parts(batch.important_property_bitmap, batch.important_property_bitmap_length)
+pub unsafe extern "C" fn rust_substitute_compositor_keyframe_value(
+    style_engine: crate::css::style::StyleEngineHandle,
+    style_node: u32,
+    pseudo_kind: u8,
+    custom_property_store: *const std::ffi::c_void,
+    inheritance_custom_property_store: *const std::ffi::c_void,
+    property_id: u16,
+    value: *const StyleValueData,
+) -> *const StyleValueData {
+    let engine = unsafe { style_engine.get() };
+    let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(style_node) else {
+        return std::ptr::null();
+    };
+    let pseudo = (pseudo_kind != crate::css::cascaded_properties::NO_PSEUDO_ELEMENT).then_some(pseudo_kind);
+    let written =
+        unsafe { RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(value)) };
+    // What a `style()` query reads is recorded when the main thread samples the same value.
+    let style_query_references = std::cell::RefCell::new(None);
+    let substituted = engine.substitute_keyframe_value(
+        node,
+        pseudo,
+        custom_property_store,
+        inheritance_custom_property_store,
+        property_id,
+        &[],
+        &written,
+        &style_query_references,
+    );
+    std::sync::Arc::into_raw(substituted.into_arc())
+}
+
+/// Resolve the declarations of the effects an element samples from their descriptions: each
+/// keyframe's easing and each value written as a token stream substituted against the element, a
+/// keyframe holding the element's own value given it, and every custom property minted into a
+/// number.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_published_animation_declarations(
+    engine: &crate::css::style::StyleEngine,
+    node: crate::css::style::tree::StyleNodeID,
+    pseudo: Option<u8>,
+    selected: &[SelectedEffect<'_>],
+    table: &crate::css::computed_longhand_table::ComputedLonghandTable,
+    stores: KeyframeStores,
+    writing_mode: u8,
+    direction: u8,
+    important_property_bitmap: &[u8],
+) -> PublishedAnimationDeclarations {
+    use crate::css::style::effect_descriptions::{PublishedValue, easing_from_computed_timing_function};
+    let registry = engine.custom_property_registry();
+    let mut custom_properties = AnimatedCustomProperties {
+        stores,
+        names: Vec::new(),
+        units: Vec::new(),
+    };
+    let substitution_marks = std::cell::Cell::new(0_u8);
+    let style_query_references = std::cell::RefCell::new(None);
+    let substitute = |property, root_name: &[u16], written: &RetainedStyleValueData| {
+        substitution_marks.set(substitution_marks.get() | substitution_marks_of(written.data()));
+        engine.substitute_keyframe_value(
+            node,
+            pseudo,
+            stores.substitution,
+            stores.inheritance,
+            property,
+            root_name,
+            written,
+            &style_query_references,
+        )
+    };
+    let mut keyframes = Vec::new();
+    let mut easings = Vec::new();
+    let mut effects = Vec::new();
+    let mut declarations = Vec::new();
+    let mut values = Vec::new();
+    let mut base_urls = Vec::new();
+    for selection in selected {
+        let effect = selection.effect;
+        let is_transition = effect.is_transition;
+        let style_sheet_resource_context = match &effect.resource_context {
+            None => FfiAnimationStyleSheetResourceContext {
+                base_url: std::ptr::null(),
+                base_url_length: 0,
+                has_value: false,
+                origin_clean: false,
+            },
+            Some(resource_context) => {
+                base_urls.push(std::sync::Arc::clone(&resource_context.base_url));
+                FfiAnimationStyleSheetResourceContext {
+                    base_url: resource_context.base_url.as_ptr(),
+                    base_url_length: resource_context.base_url.len(),
+                    has_value: true,
+                    origin_clean: resource_context.origin_clean,
+                }
+            }
         };
-        let resolved = resolve_animation_declarations(
-            declarations,
-            batch.writing_mode,
-            batch.direction,
-            important_property_bitmap,
-        );
-        if resolved.properties.is_empty() {
-            return 0;
+        let first_keyframe_index = keyframes.len();
+        for keyframe in &effect.keyframes {
+            let keyframe_index = keyframes.len();
+            keyframes.push((keyframe.key, keyframe.composite));
+            // A keyframe's own easing written as a value substitutes against the element; one that
+            // resolves to no easing runs its animation's.
+            let substituted_easing = keyframe.easing_value.as_ref().and_then(|written| {
+                let substituted;
+                let mut value = written.data();
+                if matches!(value, StyleValueData::Unresolved { .. }) {
+                    substituted = substitute(
+                        crate::css::property_metadata::property_id::ANIMATION_TIMING_FUNCTION,
+                        &[],
+                        written,
+                    );
+                    value = substituted.data();
+                }
+                if let StyleValueData::ValueList { values, .. } = value {
+                    value = values.as_slice().first()?.data();
+                }
+                easing_from_computed_timing_function(value)
+            });
+            easings.push(substituted_easing.unwrap_or_else(|| keyframe.easing.clone()));
+            for declaration in effect.declarations_of(keyframe) {
+                let (value, use_initial) = match &declaration.value {
+                    PublishedValue::ElementValue => {
+                        let Some(value) = table.get(declaration.property_id) else {
+                            continue;
+                        };
+                        (value.clone_retained(), true)
+                    }
+                    PublishedValue::Declared(value) => match value.data() {
+                        StyleValueData::Unresolved { .. } => {
+                            let value = substitute(declaration.property_id, &[], value);
+                            // https://drafts.csswg.org/css-values-5/#invalid-at-computed-value-time
+                            if matches!(value.data(), StyleValueData::GuaranteedInvalid) {
+                                continue;
+                            }
+                            (value, false)
+                        }
+                        _ => (value.clone_retained(), false),
+                    },
+                };
+                declarations.push(FfiAnimationDeclaration {
+                    keyframe_index,
+                    property_id: declaration.property_id,
+                    custom_name_id: 0,
+                    custom_is_inherited: false,
+                    custom_is_important: false,
+                    value: value.pointer(),
+                    style_sheet_resource_context,
+                    use_initial,
+                    is_transition,
+                });
+                values.push(value);
+            }
+            for declaration in effect.custom_declarations_of(keyframe) {
+                let name_id = custom_properties.mint(&declaration.name);
+                let (value, use_initial) = match &declaration.value {
+                    PublishedValue::ElementValue => (custom_properties.underlying_value(registry, name_id), true),
+                    // A custom property's value is a token stream; only the substitution functions
+                    // in it resolve against the element.
+                    PublishedValue::Declared(value) if holds_arbitrary_substitution(value.data()) => (
+                        substitute(
+                            crate::css::property_metadata::property_id::CUSTOM,
+                            custom_properties.units(name_id),
+                            value,
+                        ),
+                        false,
+                    ),
+                    PublishedValue::Declared(value) => (value.clone_retained(), false),
+                };
+                declarations.push(FfiAnimationDeclaration {
+                    keyframe_index,
+                    property_id: crate::css::property_metadata::property_id::CUSTOM,
+                    custom_name_id: name_id,
+                    custom_is_inherited: registry.name_inherits(custom_properties.units(name_id)),
+                    custom_is_important: custom_properties.is_important(name_id),
+                    value: value.pointer(),
+                    style_sheet_resource_context,
+                    use_initial,
+                    is_transition,
+                });
+                values.push(value);
+            }
         }
-        crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::AnimationComputeBatchCallback);
-        let computed = unsafe {
-            (callbacks.compute_values)(
-                callbacks.context,
-                resolved.properties.as_ptr(),
-                resolved.properties.len(),
+        effects.push(FfiAnimationEffect {
+            first_keyframe_index,
+            keyframe_count: keyframes.len() - first_keyframe_index,
+            current_key: selection.current_key,
+            result_of_transition: is_transition,
+        });
+    }
+    let keyframes = keyframes
+        .iter()
+        .zip(&easings)
+        .map(|(&(key, composite), easing)| FfiAnimationKeyframe {
+            key,
+            easing: easing_descriptor(easing),
+            composite,
+        })
+        .collect::<Vec<_>>();
+    let mut resolved = resolve_animation_declarations(
+        &declarations,
+        &effects,
+        &keyframes,
+        writing_mode,
+        direction,
+        important_property_bitmap,
+    );
+    resolved._base_urls = base_urls;
+    PublishedAnimationDeclarations {
+        resolved: Box::new(resolved),
+        custom_properties,
+        substitution_marks: substitution_marks.get(),
+        style_query_dependencies: style_query_references.into_inner(),
+    }
+}
+
+/// Whether a token stream holds an arbitrary-substitution function, which resolves against the
+/// element: the host's `UnresolvedStyleValue::contains_arbitrary_substitution_function`.
+fn holds_arbitrary_substitution(value: &StyleValueData) -> bool {
+    matches!(
+        value,
+        StyleValueData::Unresolved {
+            presence_attr,
+            presence_dashed_function,
+            presence_env,
+            presence_if,
+            presence_inherit,
+            presence_var,
+            ..
+        } if *presence_attr || *presence_dashed_function || *presence_env || *presence_if || *presence_inherit || *presence_var
+    )
+}
+
+/// A descriptor borrowing an easing's control points.
+fn easing_descriptor(easing: &crate::css::easing::Easing) -> FfiEasingDescriptor {
+    use crate::css::easing::Easing;
+    let (linear_points, linear_point_count) = match easing {
+        Easing::Linear(points) => (points.as_ptr(), points.len()),
+        _ => (std::ptr::null(), 0),
+    };
+    let (x1, y1, x2, y2) = match *easing {
+        Easing::CubicBezier { x1, y1, x2, y2 } => (x1, y1, x2, y2),
+        _ => (0.0, 0.0, 0.0, 0.0),
+    };
+    let (interval_count, step_position) = match *easing {
+        Easing::Steps {
+            interval_count,
+            position,
+        } => (interval_count, position),
+        _ => (0, 0),
+    };
+    FfiEasingDescriptor {
+        kind: easing.kind(),
+        linear_points,
+        linear_point_count,
+        x1,
+        y1,
+        x2,
+        y2,
+        interval_count,
+        step_position,
+    }
+}
+
+struct AnimationPreparationKey {
+    effects: Box<[FfiAnimationPreparationEffect]>,
+    /// The custom-property environments a preparation that substituted keyframe values against the
+    /// element was made under, which it holds for only as long as they stand.
+    custom_property_environments: Option<[u64; 2]>,
+}
+
+impl AnimationPreparationKey {
+    fn matches(&self, sampled: &[FfiSampledAnimationEffect], custom_property_environments: [u64; 2]) -> bool {
+        self.effects.len() == sampled.len()
+            && self
+                .effects
+                .iter()
+                .zip(sampled)
+                .all(|(effect, sampled)| *effect == sampled.effect)
+            && self
+                .custom_property_environments
+                .is_none_or(|environments| environments == custom_property_environments)
+    }
+}
+
+pub(crate) struct PreparedAnimationBatch {
+    key: AnimationPreparationKey,
+    resolved: ResolvedAnimationDeclarations,
+    // Retain the allocations referenced by `keyframes_by_value`.
+    _computed_keyframe_values: Vec<RetainedStyleValueData>,
+    keyframes_by_value: Vec<Vec<FfiAnimationKeyframeValue>>,
+    context: FfiAnimationContext,
+}
+
+// SAFETY: A prepared batch is built once and never mutated: sampling reads its plans and copies
+// its context. The raw `*const StyleValueData` pointers it holds all name immutable style values
+// whose reference counts are `Arc`s, retained for the batch's lifetime by `_computed_keyframe_values`
+// and the resolved declarations' own retained values. An animated overlay caches one behind an
+// `Arc`, and an installed overlay is reachable from the computed catalog that every evaluation
+// worker borrows; nothing but the animation round, which runs on the engine's thread between
+// evaluation passes, ever constructs, replaces or reads one.
+unsafe impl Send for PreparedAnimationBatch {}
+unsafe impl Sync for PreparedAnimationBatch {}
+
+/// Whether an animated overlay already holds the endpoint preparation for the `sampled` effects
+/// under the custom-property environments a sample reads.
+pub(crate) fn animation_preparation_matches(
+    overlay: Option<&crate::css::animated_overlay::AnimatedOverlay>,
+    sampled: &[FfiSampledAnimationEffect],
+    custom_property_environments: [u64; 2],
+) -> bool {
+    overlay
+        .and_then(|overlay| overlay.animation_preparation.as_ref())
+        .is_some_and(|preparation| preparation.key.matches(sampled, custom_property_environments))
+}
+
+/// Complete the Rust-owned animation plan and compose every interval without
+/// consulting C++ or the DOM. On the first sample this consumes the Rust allocations produced by
+/// declaration resolution and keyframe longhand computation. Later samples can reuse that
+/// preparation from the animated overlay.
+///
+/// # Safety
+/// `computed` must point to a live batch. Its range of sampled effects must be readable. On a cache miss both storage pointers must be live, unconsumed results from their
+/// producing calls. `underlying_longhand_table` and `overlay` must point at live values, and the
+/// overlay must be uniquely owned for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_evaluate_animations(computed: *const FfiComputedAnimationBatch) -> usize {
+    crate::css::ffi_stats::rust_style_ffi_note_animation_evaluation();
+    let computed = unsafe { &*computed };
+    assert!(!computed.underlying_longhand_table.is_null());
+    assert!(!computed.overlay.is_null());
+    let sampled = unsafe { std::slice::from_raw_parts(computed.sampled_effects, computed.sampled_effect_count) };
+    let overlay = unsafe { &mut *computed.overlay.cast::<crate::css::animated_overlay::AnimatedOverlay>() };
+    let preparation = overlay
+        .animation_preparation
+        .as_ref()
+        .filter(|preparation| preparation.key.matches(sampled, computed.custom_property_environments))
+        .cloned()
+        .unwrap_or_else(|| {
+            assert!(!computed.resolved_animation_storage.is_null());
+            assert!(!computed.computed_keyframe_storage.is_null());
+            let resolved = *unsafe {
+                Box::from_raw(
+                    computed
+                        .resolved_animation_storage
+                        .cast::<ResolvedAnimationDeclarations>(),
+                )
+            };
+            let computed_keyframe_values = unsafe {
+                crate::css::style_compute::take_animation_keyframe_longhand_values(computed.computed_keyframe_storage)
+            };
+            assert_eq!(computed_keyframe_values.len(), resolved.properties.len());
+            let keyframes_by_value = resolved
+                .value_plans
+                .iter()
+                .map(|plan| {
+                    plan.property_indices
+                        .iter()
+                        .map(|&property_index| {
+                            let property = &resolved.properties[property_index];
+                            let keyframe = &resolved.keyframes[property.keyframe_index];
+                            FfiAnimationKeyframeValue {
+                                key: keyframe.key,
+                                value: computed_keyframe_values[property_index].pointer(),
+                                easing: keyframe.easing_descriptor(),
+                                composite: keyframe.composite,
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            std::sync::Arc::new(PreparedAnimationBatch {
+                key: AnimationPreparationKey {
+                    effects: sampled.iter().map(|sampled| sampled.effect).collect(),
+                    custom_property_environments: computed
+                        .preparation_reads_custom_property_environments
+                        .then_some(computed.custom_property_environments),
+                },
+                resolved,
+                _computed_keyframe_values: computed_keyframe_values,
+                keyframes_by_value,
+                context: computed.context,
+            })
+        });
+    if computed.cache_preparation {
+        overlay.animation_preparation = Some(preparation.clone());
+    } else {
+        overlay.animation_preparation = None;
+    }
+    let resolved = &preparation.resolved;
+    let mut context = preparation.context;
+    context.current_color = computed.context.current_color;
+    context.has_transform_reference_box = computed.context.has_transform_reference_box;
+    context.transform_reference_box_width = computed.context.transform_reference_box_width;
+    context.transform_reference_box_height = computed.context.transform_reference_box_height;
+    let underlying_longhand_table = unsafe {
+        &*computed
+            .underlying_longhand_table
+            .cast::<crate::css::computed_longhand_table::ComputedLonghandTable>()
+    };
+
+    // https://www.w3.org/TR/web-animations-1/#effect-stacks
+    // NB: Inputs arrive in composite order. Keep each result as the underlying value for the
+    //     next effect affecting the same property.
+    let mut custom_final_values = Vec::<(u32, RetainedStyleValueData)>::new();
+    let mut previous_values = Vec::<(u16, u32, *const StyleValueData)>::with_capacity(resolved.value_plans.len());
+    for (plan, keyframes) in resolved.value_plans.iter().zip(&preparation.keyframes_by_value) {
+        assert!(plan.effect_index < sampled.len());
+        let (underlying, initial) = if plan.custom_name_id != 0 {
+            let custom_index = (plan.custom_name_id - 1) as usize;
+            assert!(custom_index < computed.custom_value_count);
+            (
+                unsafe { *computed.custom_underlying_values.add(custom_index) },
+                unsafe { *computed.custom_initial_values.add(custom_index) },
+            )
+        } else {
+            let underlying = underlying_longhand_table
+                .get(plan.property_id)
+                .expect("an animated longhand must have an underlying computed value");
+            (
+                underlying.pointer(),
+                crate::css::style_compute::initial_value_data(plan.property_id),
             )
         };
-        if computed.value_count == 0 {
-            return 0;
+        let input = FfiAnimationValueInput {
+            property_id: plan.property_id,
+            custom_name_id: plan.custom_name_id,
+            result_of_transition: plan.result_of_transition,
+            underlying,
+            initial,
+            current_key: sampled[plan.effect_index].current_key,
+            keyframes: keyframes.as_ptr(),
+            keyframe_count: keyframes.len(),
+        };
+        let previous_value = previous_values
+            .iter()
+            .rev()
+            .find(|(property_id, custom_name_id, _)| {
+                *property_id == input.property_id && *custom_name_id == input.custom_name_id
+            })
+            .map(|(_, _, value)| unsafe { &**value });
+        let result = evaluate_animation_value(&context, &input, previous_value);
+        if !result.apply {
+            assert!(result.value.is_null());
+            continue;
         }
-        let inputs = unsafe { std::slice::from_raw_parts(computed.values, computed.value_count) };
-        assert!(computed.result_capacity >= inputs.len());
-        assert!(!computed.results.is_null());
-
-        // https://www.w3.org/TR/web-animations-1/#effect-stacks
-        // NB: Inputs arrive in composite order. Keep each result as the underlying value for the
-        //     next effect affecting the same property.
-        let mut previous_values = Vec::<(u16, *const StyleValueData)>::new();
-        for (index, input) in inputs.iter().enumerate() {
-            let previous_value = previous_values
-                .iter()
-                .rev()
-                .find(|(property_id, _)| *property_id == input.property_id)
-                .map(|(_, value)| unsafe { &**value });
-            let result = evaluate_animation_value(&computed.context, input, previous_value);
-            if result.apply && !result.value.is_null() {
-                previous_values.push((input.property_id, result.value));
+        if input.custom_name_id != 0 {
+            if !result.value.is_null() {
+                previous_values.push((input.property_id, input.custom_name_id, result.value));
+                custom_final_values.push((input.custom_name_id, unsafe {
+                    RetainedStyleValueData::from_retained_pointer(result.value)
+                }));
             }
-            unsafe { computed.results.add(index).write(result) };
+            continue;
         }
-        inputs.len()
-    })
+        if !result.value.is_null() {
+            previous_values.push((input.property_id, input.custom_name_id, result.value));
+            let value = unsafe { RetainedStyleValueData::from_retained_pointer(result.value) };
+            overlay.set_owned(input.property_id, value, false, input.result_of_transition);
+        } else {
+            let value = RetainedStyleValueData::from_owned(StyleValueData::Keyword {
+                keyword: crate::css::css_enums::keyword::HIDDEN,
+            });
+            overlay.set_owned(
+                crate::css::property_metadata::property_id::VISIBILITY,
+                value,
+                false,
+                input.result_of_transition,
+            );
+        }
+    }
+    if !custom_final_values.is_empty() {
+        assert!(!computed.custom_results.is_null());
+        assert!(!computed.custom_result_count.is_null());
+        let mut final_by_name = std::collections::BTreeMap::<u32, RetainedStyleValueData>::new();
+        for (custom_name_id, value) in custom_final_values {
+            final_by_name.insert(custom_name_id, value);
+        }
+        let mut written = 0;
+        for (custom_name_id, value) in final_by_name {
+            assert!(written < computed.custom_value_count);
+            let pointer = value.pointer();
+            std::mem::forget(value);
+            unsafe {
+                computed.custom_results.add(written).write(FfiAnimatedCustomProperty {
+                    custom_name_id,
+                    value: pointer,
+                });
+            }
+            written += 1;
+        }
+        unsafe { computed.custom_result_count.write(written) };
+    }
+    resolved.value_plans.len()
 }
 
 /// Attempt Rust-owned style value interpolation without consulting C++ or the DOM.
@@ -6565,15 +7572,13 @@ pub unsafe extern "C" fn rust_interpolate_scalar_style_value(
     to: *const StyleValueData,
     delta: f32,
 ) -> FfiAnimationValueResult {
-    crate::abort_on_panic(|| {
-        interpolate_value(
-            unsafe { context.as_ref() },
-            property_id,
-            unsafe { &*from },
-            unsafe { &*to },
-            delta,
-        )
-    })
+    interpolate_value(
+        unsafe { context.as_ref() },
+        property_id,
+        unsafe { &*from },
+        unsafe { &*to },
+        delta,
+    )
 }
 
 /// Test-only bridge for exercising Rust-owned style value composition without constructing an
@@ -6587,7 +7592,7 @@ pub unsafe extern "C" fn rust_test_composite_style_value(
     animated: *const StyleValueData,
     operation: FfiCompositeOperation,
 ) -> FfiAnimationValueResult {
-    crate::abort_on_panic(|| composite_scalar_value(unsafe { &*underlying }, unsafe { &*animated }, operation))
+    composite_scalar_value(unsafe { &*underlying }, unsafe { &*animated }, operation)
 }
 
 #[cfg(test)]
@@ -6603,49 +7608,69 @@ mod tests {
         };
         let candidates = [
             AnimationPropertyConflictCandidate {
+                custom_name_id: 0,
+                custom_is_inherited: false,
                 keyframe_index: 0,
                 physical_property_id: property_id::BORDER_TOP_COLOR,
                 source_property_id: property_id::BORDER,
                 source_longhand_id: property_id::BORDER_TOP_COLOR,
                 value: value(),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
                 use_initial: false,
                 suppressed_by_important: false,
+                is_transition: false,
             },
             AnimationPropertyConflictCandidate {
+                custom_name_id: 0,
+                custom_is_inherited: false,
                 keyframe_index: 0,
                 physical_property_id: property_id::BORDER_TOP_COLOR,
                 source_property_id: property_id::BORDER_TOP,
                 source_longhand_id: property_id::BORDER_TOP_COLOR,
                 value: value(),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
                 use_initial: false,
                 suppressed_by_important: false,
+                is_transition: false,
             },
             AnimationPropertyConflictCandidate {
+                custom_name_id: 0,
+                custom_is_inherited: false,
                 keyframe_index: 0,
                 physical_property_id: property_id::BORDER_TOP_COLOR,
                 source_property_id: property_id::BORDER_TOP_COLOR,
                 source_longhand_id: property_id::BORDER_TOP_COLOR,
                 value: value(),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
                 use_initial: false,
                 suppressed_by_important: false,
+                is_transition: false,
             },
             AnimationPropertyConflictCandidate {
+                custom_name_id: 0,
+                custom_is_inherited: false,
                 keyframe_index: 0,
                 physical_property_id: property_id::BORDER_TOP_COLOR,
                 source_property_id: property_id::BORDER_TOP_COLOR,
                 source_longhand_id: property_id::BORDER_TOP_COLOR,
                 value: value(),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
                 use_initial: true,
                 suppressed_by_important: false,
+                is_transition: false,
             },
             AnimationPropertyConflictCandidate {
+                custom_name_id: 0,
+                custom_is_inherited: false,
                 keyframe_index: 1,
                 physical_property_id: property_id::BORDER_TOP_COLOR,
                 source_property_id: property_id::BORDER,
                 source_longhand_id: property_id::BORDER_TOP_COLOR,
                 value: value(),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
                 use_initial: true,
                 suppressed_by_important: false,
+                is_transition: false,
             },
         ];
         let mut selected = [false; 5];
@@ -6661,29 +7686,123 @@ mod tests {
         let keyword_value = |keyword| StyleValueData::Keyword { keyword };
 
         assert_eq!(
-            animation_specified_value_source(&keyword_value(keyword::INHERIT), property_id::MARGIN_LEFT),
+            animation_specified_value_source(
+                &keyword_value(keyword::INHERIT),
+                crate::css::property_metadata::property_is_inherited(property_id::MARGIN_LEFT)
+            ),
             FfiAnimationSpecifiedValueSource::Inherited
         );
         assert_eq!(
-            animation_specified_value_source(&keyword_value(keyword::UNSET), property_id::COLOR),
+            animation_specified_value_source(
+                &keyword_value(keyword::UNSET),
+                crate::css::property_metadata::property_is_inherited(property_id::COLOR)
+            ),
             FfiAnimationSpecifiedValueSource::Inherited
         );
         assert_eq!(
-            animation_specified_value_source(&keyword_value(keyword::UNSET), property_id::MARGIN_LEFT),
+            animation_specified_value_source(
+                &keyword_value(keyword::UNSET),
+                crate::css::property_metadata::property_is_inherited(property_id::MARGIN_LEFT)
+            ),
             FfiAnimationSpecifiedValueSource::Initial
         );
         assert_eq!(
-            animation_specified_value_source(&keyword_value(keyword::INITIAL), property_id::COLOR),
+            animation_specified_value_source(
+                &keyword_value(keyword::INITIAL),
+                crate::css::property_metadata::property_is_inherited(property_id::COLOR)
+            ),
             FfiAnimationSpecifiedValueSource::Initial
         );
         assert_eq!(
-            animation_specified_value_source(&keyword_value(keyword::REVERT), property_id::COLOR),
+            animation_specified_value_source(
+                &keyword_value(keyword::REVERT),
+                crate::css::property_metadata::property_is_inherited(property_id::COLOR)
+            ),
             FfiAnimationSpecifiedValueSource::Underlying
         );
         assert_eq!(
-            animation_specified_value_source(&keyword_value(keyword::REVERT_LAYER), property_id::COLOR),
+            animation_specified_value_source(
+                &keyword_value(keyword::REVERT_LAYER),
+                crate::css::property_metadata::property_is_inherited(property_id::COLOR)
+            ),
             FfiAnimationSpecifiedValueSource::Underlying
         );
+    }
+
+    #[test]
+    fn builds_property_specific_animation_plans() {
+        use crate::css::property_metadata::property_id;
+
+        let values = [
+            Arc::new(StyleValueData::Number { value: 0.0 }),
+            Arc::new(StyleValueData::Number { value: 0.5 }),
+            Arc::new(StyleValueData::Number { value: 1.0 }),
+        ];
+        let declarations = [
+            FfiAnimationDeclaration {
+                custom_name_id: 0,
+                custom_is_inherited: false,
+                custom_is_important: false,
+                keyframe_index: 0,
+                property_id: property_id::OPACITY,
+                value: Arc::as_ptr(&values[0]),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
+                use_initial: false,
+                is_transition: false,
+            },
+            FfiAnimationDeclaration {
+                custom_name_id: 0,
+                custom_is_inherited: false,
+                custom_is_important: false,
+                keyframe_index: 1,
+                property_id: property_id::COLOR,
+                value: Arc::as_ptr(&values[1]),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
+                use_initial: false,
+                is_transition: false,
+            },
+            FfiAnimationDeclaration {
+                custom_name_id: 0,
+                custom_is_inherited: false,
+                custom_is_important: false,
+                keyframe_index: 2,
+                property_id: property_id::OPACITY,
+                value: Arc::as_ptr(&values[2]),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
+                use_initial: false,
+                is_transition: false,
+            },
+        ];
+        let easing = || FfiEasingDescriptor {
+            kind: FfiEasingKind::Linear,
+            linear_points: std::ptr::null(),
+            linear_point_count: 0,
+            x1: 0.0,
+            y1: 0.0,
+            x2: 0.0,
+            y2: 0.0,
+            interval_count: 0,
+            step_position: 0,
+        };
+        let keyframes = [0, 50, 100].map(|key| FfiAnimationKeyframe {
+            key,
+            easing: easing(),
+            composite: FfiCompositeOperation::Replace,
+        });
+        let effects = [FfiAnimationEffect {
+            first_keyframe_index: 0,
+            keyframe_count: keyframes.len(),
+            current_key: 50.0,
+            result_of_transition: false,
+        }];
+
+        let resolved = resolve_animation_declarations(&declarations, &effects, &keyframes, 0, 0, &[]);
+        assert_eq!(resolved.value_plans.len(), 1);
+        let plan = &resolved.value_plans[0];
+        assert_eq!(plan.property_id, property_id::OPACITY);
+        assert_eq!(plan.property_indices.len(), 2);
+        assert_eq!(resolved.properties[plan.property_indices[0]].keyframe_index, 0);
+        assert_eq!(resolved.properties[plan.property_indices[1]].keyframe_index, 2);
     }
 
     #[test]
@@ -6695,11 +7814,15 @@ mod tests {
         let declaration = FfiAnimationDeclaration {
             keyframe_index: 0,
             property_id: crate::css::property_metadata::property_id::BORDER,
+            custom_name_id: 0,
+            custom_is_inherited: false,
+            custom_is_important: false,
             value: &raw const *pending,
+            style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
             use_initial: false,
             is_transition: false,
         };
-        let resolved = resolve_animation_declarations(&[declaration], 0, 0, &[]);
+        let resolved = resolve_animation_declarations(&[declaration], &[], &[], 0, 0, &[]);
         assert!(!resolved.properties.is_empty());
         let mut found_synthesized = false;
         for property in &resolved.properties {
@@ -6778,37 +7901,39 @@ mod tests {
     }
 
     #[test]
-    fn evaluates_linear_easing() {
+    fn constructs_easing_values_without_child_wrappers() {
         let points = [
             FfiLinearEasingPoint {
                 input: 0.0,
                 output: 0.0,
             },
             FfiLinearEasingPoint {
-                input: 0.0,
-                output: 0.5,
-            },
-            FfiLinearEasingPoint {
                 input: 1.0,
                 output: 1.0,
             },
         ];
-        assert_eq!(evaluate_linear_easing(&points, 0.0, true), 0.0);
-        assert_eq!(evaluate_linear_easing(&points, 0.0, false), 0.5);
-        assert_eq!(evaluate_linear_easing(&points, 0.5, false), 0.75);
-    }
-
-    #[test]
-    fn evaluates_cubic_bezier_easing() {
-        assert!((evaluate_cubic_bezier_easing(0.42, 0.0, 0.58, 1.0, 0.5) - 0.5).abs() < 1e-7);
-        assert_eq!(evaluate_cubic_bezier_easing(0.5, 1.0, 1.0, 1.0, -0.5), -1.0);
-    }
-
-    #[test]
-    fn evaluates_steps_easing() {
-        assert_eq!(evaluate_steps_easing(4, 1, 0.5, false), 0.5);
-        assert_eq!(evaluate_steps_easing(4, 1, 0.5, true), 0.25);
-        assert_eq!(evaluate_steps_easing(4, STEP_POSITION_JUMP_START, 0.0, false), 0.25);
+        for (kind, expected) in [
+            (FfiEasingKind::Linear, "linear(0 0%, 1 100%)"),
+            (FfiEasingKind::CubicBezier, "cubic-bezier(0, 0, 1, 1)"),
+            (FfiEasingKind::Steps, "steps(4)"),
+        ] {
+            let descriptor = FfiEasingDescriptor {
+                kind,
+                linear_points: points.as_ptr(),
+                linear_point_count: points.len(),
+                x1: 0.0,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 1.0,
+                interval_count: 4,
+                step_position: 1,
+            };
+            let value = unsafe { Arc::from_raw(rust_style_value_from_easing(&descriptor)) };
+            assert_eq!(
+                crate::css::serialize::serialize_style_value_to_utf16(&value).unwrap(),
+                expected.encode_utf16().collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
@@ -6850,6 +7975,8 @@ mod tests {
         ];
         let input = FfiAnimationValueInput {
             property_id: crate::css::property_metadata::property_id::FLEX_GROW,
+            custom_name_id: 0,
+            result_of_transition: false,
             underlying: &raw const underlying,
             initial: &raw const underlying,
             current_key: 75.0,
@@ -6900,6 +8027,8 @@ mod tests {
             ];
             let input = FfiAnimationValueInput {
                 property_id: crate::css::property_metadata::property_id::FLEX_GROW,
+                custom_name_id: 0,
+                result_of_transition: false,
                 underlying: Arc::as_ptr(&underlying),
                 initial: Arc::as_ptr(&initial),
                 current_key: 50.0,
@@ -6957,12 +8086,12 @@ mod tests {
         let result = interpolate_value(Some(&animation_context(true)), property_id, &from, &to, 0.25);
         assert!(result.handled);
         assert_eq!(result.value, Arc::as_ptr(&from));
-        unsafe { crate::css::style_value::rust_style_value_release(result.value) };
+        unsafe { crate::css::style_value::release_style_value(result.value) };
 
         let result = interpolate_value(Some(&animation_context(true)), property_id, &from, &to, 0.75);
         assert!(result.handled);
         assert_eq!(result.value, Arc::as_ptr(&to));
-        unsafe { crate::css::style_value::rust_style_value_release(result.value) };
+        unsafe { crate::css::style_value::release_style_value(result.value) };
 
         let result = interpolate_value(Some(&animation_context(false)), property_id, &from, &to, 0.75);
         assert!(result.handled);
@@ -7091,6 +8220,7 @@ mod tests {
             retained_angle(180.0),
         ]);
         let result = interpolate_rotate_3d(
+            None,
             crate::css::property_metadata::property_id::TRANSFORM,
             0,
             &from,

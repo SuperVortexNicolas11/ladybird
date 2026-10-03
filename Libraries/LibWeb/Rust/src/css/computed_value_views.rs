@@ -11,29 +11,24 @@
 
 use crate::css::calc;
 use crate::css::computed_value_types::{
-    AlignmentValues, BorderLayoutFacts, BoxValues, ComputedAspectRatio, ComputedGap, ComputedLengthPercentageOrAuto,
-    ComputedSize, ComputedSizeKind, ComputedStyleValueHandle, FontLayoutFacts, GridValues, InheritedTextLayoutFacts,
-    STYLE_GROUP_INDEX_ALIGNMENT, STYLE_GROUP_INDEX_BORDER, STYLE_GROUP_INDEX_BOX, STYLE_GROUP_INDEX_FONT,
-    STYLE_GROUP_INDEX_GRID, STYLE_GROUP_INDEX_INHERITED_BOX, STYLE_GROUP_INDEX_INHERITED_TABLE,
-    STYLE_GROUP_INDEX_INHERITED_TEXT, STYLE_GROUP_INDEX_SIZING, STYLE_GROUP_INDEX_SURROUND,
-    STYLE_GROUP_INDEX_SVG_RESET, SVGResetValues, SizingValues, SurroundValues,
+    AlignmentValues, AnchorValues, BackgroundValues, BorderLayoutFacts, BorderValues, BoxValues, ComputedAspectRatio,
+    ComputedGap, ComputedLengthPercentageOrAuto, ComputedSize, ComputedSizeKind, ComputedStyleValueHandle,
+    ContentValues, EffectsValues, FontValues, GridValues, InheritedListValues, InheritedSVGValues,
+    InheritedTextLayoutFacts, InheritedTextValues, InheritedUIValues, MaskValues, MiscResetValues,
+    STYLE_GROUP_INDEX_ALIGNMENT, STYLE_GROUP_INDEX_ANCHOR, STYLE_GROUP_INDEX_BACKGROUND, STYLE_GROUP_INDEX_BORDER,
+    STYLE_GROUP_INDEX_BOX, STYLE_GROUP_INDEX_CONTENT, STYLE_GROUP_INDEX_EFFECTS, STYLE_GROUP_INDEX_FONT,
+    STYLE_GROUP_INDEX_GRID, STYLE_GROUP_INDEX_INHERITED_BOX, STYLE_GROUP_INDEX_INHERITED_LIST,
+    STYLE_GROUP_INDEX_INHERITED_SVG, STYLE_GROUP_INDEX_INHERITED_TABLE, STYLE_GROUP_INDEX_INHERITED_TEXT,
+    STYLE_GROUP_INDEX_INHERITED_UI, STYLE_GROUP_INDEX_MASK, STYLE_GROUP_INDEX_MISC_RESET, STYLE_GROUP_INDEX_SIZING,
+    STYLE_GROUP_INDEX_SURROUND, STYLE_GROUP_INDEX_SVG_RESET, STYLE_GROUP_INDEX_TEXT_RESET, STYLE_GROUP_INDEX_TRANSFORM,
+    SVGResetValues, SizingValues, SurroundValues, TextResetValues, TransformValues,
 };
 use crate::css::computed_values::{InheritedBoxValues, InheritedTableValues};
+use crate::css::css_enums::{direction, writing_mode};
 use crate::css::css_pixels::CssPixels;
 use crate::css::display::FfiDisplay;
 use crate::css::style_value::StyleValueData;
 use std::ffi::c_void;
-
-/// The used-value truncation the C++ layout engine applies when resolving
-/// percentages: truncate toward zero at 1/64 precision, collapse NaN to zero,
-/// and saturate the raw value.
-pub(crate) fn truncated_css_pixels(value: f64) -> CssPixels {
-    if value.is_nan() {
-        return CssPixels::default();
-    }
-    let raw = (value * 64.0).trunc();
-    CssPixels::from_raw(raw.clamp(i32::MIN as f64, i32::MAX as f64) as i32)
-}
 
 pub(crate) fn px_calc_resolution_context(percentage_basis: CssPixels) -> calc::FfiCalcResolutionContext {
     calc::FfiCalcResolutionContext {
@@ -46,14 +41,16 @@ pub(crate) fn px_calc_resolution_context(percentage_basis: CssPixels) -> calc::F
     }
 }
 
-pub(crate) fn resolve_calc_to_px(calculated: *const c_void, percentage_basis: CssPixels) -> CssPixels {
+pub(crate) fn resolve_calc_to_px_without_rounding(calculated: *const c_void, percentage_basis: CssPixels) -> f64 {
     assert!(!calculated.is_null());
-    let context = px_calc_resolution_context(percentage_basis);
-    // SAFETY: The style value stays alive for the pass and the context
-    // carries no host callbacks.
-    let result = unsafe { calc::rust_calc_resolve(calculated, &raw const context, true) };
-    assert!(result.resolved);
-    CssPixels::nearest_value_for(result.value)
+    // SAFETY: The style value stays alive for the pass.
+    let value = unsafe { &*calculated.cast::<StyleValueData>() };
+    crate::css::calc::resolve_calculated_length_without_context(value, percentage_basis.to_double())
+        .expect("computed length-percentage calc failed to resolve")
+}
+
+pub(crate) fn resolve_calc_to_px(calculated: *const c_void, percentage_basis: CssPixels) -> CssPixels {
+    CssPixels::truncated_value_for(resolve_calc_to_px_without_rounding(calculated, percentage_basis))
 }
 
 /// A borrowed computed `<length-percentage>`: a retained length, percentage
@@ -62,6 +59,12 @@ pub(crate) fn resolve_calc_to_px(calculated: *const c_void, percentage_basis: Cs
 #[derive(Clone, Copy)]
 pub(crate) struct LengthPercentageRef<'a> {
     value: &'a StyleValueData,
+}
+
+impl<'a> LengthPercentageRef<'a> {
+    pub(crate) fn over(value: &'a StyleValueData) -> Self {
+        Self { value }
+    }
 }
 
 impl LengthPercentageRef<'_> {
@@ -117,7 +120,9 @@ impl LengthPercentageRef<'_> {
     pub(crate) fn to_px(self, reference: CssPixels) -> CssPixels {
         match self.value {
             StyleValueData::Length { .. } => self.absolute_length_to_px(),
-            StyleValueData::Percentage { .. } => truncated_css_pixels(reference.to_double() * self.as_fraction()),
+            StyleValueData::Percentage { .. } => {
+                CssPixels::truncated_value_for(reference.to_double() * self.as_fraction())
+            }
             StyleValueData::Calculated { .. } => resolve_calc_to_px(self.calculated_pointer(), reference),
             _ => unreachable!("computed length-percentage holds a non-length-percentage style value"),
         }
@@ -136,6 +141,13 @@ impl ComputedStyleValueHandle {
         Some(LengthPercentageRef {
             value: unsafe { &*self.pointer.cast::<StyleValueData>() },
         })
+    }
+
+    /// The retained style value itself, for the properties whose computed value is not a
+    /// length-percentage.
+    pub(crate) fn style_value<'a>(&self) -> Option<&'a StyleValueData> {
+        // SAFETY: As above.
+        unsafe { self.pointer.cast::<StyleValueData>().as_ref() }
     }
 }
 
@@ -295,6 +307,13 @@ pub(crate) fn auto_computed_size() -> &'static ComputedSize {
     &AUTO_COMPUTED_SIZE.0
 }
 
+fn counter_definitions(handle: &ComputedStyleValueHandle) -> &[crate::css::style_value::RetainedCounterDefinition] {
+    match handle.data() {
+        Some(StyleValueData::CounterDefinitions { counter_definitions }) => counter_definitions.as_slice(),
+        _ => &[],
+    }
+}
+
 // https://drafts.csswg.org/css-contain-2/#containment-types
 fn containment_applies_to_principal_box(display: FfiDisplay) -> bool {
     if display.is_internal_table() && !display.is_table_cell() {
@@ -364,11 +383,20 @@ scalar_accessors! {
         unicode_bidi: u8 => unicode_bidi,
         grid_auto_flow_row: bool => grid_auto_flow_row,
         grid_auto_flow_dense: bool => grid_auto_flow_dense,
-        has_column_count: bool => column_count_has_value,
-        column_count: i32 => column_count,
+        continue_: u8 => continue_,
+        max_lines: i32 => max_lines,
         has_size_containment: bool => size_containment,
+        has_inline_size_containment: bool => inline_size_containment,
+        contain_intrinsic_width_has_length: bool => contain_intrinsic_width.has_length,
+        contain_intrinsic_width_px: f64 => contain_intrinsic_width.length_px,
+        contain_intrinsic_height_has_length: bool => contain_intrinsic_height.has_length,
+        contain_intrinsic_height_px: f64 => contain_intrinsic_height.length_px,
         is_size_container: bool => is_size_container,
+        is_inline_size_container: bool => is_inline_size_container,
         aspect_ratio_uses_natural_when_available: bool => aspect_ratio.use_natural_aspect_ratio_if_available,
+    }
+    misc_reset: {
+        appearance: u8 => appearance,
     }
     border_facts: {
         border_top_width: CssPixels => border_top.width,
@@ -407,15 +435,17 @@ scalar_accessors! {
         tab_size: CssPixels => tab_size_length,
         tab_size_number: f64 => tab_size_number,
     }
-    font_facts: {
+    font: {
         font_variant_emoji: u8 => font_variant_emoji,
         line_height: CssPixels => line_height_used,
         font_size: CssPixels => font_size,
         font_ascent: f32 => font_ascent,
         font_descent: f32 => font_descent,
         font_x_height: f32 => font_x_height,
+        font_zero_advance: f32 => font_zero_advance,
     }
     alignment: {
+        webkit_box_orient: u8 => webkit_box_orient,
         flex_direction: u8 => flex_direction,
         flex_wrap: u8 => flex_wrap,
         flex_grow: f64 => flex_grow,
@@ -453,9 +483,6 @@ reference_accessors! {
         max_width: ComputedSize => max_width,
         max_height: ComputedSize => max_height,
     }
-    box_values: {
-        column_width: ComputedSize => column_width,
-    }
     surround: {
         margin_top: ComputedLengthPercentageOrAuto => margin.top,
         margin_right: ComputedLengthPercentageOrAuto => margin.right,
@@ -473,6 +500,13 @@ reference_accessors! {
 }
 
 impl<'a> ComputedValuesView<'a> {
+    pub(crate) fn block_ellipsis(self) -> &'a StyleValueData {
+        self.inherited_text()
+            .block_ellipsis
+            .data()
+            .expect("computed block-ellipsis has a style value")
+    }
+
     #[inline]
     pub(crate) fn new(groups: &'a [*const c_void]) -> Self {
         Self { groups }
@@ -486,6 +520,134 @@ impl<'a> ComputedValuesView<'a> {
         // derives its mirror from the cbindgen twin of the same type, and the
         // node's ComputedValues keep it alive while readers exist.
         unsafe { &*payload.cast::<T>() }
+    }
+
+    #[inline]
+    fn content(self) -> &'a ContentValues {
+        self.native_group(STYLE_GROUP_INDEX_CONTENT)
+    }
+
+    /// Whether `counter-reset` names a counter counting down from its own last item, which the
+    /// layout tree build cannot renumber without visiting every item again.
+    pub(crate) fn counter_reset_has_reversed_counter(self) -> bool {
+        match self.content().counter_reset.data() {
+            Some(StyleValueData::CounterDefinitions { counter_definitions }) => counter_definitions
+                .as_slice()
+                .iter()
+                .any(crate::css::style_value::RetainedCounterDefinition::is_reversed),
+            _ => false,
+        }
+    }
+
+    /// The computed `content` value.
+    pub(crate) fn content_value(self) -> Option<&'a StyleValueData> {
+        self.content().content.data()
+    }
+
+    /// The computed `quotes` value.
+    pub(crate) fn quotes_value(self) -> Option<&'a StyleValueData> {
+        self.inherited_list().quotes.data()
+    }
+
+    /// The `counter-reset` list, empty for `none`.
+    pub(crate) fn counter_reset(self) -> &'a [crate::css::style_value::RetainedCounterDefinition] {
+        counter_definitions(&self.content().counter_reset)
+    }
+
+    /// The `counter-increment` list, empty for `none`.
+    pub(crate) fn counter_increment(self) -> &'a [crate::css::style_value::RetainedCounterDefinition] {
+        counter_definitions(&self.content().counter_increment)
+    }
+
+    /// The `counter-set` list, empty for `none`.
+    pub(crate) fn counter_set(self) -> &'a [crate::css::style_value::RetainedCounterDefinition] {
+        counter_definitions(&self.content().counter_set)
+    }
+
+    /// Whether none of `counter-reset`, `counter-increment` and `counter-set` names a counter, so
+    /// that regenerating the content cannot renumber anything around it.
+    pub(crate) fn counter_properties_are_none(self) -> bool {
+        let content = self.content();
+        let is_none =
+            |handle: &ComputedStyleValueHandle| matches!(handle.data(), None | Some(StyleValueData::Keyword { .. }));
+        is_none(&content.counter_increment) && is_none(&content.counter_reset) && is_none(&content.counter_set)
+    }
+
+    /// Whether `content` is a bare keyword, which is what `normal` and `none` both spell.
+    pub(crate) fn content_is_keyword(self) -> bool {
+        matches!(
+            self.content().content.data(),
+            None | Some(StyleValueData::Keyword { .. })
+        )
+    }
+
+    /// Whether `content` is a list of nothing but strings: content a box can be regenerated with
+    /// in place, because no counter, quote or `attr()` in it depends on where the box ends up.
+    pub(crate) fn content_is_strings_only(self) -> bool {
+        let Some(StyleValueData::Content { content, .. }) = self.content().content.data() else {
+            return false;
+        };
+        let Some(StyleValueData::ValueList { values, .. }) = content.optional_data() else {
+            return false;
+        };
+        values
+            .as_slice()
+            .iter()
+            .all(|item| matches!(item.optional_data(), Some(StyleValueData::String { .. })))
+    }
+
+    /// Whether the style can move the generated-content state a later sibling reads: any counter
+    /// it touches, or a quote its content opens or closes.
+    pub(crate) fn affects_generated_content_state(self) -> bool {
+        let content = self.content();
+        let names_counters =
+            |handle: &ComputedStyleValueHandle| !matches!(handle.data(), None | Some(StyleValueData::Keyword { .. }));
+        if names_counters(&content.counter_increment)
+            || names_counters(&content.counter_reset)
+            || names_counters(&content.counter_set)
+        {
+            return true;
+        }
+        let Some(StyleValueData::Content { content, .. }) = content.content.data() else {
+            return false;
+        };
+        let Some(StyleValueData::ValueList { values, .. }) = content.optional_data() else {
+            return false;
+        };
+        values.as_slice().iter().any(|item| {
+            use crate::css::style_compute::keyword;
+            matches!(
+                item.optional_data(),
+                Some(StyleValueData::Keyword { keyword })
+                    if matches!(
+                        *keyword,
+                        keyword::OPEN_QUOTE | keyword::CLOSE_QUOTE | keyword::NO_OPEN_QUOTE | keyword::NO_CLOSE_QUOTE
+                    )
+            )
+        })
+    }
+
+    /// Whether `content` is a single image, which is what makes the element a replaced element
+    /// whose box renders that image instead of its children.
+    pub(crate) fn content_is_single_image(self) -> bool {
+        let Some(StyleValueData::Content { content, .. }) = self.content().content.data() else {
+            return false;
+        };
+        let Some(StyleValueData::ValueList { values, .. }) = content.optional_data() else {
+            return false;
+        };
+        let values = values.as_slice();
+        values.len() == 1
+            && matches!(
+                values[0].optional_data(),
+                Some(
+                    StyleValueData::Image { .. }
+                        | StyleValueData::ImageSet { .. }
+                        | StyleValueData::LinearGradient { .. }
+                        | StyleValueData::ConicGradient { .. }
+                        | StyleValueData::RadialGradient { .. }
+                )
+            )
     }
 
     #[inline]
@@ -504,7 +666,7 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     #[inline]
-    fn svg_reset(self) -> &'a SVGResetValues {
+    pub(crate) fn svg_reset(self) -> &'a SVGResetValues {
         self.native_group(STYLE_GROUP_INDEX_SVG_RESET)
     }
 
@@ -529,8 +691,137 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     #[inline]
+    pub(crate) fn anchor(self) -> &'a AnchorValues {
+        self.native_group(STYLE_GROUP_INDEX_ANCHOR)
+    }
+
+    #[inline]
     fn border_facts(self) -> &'a BorderLayoutFacts {
         self.native_group(STYLE_GROUP_INDEX_BORDER)
+    }
+
+    #[inline]
+    pub(crate) fn content_visibility(self) -> u8 {
+        self.inherited_box().content_visibility
+    }
+
+    #[inline]
+    pub(crate) fn image_rendering(self) -> u8 {
+        self.inherited_box().image_rendering
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn empty_cells(self) -> u8 {
+        self.inherited_table().empty_cells
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn border(self) -> &'a BorderValues {
+        self.native_group(STYLE_GROUP_INDEX_BORDER)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn inherited_list(self) -> &'a InheritedListValues {
+        self.native_group(STYLE_GROUP_INDEX_INHERITED_LIST)
+    }
+
+    /// Whether `content` computes to the keyword `none`. The property takes exactly two keywords,
+    /// so a keyword that is not `none` is `normal`.
+    pub(crate) fn content_keyword_is_none(self) -> bool {
+        matches!(
+            self.content().content.data(),
+            Some(StyleValueData::Keyword { keyword }) if *keyword == crate::css::css_enums::keyword::NONE
+        )
+    }
+
+    /// Whether `list-style-type` computes to `none`, the marker that renders nothing.
+    pub(crate) fn list_style_type_is_none(self) -> bool {
+        matches!(
+            self.inherited_list().list_style_type.data(),
+            Some(StyleValueData::Keyword { keyword }) if *keyword == crate::css::css_enums::keyword::NONE
+        )
+    }
+
+    /// Whether `list-style-position` computes to `inside`, which puts the marker box inside the
+    /// principal block box rather than outside it.
+    pub(crate) fn list_style_position_is_inside(self) -> bool {
+        self.inherited_list().list_style_position == crate::css::css_enums::list_style_position::INSIDE
+    }
+
+    /// Whether `list-style-image` names an image, which a list marker then shows instead of its
+    /// marker string.
+    pub(crate) fn list_style_image_is_set(self) -> bool {
+        matches!(
+            self.inherited_list().list_style_image.data(),
+            Some(
+                StyleValueData::Image { .. }
+                    | StyleValueData::ImageSet { .. }
+                    | StyleValueData::LinearGradient { .. }
+                    | StyleValueData::ConicGradient { .. }
+                    | StyleValueData::RadialGradient { .. }
+            )
+        )
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn inherited_ui(self) -> &'a InheritedUIValues {
+        self.native_group(STYLE_GROUP_INDEX_INHERITED_UI)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn inherited_svg(self) -> &'a InheritedSVGValues {
+        self.native_group(STYLE_GROUP_INDEX_INHERITED_SVG)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn inherited_text(self) -> &'a InheritedTextValues {
+        self.native_group(STYLE_GROUP_INDEX_INHERITED_TEXT)
+    }
+
+    #[inline]
+    pub(crate) fn font(self) -> &'a FontValues {
+        self.native_group(STYLE_GROUP_INDEX_FONT)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn effects(self) -> &'a EffectsValues {
+        self.native_group(STYLE_GROUP_INDEX_EFFECTS)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn mask(self) -> &'a MaskValues {
+        self.native_group(STYLE_GROUP_INDEX_MASK)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn text_reset(self) -> &'a TextResetValues {
+        self.native_group(STYLE_GROUP_INDEX_TEXT_RESET)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn transform(self) -> &'a TransformValues {
+        self.native_group(STYLE_GROUP_INDEX_TRANSFORM)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn background(self) -> &'a BackgroundValues {
+        self.native_group(STYLE_GROUP_INDEX_BACKGROUND)
+    }
+
+    #[inline]
+    pub(crate) fn misc_reset(self) -> &'a MiscResetValues {
+        self.native_group(STYLE_GROUP_INDEX_MISC_RESET)
     }
 
     #[inline]
@@ -538,13 +829,43 @@ impl<'a> ComputedValuesView<'a> {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_TEXT)
     }
 
-    #[inline]
-    fn font_facts(self) -> &'a FontLayoutFacts {
-        self.native_group(STYLE_GROUP_INDEX_FONT)
-    }
-
     pub(crate) fn is_floating(self) -> bool {
         self.box_values().float_ != crate::css::css_enums::float::NONE
+    }
+
+    pub(crate) fn effective_flex_direction(self) -> u8 {
+        if self.display_before_box_type_transformation().is_webkit_box_inside() {
+            if self.webkit_box_orient() == crate::css::css_enums::webkit_box_orient::VERTICAL {
+                return crate::css::css_enums::flex_direction::COLUMN;
+            }
+            return crate::css::css_enums::flex_direction::ROW;
+        }
+        self.flex_direction()
+    }
+
+    /// Whether the box is a scroll snap area.
+    pub(crate) fn has_scroll_snap_alignment(self) -> bool {
+        let misc = self.misc_reset();
+        misc.scroll_snap_align_block != crate::css::css_enums::scroll_snap_align::NONE
+            || misc.scroll_snap_align_inline != crate::css::css_enums::scroll_snap_align::NONE
+    }
+
+    pub(crate) fn inline_axis_is_reverse(self) -> bool {
+        match self.writing_mode() {
+            writing_mode::HORIZONTAL_TB
+            | writing_mode::VERTICAL_RL
+            | writing_mode::VERTICAL_LR
+            | writing_mode::SIDEWAYS_RL => self.direction() == direction::RTL,
+            writing_mode::SIDEWAYS_LR => self.direction() == direction::LTR,
+            _ => unreachable!("invalid writing mode"),
+        }
+    }
+
+    pub(crate) fn block_axis_is_reverse(self) -> bool {
+        matches!(
+            self.writing_mode(),
+            writing_mode::VERTICAL_RL | writing_mode::SIDEWAYS_RL
+        )
     }
 
     pub(crate) fn is_absolutely_positioned(self) -> bool {
@@ -557,8 +878,8 @@ impl<'a> ComputedValuesView<'a> {
     // https://developer.mozilla.org/en-US/docs/Web/Guide/CSS/Block_formatting_context
     // The computed-style-only half of the block-formatting-context predicate;
     // node_creates_block_formatting_context adds the terms that need the node
-    // kind, stamped DOM identity, the live IsFlexItem flag, or the parent's
-    // display. The float term is deliberately absent for the same reason: only
+    // kind, stamped DOM identity, the live IsFlexItem flag, or whether the
+    // parent is a flex or grid container. The float term is deliberately absent for the same reason: only
     // non-flex-items establish one by floating.
     pub(crate) fn own_style_establishes_block_formatting_context(self) -> bool {
         let box_values = self.box_values();
@@ -587,6 +908,17 @@ impl<'a> ComputedValuesView<'a> {
             return true;
         }
 
+        // https://drafts.csswg.org/css-overflow-4/#continue
+        // If the box is a block container, then it must establish an independent formatting context.
+        if matches!(
+            box_values.continue_,
+            crate::css::css_enums::continue_value::COLLAPSE | crate::css::css_enums::continue_value::DISCARD
+        ) && display.is_block_outside()
+            && display.is_flow_inside()
+        {
+            return true;
+        }
+
         // https://drafts.csswg.org/css-contain-2/#containment-types
         // 1. The layout containment box establishes an independent formatting context.
         // 4. The paint containment box establishes an independent formatting context.
@@ -605,15 +937,20 @@ impl<'a> ComputedValuesView<'a> {
             return true;
         }
 
-        // https://drafts.csswg.org/css-multicol-2/#the-multi-column-model
-        // An element whose 'column-width', 'column-count', or 'column-height' property is not 'auto' establishes a
-        // multi-column container (or multicol container for short), and therefore acts as a container for
-        // multi-column layout.
-        if box_values.column_width.kind != ComputedSizeKind::Auto || box_values.column_count_has_value {
+        if self.establishes_multi_column_container() {
             return true;
         }
 
         false
+    }
+
+    // https://drafts.csswg.org/css-multicol-2/#the-multi-column-model
+    // An element whose 'column-width', 'column-count', or 'column-height' property is not 'auto' establishes a
+    // multi-column container (or multicol container for short), and therefore acts as a container for
+    // multi-column layout.
+    pub(crate) fn establishes_multi_column_container(self) -> bool {
+        let box_values = self.box_values();
+        box_values.column_width.kind != ComputedSizeKind::Auto || box_values.column_count_has_value
     }
 
     pub(crate) fn x(self) -> LengthPercentageRef<'a> {
@@ -628,6 +965,10 @@ impl<'a> ComputedValuesView<'a> {
             .y
             .length_percentage()
             .expect("computed y lost its style value")
+    }
+
+    pub(crate) fn overflow_wrap(self) -> u8 {
+        self.inherited_text().overflow_wrap
     }
 
     pub(crate) fn text_indent(self) -> LengthPercentageRef<'a> {
@@ -647,31 +988,40 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     pub(crate) fn has_position_anchor(self) -> bool {
-        self.surround().position_anchor_name.raw() != 0
+        !self.surround().position_anchor.pointer.is_null()
     }
 
     /// The raw fly-string representation of the computed position-anchor
-    /// name, borrowed from the surround payload for the duration of the pass.
+    /// name, borrowed from the anchor payload for the duration of the pass.
     pub(crate) fn position_anchor_name(self) -> usize {
-        self.surround().position_anchor_name.raw()
+        self.anchor().position_anchor_name.raw()
     }
 
-    pub(crate) fn first_available_font(self) -> *const c_void {
-        let font = self.font_facts().first_available_font;
+    pub(crate) fn first_available_font(self) -> libgfx_rust::font::FontHandle {
+        let font = self.font();
         debug_assert!(
-            !font.is_null(),
+            !font.first_available_font.is_null() && !font.font_cascade_list.is_null(),
             "layout read a font group that never received a font list"
         );
-        font
+        // SAFETY: The payload's cascade list handle owns the list, and the list
+        // owns its first available font.
+        unsafe { libgfx_rust::font::FontHandle::intern(font.first_available_font) }
     }
 
-    pub(crate) fn font_cascade_list(self) -> *const c_void {
-        let list = self.font_facts().font_cascade_list;
-        debug_assert!(
-            !list.is_null(),
-            "layout read a font group that never received a font list"
-        );
-        list
+    /// The frozen cascade a render pass reads.
+    pub(crate) fn frozen_font_list(self) -> &'a libgfx_rust::font::FrozenFontList {
+        self.font()
+            .frozen_font_list
+            .list()
+            .expect("layout read a font group that never received a frozen font list")
+    }
+
+    /// A counted reference to the frozen cascade, for a render row that outlives this payload.
+    pub(crate) fn frozen_font_list_ref(self) -> std::sync::Arc<libgfx_rust::font::FrozenFontList> {
+        self.font()
+            .frozen_font_list
+            .to_arc()
+            .expect("layout read a font group that never received a frozen font list")
     }
 
     pub(crate) fn box_sizing_for_aspect_ratio(self) -> u8 {

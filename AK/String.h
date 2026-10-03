@@ -23,6 +23,7 @@
 #include <AK/UnicodeUtils.h>
 #include <AK/Utf8View.h>
 #include <AK/Vector.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -34,6 +35,8 @@ class String : public Detail::StringBase {
     AK_MAKE_DEFAULT_MOVABLE(String);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     // NOTE: For short strings, we avoid heap allocations by storing them in the data pointer slot.
     static constexpr size_t MAX_SHORT_STRING_BYTE_COUNT = Detail::MAX_SHORT_STRING_BYTE_COUNT;
 
@@ -95,8 +98,7 @@ public:
     [[nodiscard]] static String from_string_builder_without_validation(Badge<StringBuilder>, StringBuilder&);
 
     // Creates a new String from a sequence of UTF-16 encoded code points.
-    static ErrorOr<String> from_utf16_le_with_replacement_character(ReadonlyBytes);
-    static ErrorOr<String> from_utf16_be_with_replacement_character(ReadonlyBytes);
+    static ErrorOr<String> from_utf16_with_replacement_character(Utf16View const&);
 
     // Creates a new String by reading byte_count bytes from a UTF-8 encoded Stream.
     static ErrorOr<String> from_stream(Stream&, size_t byte_count);

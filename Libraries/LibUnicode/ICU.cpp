@@ -5,7 +5,6 @@
  */
 
 #include <AK/HashMap.h>
-#include <AK/NeverDestroyed.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Utf16View.h>
 #include <LibUnicode/ICU.h>
@@ -18,16 +17,30 @@
 
 namespace Unicode {
 
+// NB: Cache entries and their lazily created ICU objects belong to the calling thread.
+//     Keeping the entire entry local also covers canonical-string publication and mutable ICU APIs.
 static auto& locale_cache()
 {
-    static NeverDestroyed<HashMap<String, OwnPtr<LocaleData>>> cache;
-    return *cache;
+    using Cache = HashMap<String, OwnPtr<LocaleData>>;
+    // NB: Destroy each thread's ICU objects when that thread exits.
+#ifdef AK_COMPILER_CLANG
+    AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local Cache cache)
+#else
+    static thread_local Cache cache;
+#endif
+    return cache;
 }
 
 static auto& time_zone_cache()
 {
-    static NeverDestroyed<HashMap<Utf16String, OwnPtr<TimeZoneData>>> cache;
-    return *cache;
+    using Cache = HashMap<Utf16String, OwnPtr<TimeZoneData>>;
+    // NB: Destroy each thread's ICU objects when that thread exits.
+#ifdef AK_COMPILER_CLANG
+    AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local Cache cache)
+#else
+    static thread_local Cache cache;
+#endif
+    return cache;
 }
 
 Optional<LocaleData&> LocaleData::for_locale(StringView locale)
@@ -56,10 +69,11 @@ LocaleData::LocaleData(icu::Locale locale)
 {
 }
 
-Utf16String LocaleData::canonicalize(StringView locale)
+Optional<Utf16String> LocaleData::canonicalize(StringView locale)
 {
     auto locale_data = LocaleData::for_locale(locale);
-    VERIFY(locale_data.has_value());
+    if (!locale_data.has_value())
+        return {};
 
     if (locale_data->m_canonical_locale_string.has_value())
         return *locale_data->m_canonical_locale_string;
@@ -91,11 +105,15 @@ Utf16String LocaleData::canonicalize(StringView locale)
         });
     }
 
-    locale_data->locale().canonicalize(status);
-    verify_icu_success(status);
+    // NB: Canonicalize a copy so the cached locale retains its original form.
+    auto canonical_locale = locale_data->locale();
+    canonical_locale.canonicalize(status);
+    if (icu_failure(status))
+        return {};
 
-    auto result = locale_data->locale().toLanguageTag<StringBuilder>(status);
-    verify_icu_success(status);
+    auto result = canonical_locale.toLanguageTag<StringBuilder>(status);
+    if (icu_failure(status))
+        return {};
 
     if (keywords_with_yes.is_empty()) {
         locale_data->m_canonical_locale_string = Utf16String::from_ascii_without_validation(result.string_view().bytes());
@@ -149,15 +167,25 @@ icu::NumberingSystem& LocaleData::numbering_system()
     return *m_numbering_system;
 }
 
-icu::DateTimePatternGenerator& LocaleData::date_time_pattern_generator()
+Optional<icu::DateTimePatternGenerator&> LocaleData::date_time_pattern_generator()
 {
     if (!m_date_time_pattern_generator) {
         UErrorCode status = U_ZERO_ERROR;
+        m_date_time_pattern_generator = adopt_own_if_nonnull(icu::DateTimePatternGenerator::createInstance(locale(), status));
 
-        m_date_time_pattern_generator = adopt_own(*icu::DateTimePatternGenerator::createInstance(locale(), status));
-        verify_icu_success(status);
+        if (!m_date_time_pattern_generator) {
+            status = U_ZERO_ERROR;
+
+            auto locale_without_numbering_system = locale();
+            locale_without_numbering_system.setUnicodeKeywordValue("nu", {}, status);
+
+            if (icu_success(status))
+                m_date_time_pattern_generator = adopt_own_if_nonnull(icu::DateTimePatternGenerator::createInstance(locale_without_numbering_system, status));
+        }
     }
 
+    if (!m_date_time_pattern_generator)
+        return {};
     return *m_date_time_pattern_generator;
 }
 

@@ -6,40 +6,19 @@
 
 #pragma once
 
-#include <AK/Utf16String.h>
-#include <LibWeb/Layout/BlockContainer.h>
+#include <LibWeb/Layout/Box.h>
 
 namespace Web::Layout {
 
-class Viewport final : public BlockContainer {
-    LAYOUT_NODE(Viewport, BlockContainer);
-
+class Viewport final : public Box {
 public:
-    explicit Viewport(DOM::Document&, NonnullRefPtr<CSS::ComputedValues const>);
+    Viewport(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
     virtual ~Viewport() override;
-
-    struct TextPosition {
-        GC::Weak<DOM::Text> dom_node;
-        size_t start_offset { 0 };
-        size_t dom_offset_within_node { 0 };
-    };
-    struct TextBlock {
-        Utf16String text;
-        Vector<TextPosition> positions;
-    };
-    Vector<TextBlock> const& text_blocks();
-    void invalidate_text_blocks_cache() { m_text_blocks.clear(); }
 
     DOM::Document const& dom_node() const;
 
 private:
-    virtual RefPtr<Painting::Paintable> create_paintable() const override;
-
-    void update_text_blocks();
-
     virtual bool is_viewport() const override { return true; }
-
-    Optional<Vector<TextBlock>> m_text_blocks;
 };
 
 template<>

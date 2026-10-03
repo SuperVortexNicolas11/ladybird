@@ -4,20 +4,21 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
 #include <LibWeb/HTML/HTMLDocument.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
-#include <LibWeb/HTML/SandboxingFlagSet.h>
+#include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
@@ -26,93 +27,35 @@
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWebCommon/HTML/SandboxingFlagSet.h>
 
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(BrowsingContext);
 
-// https://html.spec.whatwg.org/multipage/urls-and-fetching.html#matches-about:blank
-bool url_matches_about_blank(URL::URL const& url)
-{
-    // A URL matches about:blank if its scheme is "about", its path contains a single string "blank", its username and password are the empty string, and its host is null.
-    return url.scheme() == "about"sv
-        && url.paths().size() == 1 && url.paths()[0] == "blank"sv
-        && url.username().is_empty()
-        && url.password().is_empty()
-        && !url.host().has_value();
-}
-
-// https://html.spec.whatwg.org/multipage/urls-and-fetching.html#matches-about:srcdoc
-bool url_matches_about_srcdoc(URL::URL const& url)
-{
-    // A URL matches about:srcdoc if its scheme is "about", its path contains a single string "srcdoc", its query is null, its username and password are the empty string, and its host is null.
-    return url.scheme() == "about"sv
-        && url.paths().size() == 1 && url.paths()[0] == "srcdoc"sv
-        && !url.query().has_value()
-        && url.username().is_empty()
-        && url.password().is_empty()
-        && !url.host().has_value();
-}
-
-// https://html.spec.whatwg.org/multipage/document-sequences.html#determining-the-origin
-URL::Origin determine_the_origin(Optional<URL::URL const&> url, SandboxingFlagSet sandbox_flags, Optional<URL::Origin> source_origin)
-{
-    // 1. If sandboxFlags has its sandboxed origin browsing context flag set, then return a new opaque origin.
-    if (has_flag(sandbox_flags, SandboxingFlagSet::SandboxedOrigin)) {
-        return URL::Origin::create_opaque();
-    }
-
-    // 2. If url is null, then return a new opaque origin.
-    if (!url.has_value()) {
-        return URL::Origin::create_opaque();
-    }
-
-    // 3. If url is about:srcdoc, then:
-    if (url == URL::about_srcdoc()) {
-        // 1. Assert: sourceOrigin is non-null.
-        VERIFY(source_origin.has_value());
-
-        // 2. Return sourceOrigin.
-        return source_origin.release_value();
-    }
-
-    // 4. If url matches about:blank and sourceOrigin is non-null, then return sourceOrigin.
-    if (url_matches_about_blank(*url) && source_origin.has_value())
-        return source_origin.release_value();
-
-    // 5. Return url's origin.
-    return url->origin();
-}
-
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context
 BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_auxiliary_browsing_context_and_document(GC::Ref<Page> page, GC::Ref<HTML::BrowsingContext> opener)
 {
     // 1. Let openerTopLevelBrowsingContext be opener's top-level traversable's active browsing context.
-    auto opener_top_level_browsing_context = opener->top_level_traversable()->active_browsing_context();
-
     // 2. Let group be openerTopLevelBrowsingContext's group.
-    auto group = opener_top_level_browsing_context->group();
-
     // 3. Assert: group is non-null, as navigating invokes this directly.
-    VERIFY(group);
+    // NB: The UI process holds the group.
 
     // 4. Set browsingContext and document be the result of creating a new browsing context and document with opener's active document, null, and group.
-    auto [browsing_context, document] = create_a_new_browsing_context_and_document(page, opener->active_document(), nullptr, *group);
+    auto [browsing_context, document] = create_a_new_browsing_context_and_document(page, opener->active_document(), nullptr);
 
     // 5. Set browsingContext's is auxiliary to true.
     browsing_context->m_is_auxiliary = true;
 
     // 6. Append browsingContext to group.
-    group->append(browsing_context);
+    // NB: The UI process appends its browsing context to the group.
 
     // 7. Set browsingContext's opener browsing context to opener.
     browsing_context->set_opener_browsing_context(opener);
 
     // 8. Set browsingContext's virtual browsing context group ID to openerTopLevelBrowsingContext's virtual browsing context group ID.
-    browsing_context->m_virtual_browsing_context_group_id = opener_top_level_browsing_context->m_virtual_browsing_context_group_id;
-
     // 9. Set browsingContext's opener origin at creation to opener's active document's origin.
-    browsing_context->m_opener_origin_at_creation = opener->active_document()->origin();
+    // NB: The UI process holds these on the canonical browsing context.
 
     // 10. Return browsingContext and document.
     return BrowsingContext::BrowsingContextAndDocument { browsing_context, document };
@@ -129,12 +72,10 @@ static void populate_with_html_head_body(GC::Ref<DOM::Document> document)
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-browsing-context
-BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsing_context_and_document(GC::Ref<Page> page, GC::Ptr<DOM::Document> creator, GC::Ptr<DOM::Element> embedder, GC::Ref<BrowsingContextGroup> group)
+BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsing_context_and_document(GC::Ref<Page> page, GC::Ptr<DOM::Document> creator, GC::Ptr<DOM::Element> embedder, GC::Ptr<WindowProxy> existing_window_proxy, Optional<URL::Origin> determined_origin)
 {
-    auto& vm = group->vm();
-
     // 1. Let browsingContext be a new browsing context.
-    GC::Ref<BrowsingContext> browsing_context = *vm.heap().allocate<BrowsingContext>(page);
+    GC::Ref<BrowsingContext> browsing_context = *GC::Heap::the().allocate<BrowsingContext>(page);
 
     // 2. Let unsafeContextCreationTime be the unsafe shared current time.
     [[maybe_unused]] auto unsafe_context_creation_time = HighResolutionTime::unsafe_shared_current_time();
@@ -154,45 +95,52 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
         creator_base_url = creator->base_url();
 
         // 3. Set browsingContext's virtual browsing context group ID to creator's browsing context's top-level browsing context's virtual browsing context group ID.
-        VERIFY(creator->browsing_context());
-        browsing_context->m_virtual_browsing_context_group_id = creator->browsing_context()->top_level_browsing_context()->m_virtual_browsing_context_group_id;
+        // NB: The UI process holds this on the canonical browsing context.
     }
 
     // 6. Let sandboxFlags be the result of determining the creation sandboxing flags given browsingContext and embedder.
     auto sandbox_flags = determine_the_creation_sandboxing_flags(*browsing_context, embedder);
 
     // 7. Let origin be the result of determining the origin given about:blank, sandboxFlags, and creatorOrigin.
-    auto origin = determine_the_origin(URL::about_blank(), sandbox_flags, creator_origin);
+    // NB: The UI process determined the origin of a document it held first.
+    auto origin = determined_origin.has_value() ? determined_origin.release_value() : determine_the_origin(URL::about_blank(), sandbox_flags, creator_origin);
 
     // FIXME: 8. Let permissionsPolicy be the result of creating a permissions policy given embedder and origin. [PERMISSIONSPOLICY]
 
-    // FIXME: 9. Let agent be the result of obtaining a similar-origin window agent given origin, group, and false.
+    // 9. Let agent be the result of obtaining a similar-origin window agent given origin, group, and false.
+    // NB: The UI process obtains the agent. For creator's origin, that is creator's agent. Any other origin is a new
+    //     opaque one, whose agent cluster nothing else can reach.
+    Optional<u64> agent_cluster_id;
+    if (creator && origin.is_same_origin(*creator_origin))
+        agent_cluster_id = creator->relevant_settings_object().agent_cluster_id();
 
     GC::Ptr<Window> window;
 
     // 10. Let realm execution context be the result of creating a new JavaScript realm given agent and the following customizations:
     auto realm_execution_context = Bindings::create_a_new_javascript_realm(
         Bindings::main_thread_vm(),
-        [&](JS::Realm& realm) -> JS::Object* {
-            auto window_proxy = realm.create<WindowProxy>(realm);
+        [&](JS::Realm& realm) -> GC::Ref<JS::Object> {
+            // NB: A container whose content navigable's document comes back from another process keeps the WindowProxy
+            //     scripts hold for it.
+            auto window_proxy = existing_window_proxy ? GC::Ref { *existing_window_proxy } : WindowProxy::create(realm);
             browsing_context->set_window_proxy(window_proxy);
 
             // - For the global object, create a new Window object.
-            window = Window::create(realm);
-            return window.ptr();
+            window = Window::create();
+            return Bindings::create_global_object_wrapper(realm, GC::Ref { *window });
         },
-        [&](JS::Realm&) -> JS::Object* {
+        [&](JS::Realm&) -> GC::Ref<JS::Object> {
             // - For the global this binding, use browsingContext's WindowProxy object.
-            return browsing_context->window_proxy();
+            return *browsing_context->window_proxy();
         });
 
-    auto& realm = window->realm();
+    auto& realm = *realm_execution_context->realm;
 
     // 11. Let topLevelCreationURL be about:blank if embedder is null; otherwise embedder's relevant settings object's top-level creation URL.
     auto top_level_creation_url = !embedder ? URL::about_blank() : relevant_settings_object(*embedder).top_level_creation_url.value();
 
     // 12. Let topLevelOrigin be origin if embedder is null; otherwise embedder's relevant settings object's top-level origin.
-    auto top_level_origin = !embedder ? origin : relevant_settings_object(*embedder).origin();
+    auto top_level_origin = !embedder ? origin : relevant_settings_object(*embedder).top_level_origin.value();
 
     // 13. Set up a window environment settings object with about:blank, realm execution context, null, topLevelCreationURL, and topLevelOrigin.
     WindowEnvironmentSettingsObject::setup(
@@ -201,7 +149,8 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
         move(realm_execution_context),
         {},
         top_level_creation_url,
-        top_level_origin);
+        top_level_origin,
+        agent_cluster_id);
 
     // 14. Let loadTimingInfo be a new document load timing info with its navigation start time set to the result of calling
     //     coarsen time with unsafeContextCreationTime and the new environment settings object's cross-origin isolated capability.
@@ -211,10 +160,11 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
         as<WindowEnvironmentSettingsObject>(Bindings::principal_host_defined_environment_settings_object(realm)).cross_origin_isolated_capability());
 
     // 15. Let document be a new Document, with:
-    auto document = HTML::HTMLDocument::create(realm);
+    auto document = HTML::HTMLDocument::create(page, *window);
 
     // Non-standard
     window->set_associated_document(*document);
+    document->set_window(*window);
 
     // type: "html"
     document->set_document_type(DOM::Document::Type::HTML);
@@ -251,7 +201,7 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
     document->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
 
     // custom element registry: A new CustomElementRegistry object.
-    document->set_custom_element_registry(realm.create<CustomElementRegistry>(realm));
+    document->set_custom_element_registry(CustomElementRegistry::create_global(*document));
 
     // 16. Let iframeReferrerPolicy be the result of determining the iframe element referrer policy given embedder.
     auto iframe_referrer_policy = determine_iframe_element_referrer_policy(embedder);
@@ -274,9 +224,10 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
         // 3. If creator's origin is same origin with creator's relevant settings object's top-level origin,
         if (creator->origin().is_same_origin(creator->relevant_settings_object().top_level_origin.value())) {
             // then set document's opener policy to creator's browsing context's top-level browsing context's active document's opener policy.
-            VERIFY(creator->browsing_context());
-            VERIFY(creator->browsing_context()->top_level_browsing_context()->active_document());
-            document->set_opener_policy(creator->browsing_context()->top_level_browsing_context()->active_document()->opener_policy());
+            // NB: That document is the top-level traversable's active document, which the traversable answers for
+            //     a document hosted in another process.
+            VERIFY(creator->navigable());
+            document->set_opener_policy(creator->navigable()->top_level_traversable()->active_document_opener_policy());
         }
     }
 
@@ -309,6 +260,17 @@ BrowsingContext::BrowsingContext(GC::Ref<Page> page)
 
 BrowsingContext::~BrowsingContext() = default;
 
+void BrowsingContext::set_opener_browsing_context(GC::Ptr<BrowsingContext> opener)
+{
+    m_opener_browsing_context_window_proxy = opener ? opener->window_proxy() : nullptr;
+}
+
+// NB: The browsing context active in a navigable another process hosts is there, and its WindowProxy stands for it.
+void BrowsingContext::set_opener_browsing_context(RemoteNavigable& navigable)
+{
+    m_opener_browsing_context_window_proxy = navigable.active_window_proxy();
+}
+
 void BrowsingContext::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -316,17 +278,7 @@ void BrowsingContext::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_page);
     visitor.visit(m_window_proxy);
     visitor.visit(m_active_document);
-    visitor.visit(m_group);
-    visitor.visit(m_opener_browsing_context);
-}
-
-// https://html.spec.whatwg.org/multipage/document-sequences.html#bc-traversable
-GC::Ref<LocalTraversableNavigable> BrowsingContext::top_level_traversable() const
-{
-    // A browsing context's top-level traversable is its active document's node navigable's top-level traversable.
-    auto& traversable = as<LocalTraversableNavigable>(*active_document()->navigable()->top_level_traversable());
-    VERIFY(traversable.is_top_level_traversable());
-    return traversable;
+    visitor.visit(m_opener_browsing_context_window_proxy);
 }
 
 // https://html.spec.whatwg.org/multipage/browsers.html#top-level-browsing-context
@@ -346,33 +298,30 @@ GC::Ptr<BrowsingContext> BrowsingContext::top_level_browsing_context() const
     }
 
     // 2. Let navigable be start's active document's node navigable.
-    auto navigable = start->active_document()->navigable();
+    GC::Ptr<Navigable> navigable = start->active_document()->navigable();
 
     // 3. While navigable's parent is not null, set navigable to navigable's parent.
-    while (navigable->parent()) {
-        navigable = as<LocalNavigable>(*navigable->parent());
-    }
+    while (navigable->parent())
+        navigable = navigable->parent();
 
     // 4. Return navigable's active browsing context.
-    return navigable->active_browsing_context();
+    // NB: This is null if another process hosts navigable's document.
+    auto* local_navigable = as_if<LocalNavigable>(*navigable);
+    if (!local_navigable)
+        return nullptr;
+    return local_navigable->active_browsing_context();
 }
 
-// https://html.spec.whatwg.org/multipage/document-sequences.html#active-document
+// https://html.spec.whatwg.org/multipage/browsers.html#active-document
 DOM::Document const* BrowsingContext::active_document() const
 {
-    // AD-HOC: The HTML Standard currently defines this as the active window's associated Document.
-    //         That changes too early when the initial about:blank Window is reused for its first
-    //         same-origin navigation, because create-and-initialize updates the associated Document
-    //         before the new Document is made active.
-    //         Spec issue: https://github.com/whatwg/html/issues/12415
-    return m_active_document;
+    return m_active_document.ptr();
 }
 
-// https://html.spec.whatwg.org/multipage/document-sequences.html#active-document
+// https://html.spec.whatwg.org/multipage/browsers.html#active-document
 DOM::Document* BrowsingContext::active_document()
 {
-    // AD-HOC: See the const overload above.
-    return m_active_document;
+    return m_active_document.ptr();
 }
 
 void BrowsingContext::set_active_document(GC::Ptr<DOM::Document> document)
@@ -384,14 +333,14 @@ void BrowsingContext::set_active_document(GC::Ptr<DOM::Document> document)
 HTML::Window* BrowsingContext::active_window()
 {
     // A browsing context's active window is its WindowProxy object's [[Window]] internal slot value.
-    return m_window_proxy->window();
+    return m_window_proxy->window().ptr();
 }
 
 // https://html.spec.whatwg.org/multipage/browsers.html#active-window
 HTML::Window const* BrowsingContext::active_window() const
 {
     // A browsing context's active window is its WindowProxy object's [[Window]] internal slot value.
-    return m_window_proxy->window();
+    return m_window_proxy->window().ptr();
 }
 
 HTML::WindowProxy* BrowsingContext::window_proxy()
@@ -404,43 +353,37 @@ HTML::WindowProxy const* BrowsingContext::window_proxy() const
     return m_window_proxy.ptr();
 }
 
+HTML::WindowProxy* BrowsingContext::window_proxy_for(Bindings::WrapperWorld& wrapper_world, JS::Realm& realm)
+{
+    if (wrapper_world.is_main_world()) {
+        VERIFY(m_window_proxy);
+        return window_proxy();
+    }
+
+    auto& cache = m_window_proxies.cache_for(wrapper_world);
+    if (auto proxy = cache.get(wrapper_world))
+        return proxy.ptr();
+
+    auto proxy = WindowProxy::create(realm);
+    if (auto window = active_window())
+        proxy->set_window(*window);
+    cache.set(wrapper_world, proxy);
+    return proxy.ptr();
+}
+
+void BrowsingContext::set_active_window(GC::Ref<HTML::Window> window)
+{
+    m_window_proxy->set_window(window);
+    m_window_proxies.for_each([&](auto& cache) {
+        cache.for_each([&](auto& proxy) {
+            proxy.set_window(window);
+        });
+    });
+}
+
 void BrowsingContext::set_window_proxy(GC::Ptr<WindowProxy> window_proxy)
 {
     m_window_proxy = move(window_proxy);
-}
-
-BrowsingContextGroup* BrowsingContext::group()
-{
-    return m_group;
-}
-
-BrowsingContextGroup const* BrowsingContext::group() const
-{
-    return m_group;
-}
-
-void BrowsingContext::set_group(BrowsingContextGroup* group)
-{
-    m_group = group;
-}
-
-// https://html.spec.whatwg.org/multipage/browsers.html#bcg-remove
-void BrowsingContext::remove()
-{
-    // 1. Assert: browsingContext's group is non-null, because a browsing context only gets discarded once.
-    VERIFY(group());
-
-    // 2. Let group be browsingContext's group.
-    GC::Ref<BrowsingContextGroup> group = *this->group();
-
-    // 3. Set browsingContext's group to null.
-    set_group(nullptr);
-
-    // 4. Remove browsingContext from group's browsing context set.
-    group->browsing_context_set().remove(*this);
-
-    // 5. If group's browsing context set is empty, then remove group from the user agent's browsing context group set.
-    // NOTE: This is done by ~BrowsingContextGroup() when the refcount reaches 0.
 }
 
 // https://html.spec.whatwg.org/multipage/origin.html#one-permitted-sandboxed-navigator
@@ -463,46 +406,12 @@ bool BrowsingContext::is_ancestor_of(BrowsingContext const& potential_descendant
         return false;
 
     // 3. Let ancestorBCs be the list obtained by taking the browsing context of the active document of each member of potentialDescendantDocument's ancestor navigables.
+    // NB: The browsing context of an ancestor hosted by another process is there, and is not potentialAncestor.
     for (auto const& ancestor : potential_descendant_document->ancestor_navigables()) {
-        auto ancestor_browsing_context = as<HTML::LocalNavigable>(*ancestor).active_browsing_context();
+        auto* local_ancestor = as_if<HTML::LocalNavigable>(*ancestor);
 
         // 4. If ancestorBCs contains potentialAncestor, then return true.
-        if (ancestor_browsing_context == this)
-            return true;
-    }
-
-    // 5. Return false.
-    return false;
-}
-
-// https://html.spec.whatwg.org/multipage/document-sequences.html#familiar-with
-bool BrowsingContext::is_familiar_with(BrowsingContext const& other) const
-{
-    // A browsing context A is familiar with a second browsing context B if the following algorithm returns true:
-    auto const& A = *this;
-    auto const& B = other;
-
-    // 1. If A's active document's origin is same origin with B's active document's origin, then return true.
-    if (A.active_document()->origin().is_same_origin(B.active_document()->origin()))
-        return true;
-
-    // 2. If A's top-level browsing context is B, then return true.
-    if (A.top_level_browsing_context() == &B)
-        return true;
-
-    // 3. If B is an auxiliary browsing context and A is familiar with B's opener browsing context, then return true.
-    if (B.opener_browsing_context() != nullptr && A.is_familiar_with(*B.opener_browsing_context()))
-        return true;
-
-    // 4. If there exists an ancestor browsing context of B whose active document has the same origin as the active document of A, then return true.
-    // NOTE: This includes the case where A is an ancestor browsing context of B.
-
-    // If B's active document is not fully active then it cannot have ancestor browsing context
-    if (!B.active_document()->is_fully_active())
-        return false;
-
-    for (auto const& ancestor : B.active_document()->ancestor_navigables()) {
-        if (ancestor->active_document_origin()->is_same_origin(A.active_document()->origin()))
+        if (local_ancestor && local_ancestor->active_browsing_context().ptr() == this)
             return true;
     }
 
@@ -534,9 +443,34 @@ SandboxingFlagSet determine_the_creation_sandboxing_flags(BrowsingContext const&
     return sandboxing_flags;
 }
 
+// https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags
+// Given the navigable whose container is embedder, which reads the container's facts wherever the element is.
+SandboxingFlagSet determine_the_creation_sandboxing_flags(BrowsingContext const& browsing_context, Navigable const& navigable)
+{
+    // To determine the creation sandboxing flags for a browsing context browsing context, given null or an element
+    // embedder, return the union of the flags that are present in the following sandboxing flag sets:
+    SandboxingFlagSet sandboxing_flags {};
+
+    // - If embedder is null, then: the flags set on browsing context's popup sandboxing flag set.
+    if (!navigable.container_local_name().has_value()) {
+        sandboxing_flags |= browsing_context.popup_sandboxing_flag_set();
+    } else {
+        // - If embedder is an element, then: the flags set on embedder's iframe sandboxing flag set.
+        sandboxing_flags |= navigable.container_iframe_sandboxing_flag_set();
+
+        // - If embedder is an element, then: the flags set on embedder's node document's active sandboxing flag set.
+        sandboxing_flags |= navigable.container_document_active_sandboxing_flag_set();
+    }
+
+    return sandboxing_flags;
+}
+
 bool BrowsingContext::has_navigable_been_destroyed() const
 {
-    auto navigable = active_document()->navigable();
+    auto const* document = active_document();
+    if (!document)
+        return true;
+    auto navigable = document->navigable();
     return !navigable || navigable->has_been_destroyed();
 }
 

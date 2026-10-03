@@ -6,14 +6,14 @@
 
 #pragma once
 
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 
 namespace Web::SVG {
 
 class SVGClipPathElement final : public SVGGraphicsElement {
-    WEB_PLATFORM_OBJECT(SVGClipPathElement, SVGGraphicsElement);
+    WEB_WRAPPABLE(SVGClipPathElement, SVGGraphicsElement);
     GC_DECLARE_ALLOCATOR(SVGClipPathElement);
 
 public:
@@ -34,11 +34,10 @@ public:
         return m_clip_path_units.value_or(ClipPathUnits::UserSpaceOnUse);
     }
 
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
 private:
     SVGClipPathElement(DOM::Document&, DOM::QualifiedName);
-    virtual void initialize(JS::Realm&) override;
 
     virtual bool is_svg_clip_path_element() const final { return true; }
 

@@ -12,7 +12,7 @@
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/IndexedDB/IDBRecord.h>
 #include <LibWeb/IndexedDB/Internal/KeyGenerator.h>
-#include <LibWeb/IndexedDB/TransactionChanges.h>
+#include <LibWebCommon/IndexedDB/TransactionChanges.h>
 
 namespace Web::IndexedDB {
 
@@ -33,7 +33,7 @@ class MutationLog : public JS::Cell {
     GC_DECLARE_ALLOCATOR(MutationLog);
 
 public:
-    [[nodiscard]] static GC::Ref<MutationLog> create(JS::Realm&);
+    [[nodiscard]] static GC::Ref<MutationLog> create();
 
     // Schema-level entries (upgrade transactions only).
     void note_object_store_created();

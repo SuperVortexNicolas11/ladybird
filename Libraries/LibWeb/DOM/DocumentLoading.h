@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <AK/StringView.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
@@ -20,13 +20,12 @@ bool can_load_document_with_type(MimeSniff::MimeType const&);
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#read-ua-inline
 template<typename MutateDocument>
-GC::Ref<DOM::Document> create_document_for_inline_content(GC::Ptr<HTML::LocalNavigable> navigable, Optional<Utf16String> navigation_id, HTML::UserNavigationInvolvement user_involvement, MutateDocument mutate_document)
+GC::Ref<DOM::Document> create_document_for_inline_content(GC::Ptr<HTML::LocalNavigable> navigable, Optional<Utf16String> navigation_id, Bindings::NavigationTimingType navigation_timing_type, HTML::UserNavigationInvolvement user_involvement, URL::Origin origin, MutateDocument mutate_document)
 {
-    auto& vm = navigable->vm();
     VERIFY(navigable->active_document());
 
     // 1. Let origin be a new opaque origin.
-    auto origin = URL::Origin::create_opaque();
+    // NB: The UI process generated it with the navigation's population result, as it holds the document too.
 
     // 2. Let coop be a new opener policy.
     auto coop = HTML::OpenerPolicy {};
@@ -55,12 +54,13 @@ GC::Ref<DOM::Document> create_document_for_inline_content(GC::Ptr<HTML::LocalNav
     //    final sandboxing flag set: an empty set
     //    iframe element referrer policy: the empty string
     //    opener policy: coop
-    //    FIXME: navigation timing type: navTimingType
+    //    navigation timing type: navTimingType
     //    about base URL: null
     //    user involvement: userInvolvement
-    auto response = Fetch::Infrastructure::Response::create(vm);
+    auto response = Fetch::Infrastructure::Response::create();
     response->url_list().append(URL::about_error()); // AD-HOC: https://github.com/whatwg/html/issues/9122
-    auto navigation_params = vm.heap().allocate<HTML::NavigationParams>(
+    auto& heap = GC::Heap::the();
+    auto navigation_params = heap.allocate<HTML::NavigationParams>(
         move(navigation_id),
         navigable,
         nullptr,
@@ -70,10 +70,11 @@ GC::Ref<DOM::Document> create_document_for_inline_content(GC::Ptr<HTML::LocalNav
         move(coop_enforcement_result),
         nullptr,
         move(origin),
-        vm.heap().allocate<HTML::PolicyContainer>(vm.heap()),
+        heap.allocate<HTML::PolicyContainer>(heap),
         HTML::SandboxingFlagSet {},
         ReferrerPolicy::ReferrerPolicy::EmptyString,
         move(coop),
+        navigation_timing_type,
         OptionalNone {},
         user_involvement);
 

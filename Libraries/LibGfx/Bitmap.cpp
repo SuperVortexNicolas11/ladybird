@@ -60,7 +60,7 @@ size_t Bitmap::minimum_pitch(size_t width, BitmapFormat format)
     return width * element_size;
 }
 
-static bool size_would_overflow(BitmapFormat format, IntSize size)
+bool Bitmap::size_would_overflow(BitmapFormat format, IntSize size)
 {
     if (size.width() < 0 || size.height() < 0)
         return true;
@@ -224,9 +224,9 @@ ErrorOr<NonnullRefPtr<Bitmap>> Bitmap::to_bitmap_backed_by_anonymous_buffer() co
         // FIXME: The const_cast here is awkward.
         return NonnullRefPtr { const_cast<Bitmap&>(*this) };
     }
-    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(round_up_to_power_of_two(size_in_bytes(), PAGE_SIZE)));
-    auto bitmap = TRY(Bitmap::create_with_anonymous_buffer(format(), alpha_type(), move(buffer), size()));
-    memcpy(bitmap->scanline(0), scanline(0), size_in_bytes());
+    auto bitmap = TRY(Bitmap::create_shareable(format(), alpha_type(), size()));
+    for (int y = 0; y < height(); ++y)
+        memcpy(bitmap->scanline(y), scanline(y), bitmap->pitch());
     return bitmap;
 }
 

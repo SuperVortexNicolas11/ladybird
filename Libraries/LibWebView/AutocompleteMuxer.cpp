@@ -46,8 +46,8 @@ static void merge_suggestion(AutocompleteSuggestion& existing, AutocompleteSugge
             existing.title = move(suggestion.title);
         if (!existing.subtitle.has_value() && suggestion.subtitle.has_value())
             existing.subtitle = move(suggestion.subtitle);
-        if (!existing.favicon_base64_png.has_value() && suggestion.favicon_base64_png.has_value())
-            existing.favicon_base64_png = move(suggestion.favicon_base64_png);
+        if (!existing.favicon_png.has_value() && suggestion.favicon_png.has_value())
+            existing.favicon_png = move(suggestion.favicon_png);
     }
 
     existing.is_verbatim = is_verbatim;
@@ -78,7 +78,7 @@ static Optional<String> origin_family(AutocompleteSuggestion const& suggestion)
     auto url = URL::Parser::basic_parse(suggestion.text);
     if (!url.has_value() || !url->host().has_value())
         return {};
-    auto host = MUST(url->serialized_host().to_lowercase());
+    auto host = MUST(String::from_utf8(url->serialized_host())).to_ascii_lowercase();
     if (host.bytes_as_string_view().starts_with("www."sv))
         return MUST(String::from_utf8(host.bytes_as_string_view().substring_view(4)));
     return host;
@@ -199,6 +199,9 @@ Vector<AutocompleteSuggestion> mux_autocomplete_suggestions(
     if (limit == 0)
         return {};
 
+    auto verbatim_is_literal_url = verbatim_suggestion.has_value()
+        && verbatim_suggestion->source == AutocompleteSuggestionSource::LiteralURL;
+
     Vector<AutocompleteSuggestion> candidates;
     candidates.ensure_capacity(local_suggestions.size() + remote_suggestions.size() + (verbatim_suggestion.has_value() ? 1 : 0));
     if (verbatim_suggestion.has_value())
@@ -247,7 +250,9 @@ Vector<AutocompleteSuggestion> mux_autocomplete_suggestions(
 
     quick_sort(candidates, suggestion_is_better);
 
-    auto default_index = candidates.find_first_index_if([](auto const& suggestion) {
+    auto default_index = candidates.find_first_index_if([verbatim_is_literal_url](auto const& suggestion) {
+        if (verbatim_is_literal_url)
+            return suggestion.is_verbatim;
         return suggestion.can_be_automatically_selected;
     });
     if (default_index.has_value() && *default_index != 0) {

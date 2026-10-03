@@ -4,13 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLBodyElement.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/Gamepad/EventNames.h>
 #include <LibWeb/HTML/HTMLBodyElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
@@ -19,7 +20,6 @@
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Painting/Paintable.h>
 
 namespace Web::HTML {
 
@@ -31,17 +31,6 @@ HTMLBodyElement::HTMLBodyElement(DOM::Document& document, DOM::QualifiedName qua
 }
 
 HTMLBodyElement::~HTMLBodyElement() = default;
-
-void HTMLBodyElement::visit_edges(Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-}
-
-void HTMLBodyElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLBodyElement);
-    Base::initialize(realm);
-}
 
 bool HTMLBodyElement::is_presentational_hint(Utf16FlyString const& name) const
 {
@@ -120,18 +109,15 @@ void HTMLBodyElement::attribute_changed(Utf16FlyString const& name, Optional<Utf
     if (name == HTML::AttributeNames::link) {
         // https://html.spec.whatwg.org/multipage/rendering.html#the-page:rules-for-parsing-a-legacy-colour-value-3
         auto color = parse_legacy_color_value(value.has_value() ? value->utf16_view() : u""sv);
-        if (color.has_value())
-            document().set_normal_link_color(color.value());
+        document().set_normal_link_color(color);
     } else if (name == HTML::AttributeNames::alink) {
         // https://html.spec.whatwg.org/multipage/rendering.html#the-page:rules-for-parsing-a-legacy-colour-value-5
         auto color = parse_legacy_color_value(value.has_value() ? value->utf16_view() : u""sv);
-        if (color.has_value())
-            document().set_active_link_color(color.value());
+        document().set_active_link_color(color);
     } else if (name == HTML::AttributeNames::vlink) {
         // https://html.spec.whatwg.org/multipage/rendering.html#the-page:rules-for-parsing-a-legacy-colour-value-4
         auto color = parse_legacy_color_value(value.has_value() ? value->utf16_view() : u""sv);
-        if (color.has_value())
-            document().set_visited_link_color(color.value());
+        document().set_visited_link_color(color);
     } else if (name == HTML::AttributeNames::background) {
         // https://html.spec.whatwg.org/multipage/rendering.html#the-page:attr-background
         m_background_style_value = nullptr;

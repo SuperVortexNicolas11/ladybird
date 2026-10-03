@@ -51,7 +51,7 @@ static StyleValueFFI::FfiNumericType to_ffi_numeric_type(Optional<NumericType> c
     result.valid = type.has_value();
     if (type.has_value()) {
         type->for_each_type_and_exponent([&](auto base_type, i32 exponent) {
-            result.has_exponent[to_underlying(base_type)] = true;
+            result.has_exponent_bits |= 1u << to_underlying(base_type);
             result.exponents[to_underlying(base_type)] = exponent;
         });
         if (auto hint = type->percent_hint(); hint.has_value()) {
@@ -120,68 +120,6 @@ CalculationContext CalculationContext::for_property(PropertyNameAndID const& pro
     };
 }
 
-// https://drafts.csswg.org/css-values-4/#funcdef-min
-void CalculatedStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    struct Serialization {
-        StyleValueFFI::FfiCalcSerialization pieces;
-        ~Serialization() { StyleValueFFI::rust_calc_serialization_release(pieces.storage); }
-    } serialization { StyleValueFFI::rust_calc_serialize(m_value.operator->(), mode == SerializationMode::ResolvedValue) };
-
-    bool previous_piece_appended = false;
-    for (auto const& piece : ReadonlySpan<StyleValueFFI::FfiCalcSerializationPiece> { serialization.pieces.pieces, serialization.pieces.piece_count }) {
-        auto start_length = builder.length();
-        switch (piece.kind) {
-        case 0:
-            builder.append(StringView { piece.bytes, piece.length });
-            break;
-        case 1:
-            switch (piece.numeric_kind) {
-            case 0:
-                Number { static_cast<Number::Type>(piece.unit_or_channel), piece.value }.serialize(builder, mode);
-                break;
-            case 1:
-                Angle { piece.value, static_cast<AngleUnit>(piece.unit_or_channel) }.serialize(builder, mode);
-                break;
-            case 2:
-                Flex { piece.value, static_cast<FlexUnit>(piece.unit_or_channel) }.serialize(builder, mode);
-                break;
-            case 3:
-                Frequency { piece.value, static_cast<FrequencyUnit>(piece.unit_or_channel) }.serialize(builder, mode);
-                break;
-            case 4:
-                Length { piece.value, static_cast<LengthUnit>(piece.unit_or_channel) }.serialize(builder, mode);
-                break;
-            case 5:
-                Percentage { piece.value }.serialize(builder, mode);
-                break;
-            case 6:
-                Resolution { piece.value, static_cast<ResolutionUnit>(piece.unit_or_channel) }.serialize(builder, mode);
-                break;
-            case 7:
-                Time { piece.value, static_cast<TimeUnit>(piece.unit_or_channel) }.serialize(builder, mode);
-                break;
-            default:
-                VERIFY_NOT_REACHED();
-            }
-            break;
-        case 2:
-            wrap_borrowed_style_value_data(piece.style_value)->serialize(builder, mode);
-            break;
-        case 3:
-            builder.append(CSS::to_string(static_cast<ChannelKeyword>(piece.unit_or_channel)));
-            break;
-        case 4:
-            if (previous_piece_appended)
-                builder.append(StringView { piece.bytes, piece.length });
-            break;
-        default:
-            VERIFY_NOT_REACHED();
-        }
-        previous_piece_appended = builder.length() > start_length;
-    }
-}
-
 // The RoundingStrategy discriminants cross the boundary as round()'s strategy code; pin them.
 static_assert(to_underlying(RoundingStrategy::Down) == 0);
 static_assert(to_underlying(RoundingStrategy::Nearest) == 1);
@@ -210,7 +148,7 @@ static Optional<NumericType> from_ffi_numeric_type(StyleValueFFI::FfiNumericType
         return {};
     NumericType result;
     for (auto i = 0; i < to_underlying(NumericType::BaseType::__Count); ++i) {
-        if (type.has_exponent[i])
+        if (type.has_exponent_bits & (1u << i))
             result.set_exponent(static_cast<NumericType::BaseType>(i), type.exponents[i]);
     }
     if (type.has_percent_hint)
@@ -314,6 +252,9 @@ ValueComparingNonnullRefPtr<StyleValue const> CalculatedStyleValue::absolutized(
     auto result = StyleValueFFI::rust_calc_absolutize(m_value.operator->(), &resolution_snapshot.ffi_context);
     if (result.is_percentage)
         return PercentageStyleValue::create(Percentage { result.percentage_value });
+
+    if (result.collapsed)
+        return adopt_rust_style_value_data(static_cast<StyleValueFFI::StyleValueData const*>(result.collapsed));
 
     // The simplified root transfers straight into the new value's data; no
     // C++ tree is materialized.
@@ -487,7 +428,7 @@ bool CalculatedStyleValue::is_fully_simplified() const
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#reify-a-math-expression
-static GC::Ptr<CSSNumericValue> reify_rust_calculation(JS::Realm& realm, void const* calculated_data)
+static GC::Ptr<CSSNumericValue> reify_rust_calculation(void const* calculated_data)
 {
     struct Reification {
         StyleValueFFI::FfiCalcReification description;
@@ -516,63 +457,63 @@ static GC::Ptr<CSSNumericValue> reify_rust_calculation(JS::Realm& realm, void co
                 VERIFY(index < reified_nodes.size());
                 result.append(reified_nodes[index]);
             }
-            return CSSNumericArray::create(realm, move(result));
+            return CSSNumericArray::create(move(result));
         };
 
         switch (node.kind) {
         case 0:
             switch (node.numeric_kind) {
             case 0:
-                reified_nodes.append(CSSUnitValue::create(realm, node.value, "number"_utf16_fly_string));
+                reified_nodes.append(CSSUnitValue::create(node.value, "number"_utf16_fly_string));
                 break;
             case 1:
-                reified_nodes.append(CSSUnitValue::create(realm, node.value, Angle { node.value, static_cast<AngleUnit>(node.unit) }.unit_name()));
+                reified_nodes.append(CSSUnitValue::create(node.value, Angle { node.value, static_cast<AngleUnit>(node.unit) }.unit_name()));
                 break;
             case 2:
-                reified_nodes.append(CSSUnitValue::create(realm, node.value, Flex { node.value, static_cast<FlexUnit>(node.unit) }.unit_name()));
+                reified_nodes.append(CSSUnitValue::create(node.value, Flex { node.value, static_cast<FlexUnit>(node.unit) }.unit_name()));
                 break;
             case 3:
-                reified_nodes.append(CSSUnitValue::create(realm, node.value, Frequency { node.value, static_cast<FrequencyUnit>(node.unit) }.unit_name()));
+                reified_nodes.append(CSSUnitValue::create(node.value, Frequency { node.value, static_cast<FrequencyUnit>(node.unit) }.unit_name()));
                 break;
             case 4:
-                reified_nodes.append(CSSUnitValue::create(realm, node.value, Length { node.value, static_cast<LengthUnit>(node.unit) }.unit_name()));
+                reified_nodes.append(CSSUnitValue::create(node.value, Length { node.value, static_cast<LengthUnit>(node.unit) }.unit_name()));
                 break;
             case 5:
-                reified_nodes.append(CSSUnitValue::create(realm, node.value, "percent"_utf16_fly_string));
+                reified_nodes.append(CSSUnitValue::create(node.value, "percent"_utf16_fly_string));
                 break;
             case 6:
-                reified_nodes.append(CSSUnitValue::create(realm, node.value, Resolution { node.value, static_cast<ResolutionUnit>(node.unit) }.unit_name()));
+                reified_nodes.append(CSSUnitValue::create(node.value, Resolution { node.value, static_cast<ResolutionUnit>(node.unit) }.unit_name()));
                 break;
             case 7:
-                reified_nodes.append(CSSUnitValue::create(realm, node.value, Time { node.value, static_cast<TimeUnit>(node.unit) }.unit_name()));
+                reified_nodes.append(CSSUnitValue::create(node.value, Time { node.value, static_cast<TimeUnit>(node.unit) }.unit_name()));
                 break;
             default:
                 VERIFY_NOT_REACHED();
             }
             break;
         case 2:
-            reified_nodes.append(CSSMathSum::create(realm, move(numeric_type), reify_children()));
+            reified_nodes.append(CSSMathSum::create(move(numeric_type), reify_children()));
             break;
         case 3:
-            reified_nodes.append(CSSMathProduct::create(realm, move(numeric_type), reify_children()));
+            reified_nodes.append(CSSMathProduct::create(move(numeric_type), reify_children()));
             break;
         case 4:
             VERIFY(children.size() == 1);
-            reified_nodes.append(CSSMathNegate::create(realm, move(numeric_type), child(0)));
+            reified_nodes.append(CSSMathNegate::create(move(numeric_type), child(0)));
             break;
         case 5:
             VERIFY(children.size() == 1);
-            reified_nodes.append(CSSMathInvert::create(realm, move(numeric_type), child(0)));
+            reified_nodes.append(CSSMathInvert::create(move(numeric_type), child(0)));
             break;
         case 6:
-            reified_nodes.append(CSSMathMin::create(realm, move(numeric_type), reify_children()));
+            reified_nodes.append(CSSMathMin::create(move(numeric_type), reify_children()));
             break;
         case 7:
-            reified_nodes.append(CSSMathMax::create(realm, move(numeric_type), reify_children()));
+            reified_nodes.append(CSSMathMax::create(move(numeric_type), reify_children()));
             break;
         case 8:
             VERIFY(children.size() == 3);
-            reified_nodes.append(CSSMathClamp::create(realm, move(numeric_type), child(0), child(1), child(2)));
+            reified_nodes.append(CSSMathClamp::create(move(numeric_type), child(0), child(1), child(2)));
             break;
         default:
             VERIFY_NOT_REACHED();
@@ -586,15 +527,15 @@ bool CalculatedStyleValue::contains_anchor_function() const
     return StyleValueFFI::rust_calc_contains_anchor(m_value.operator->());
 }
 
-GC::Ref<CSSStyleValue> CalculatedStyleValue::reify(JS::Realm& realm, Utf16FlyString const& associated_property) const
+GC::Ref<CSSStyleValue> CalculatedStyleValue::reify(Utf16FlyString const& associated_property) const
 {
     // NB: This spec algorithm is incomplete and assumes we do not already have a calculation tree.
     //     Rust describes the existing tree in one batch instead.
-    if (auto reified = reify_rust_calculation(realm, m_value.operator->()))
+    if (auto reified = reify_rust_calculation(m_value.operator->()))
         return *reified;
     // Some math functions are not reifiable yet. If we contain one, we have to fall back to CSSStyleValue.
     // https://github.com/w3c/css-houdini-drafts/issues/1090
-    return default_reify(realm, associated_property);
+    return default_reify(associated_property);
 }
 
 CalcNodeRef CalcNodeRef::numeric(NumericValue const& value)

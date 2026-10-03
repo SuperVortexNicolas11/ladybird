@@ -4,12 +4,71 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Hex.h>
+#include <AK/LEB128.h>
 #include <AK/MemoryStream.h>
 #include <LibCore/File.h>
 #include <LibTest/TestCase.h>
 #include <LibWasm/AbstractMachine/AbstractMachine.h>
 #include <LibWasm/AbstractMachine/Configuration.h>
+#include <LibWasm/AbstractMachine/Validator.h>
 #include <LibWasm/Constants.h>
+
+TEST_CASE(element_segments_require_reference_types)
+{
+    auto bytes = MUST(decode_hex("0061736d01000000040401700001090801060041000b7f00"sv));
+    FixedMemoryStream stream { bytes.bytes() };
+    auto module = MUST(Wasm::Module::parse(stream));
+
+    Wasm::AbstractMachine machine;
+    EXPECT(machine.validate(*module, {}, Wasm::CompileToNative::No).is_error());
+}
+
+TEST_CASE(function_import_requires_function_type)
+{
+    auto bytes = MUST(decode_hex("0061736d010000000106025f00600000020701016d01660000"sv));
+    FixedMemoryStream stream { bytes.bytes() };
+    auto module = MUST(Wasm::Module::parse(stream));
+
+    Wasm::AbstractMachine machine;
+    EXPECT(machine.validate(*module, {}, Wasm::CompileToNative::No).is_error());
+}
+
+TEST_CASE(interpreter_preserves_large_alias_chain)
+{
+    constexpr i32 chain_length = 4096;
+    auto bytes = MUST(decode_hex("0061736d0100000001060160017f017f030201000707010372756e0000"sv));
+    auto body = MUST(decode_hex("002000"sv));
+    for (i32 i = 0; i < chain_length; ++i) {
+        body.append(0x41); // i32.const 1
+        body.append(1);
+        body.append(0x6a); // i32.add
+    }
+    body.append(0x0b);
+
+    ByteBuffer code;
+    code.append(1);
+    LEB128<u32>::append_to(code, static_cast<u32>(body.size()));
+    code.append(body.bytes());
+    bytes.append(10);
+    LEB128<u32>::append_to(bytes, static_cast<u32>(code.size()));
+    bytes.append(code.bytes());
+
+    FixedMemoryStream stream { bytes.bytes() };
+    auto module = MUST(Wasm::Module::parse(stream));
+    Wasm::AbstractMachine machine;
+    MUST(machine.validate(*module, {}, Wasm::CompileToNative::No));
+    auto instance = MUST(machine.instantiate(*module, {}));
+    auto run = instance->exports()[0].value().get<Wasm::FunctionAddress>();
+    EXPECT(!module->has_attempted_cranelift_compilation());
+
+    for (auto input : { 41, -chain_length }) {
+        auto result = machine.invoke(run, { Wasm::Value(static_cast<i32>(input)) });
+        EXPECT(!result.is_trap());
+        EXPECT_EQ(result.values().size(), 1u);
+        EXPECT_EQ(result.values()[0].to<i32>(), input + chain_length);
+    }
+}
 
 TEST_CASE(compiled_to_interpreter_call_restores_label_stack)
 {
@@ -45,6 +104,116 @@ TEST_CASE(compiled_to_interpreter_call_restores_label_stack)
     EXPECT(!result.is_trap());
     EXPECT_EQ(result.values().size(), 1u);
     EXPECT_EQ(result.values()[0].to<i32>(), 1);
+}
+
+TEST_CASE(reentrant_invoke_uses_independent_execution_state)
+{
+    auto file = MUST(Core::File::open("Fixtures/label-stack-cleanup.wasm"sv, Core::File::OpenMode::Read));
+    auto bytes = MUST(file->read_until_eof());
+    FixedMemoryStream stream { bytes.bytes() };
+    auto module = MUST(Wasm::Module::parse(stream));
+
+    Wasm::AbstractMachine machine;
+    Optional<Wasm::FunctionAddress> run;
+    bool should_reenter { true };
+    Wasm::FunctionType label_stack_size_type { {}, { Wasm::ValueType(Wasm::ValueType::I32) } };
+    auto label_stack_size = machine.store().allocate(Wasm::HostFunction {
+        [&](Wasm::Configuration& configuration, Span<Wasm::Value>) -> Wasm::Result {
+            if (should_reenter) {
+                should_reenter = false;
+                return machine.invoke(*run, {});
+            }
+
+            Vector<Wasm::Value> result;
+            result.append(Wasm::Value(static_cast<i32>(configuration.label_stack().size())));
+            return Wasm::Result { move(result) };
+        },
+        label_stack_size_type,
+        "label_stack_size" });
+    VERIFY(label_stack_size.has_value());
+
+    Vector<Wasm::ExternValue> imports;
+    imports.append(*label_stack_size);
+    auto instance = MUST(machine.instantiate(*module, move(imports)));
+
+    for (auto const& export_ : instance->exports()) {
+        if (export_.name() == "run"sv)
+            run = export_.value().get<Wasm::FunctionAddress>();
+    }
+    VERIFY(run.has_value());
+
+    auto result = machine.invoke(*run, {});
+    EXPECT(!result.is_trap());
+    EXPECT_EQ(result.values().size(), 1u);
+    EXPECT_EQ(result.values()[0].to<i32>(), 1);
+}
+
+TEST_CASE(reentrant_compiled_memory_fault_uses_innermost_recovery_context)
+{
+    auto parse_fixture = [](StringView path) {
+        auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
+        auto bytes = MUST(file->read_until_eof());
+        FixedMemoryStream stream { bytes.bytes() };
+        return MUST(Wasm::Module::parse(stream));
+    };
+
+    Wasm::AbstractMachine machine;
+
+    auto inner_module = parse_fixture("Fixtures/memory-guard-trap.wasm"sv);
+    auto inner_instance = MUST(machine.instantiate(*inner_module, {}));
+    Optional<Wasm::FunctionAddress> load_high;
+    for (auto const& export_ : inner_instance->exports()) {
+        if (export_.name() == "load_high"sv)
+            load_high = export_.value().get<Wasm::FunctionAddress>();
+    }
+    VERIFY(load_high.has_value());
+
+    Wasm::FunctionType host_type { {}, { Wasm::ValueType(Wasm::ValueType::I32) } };
+    auto call_inner = machine.store().allocate(Wasm::HostFunction {
+        [&](Wasm::Configuration&, Span<Wasm::Value>) -> Wasm::Result {
+            return machine.invoke(*load_high, { Wasm::Value(static_cast<i32>(0)) });
+        },
+        host_type,
+        "call_inner" });
+    VERIFY(call_inner.has_value());
+
+    auto outer_module = parse_fixture("Fixtures/label-stack-cleanup.wasm"sv);
+    Vector<Wasm::ExternValue> imports;
+    imports.append(*call_inner);
+    auto outer_instance = MUST(machine.instantiate(*outer_module, move(imports)));
+    Optional<Wasm::FunctionAddress> run;
+    for (auto const& export_ : outer_instance->exports()) {
+        if (export_.name() == "run"sv)
+            run = export_.value().get<Wasm::FunctionAddress>();
+    }
+    VERIFY(run.has_value());
+
+    auto result = machine.invoke(*run, {});
+    EXPECT(result.is_trap());
+    EXPECT_EQ(result.trap().format(), "Memory access out of bounds"sv);
+}
+
+TEST_CASE(compiled_indirect_call_preserves_arguments_and_result)
+{
+    auto file = MUST(Core::File::open("Fixtures/indirect-call.wasm"sv, Core::File::OpenMode::Read));
+    auto bytes = MUST(file->read_until_eof());
+    FixedMemoryStream stream { bytes.bytes() };
+    auto module = MUST(Wasm::Module::parse(stream));
+
+    Wasm::AbstractMachine machine;
+    auto instance = MUST(machine.instantiate(*module, {}));
+
+    Optional<Wasm::FunctionAddress> run;
+    for (auto const& export_ : instance->exports()) {
+        if (export_.name() == "run"sv)
+            run = export_.value().get<Wasm::FunctionAddress>();
+    }
+    VERIFY(run.has_value());
+
+    auto result = machine.invoke(*run, { Wasm::Value(static_cast<i32>(41)) });
+    EXPECT(!result.is_trap());
+    EXPECT_EQ(result.values().size(), 1u);
+    EXPECT_EQ(result.values()[0].to<i32>(), 42);
 }
 
 TEST_CASE(compiled_memory_access_traps_out_of_bounds)

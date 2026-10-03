@@ -7,18 +7,18 @@
 #include <AK/Vector.h>
 #include <Compositor/HostWebGLContext.h>
 #include <Compositor/WebGLCommandReplayer.h>
+#include <LibCompositing/WebGL/TextureUpload.h>
+#include <LibCompositing/WebGL/WebGLCommandList.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/BitmapExport.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/PaintingSurface.h>
 #include <LibGfx/ShareableBitmap.h>
 #include <LibGfx/SkiaBackendContext.h>
-#include <LibWeb/WebGL/TextureUpload.h>
-#include <LibWeb/WebGL/WebGLCommandList.h>
 
 namespace Compositor {
 
-using namespace Web::WebGL;
+using namespace Compositing::WebGL;
 
 static constexpr GLsizei max_webgl_string_list_entries = 16384;
 
@@ -54,14 +54,7 @@ Optional<ReadonlyBytes> HostWebGLContext::shared_command_buffer_range(u64 offset
 ErrorOr<void> HostWebGLContext::execute_commands(ReadonlyBytes bytes, Vector<Gfx::DecodedImageFrame> const& bitmaps)
 {
     m_gl_context->make_current();
-
-    // A non-preserving context's drawing buffer is cleared after being prepared for
-    // compositing, but the clear is deferred to here (the start of the next frame's
-    // commands) so a readback taken before then still sees the rendered frame.
-    if (m_needs_clear_before_next_frame) {
-        m_gl_context->clear_buffer_to_default_values();
-        m_needs_clear_before_next_frame = false;
-    }
+    clear_drawing_buffer_if_needed();
 
     return WebGLCommandList::for_each_command(bytes, [&]<typename Command>(Command const& command, [[maybe_unused]] ReadonlyBytes payload) -> ErrorOr<void> {
         if constexpr (IsSame<Command, Commands::SetDrawingBufferSize>) {
@@ -144,9 +137,21 @@ ErrorOr<void> HostWebGLContext::tex_sub_image3d_from_bitmap(Commands::TexSubImag
     return {};
 }
 
+// A non-preserving context's drawing buffer is cleared after being prepared for
+// compositing, but the clear is deferred until the next GL command or read, so a
+// readback of the presented frame taken before then still sees the rendered frame.
+void HostWebGLContext::clear_drawing_buffer_if_needed()
+{
+    if (!m_needs_clear_before_next_frame)
+        return;
+    m_gl_context->clear_buffer_to_default_values();
+    m_needs_clear_before_next_frame = false;
+}
+
 ErrorOr<ByteBuffer> HostWebGLContext::execute_sync_call(ReadonlyBytes request)
 {
     m_gl_context->make_current();
+    clear_drawing_buffer_if_needed();
     return handle_webgl_sync_call(*m_gl_context, m_objects, request);
 }
 
@@ -155,7 +160,7 @@ ErrorOr<NonnullRefPtr<Gfx::PaintingSurface>> HostWebGLContext::prepare_for_compo
     // Flush all pending GL work so Skia samples the finished drawing buffer. The
     // default framebuffer was written behind Skia's back, so discard cached snapshots
     // before the display-list player asks Skia for an image.
-    m_gl_context->present(/* preserve_drawing_buffer= */ true);
+    m_gl_context->present();
 
     auto drawing_surface = m_gl_context->surface();
     if (!drawing_surface)
@@ -170,6 +175,13 @@ ErrorOr<NonnullRefPtr<Gfx::PaintingSurface>> HostWebGLContext::prepare_for_compo
     return drawing_surface.release_nonnull();
 }
 
+void HostWebGLContext::clear_drawing_buffer()
+{
+    m_gl_context->make_current();
+    m_gl_context->clear_buffer_to_default_values();
+    m_needs_clear_before_next_frame = false;
+}
+
 RefPtr<Gfx::PaintingSurface> HostWebGLContext::surface()
 {
     return m_gl_context->surface();
@@ -178,7 +190,7 @@ RefPtr<Gfx::PaintingSurface> HostWebGLContext::surface()
 Gfx::ShareableBitmap HostWebGLContext::read_back_drawing_buffer(Gfx::IntRect rect)
 {
     m_gl_context->make_current();
-    m_gl_context->present(/* preserve_drawing_buffer= */ true);
+    m_gl_context->present();
     auto surface = m_gl_context->surface();
     if (!surface)
         return {};
@@ -202,6 +214,7 @@ ReadPixelsResult HostWebGLContext::read_pixels_robust_angle(GLint x, GLint y, GL
     VERIFY(static_cast<size_t>(buf_size) <= pixels.size());
 
     m_gl_context->make_current();
+    clear_drawing_buffer_if_needed();
 
     GLsizei length = 0;
     GLsizei columns = 0;
@@ -214,7 +227,7 @@ ReadPixelsResult HostWebGLContext::read_pixels_robust_angle(GLint x, GLint y, GL
     };
 }
 
-bool HostWebGLContext::read_buffer_sub_data(GLenum target, Web::WebGL::GLintptr offset, Web::WebGL::GLintptr size, Core::AnonymousBuffer data)
+bool HostWebGLContext::read_buffer_sub_data(GLenum target, Compositing::WebGL::GLintptr offset, Compositing::WebGL::GLintptr size, Core::AnonymousBuffer data)
 {
     VERIFY(size >= 0);
     VERIFY(static_cast<size_t>(size) <= data.size());
@@ -298,7 +311,7 @@ ErrorOr<ByteBuffer> handle_one(OpenGLContext& gl, WebGLObjectMap&, SyncCalls::Ge
     GLsizei length = 0;
     gl.get_vertex_attrib_pointerv_robust_angle(request.index, request.pname, 1, &length, &pointer);
     SyncCalls::GetVertexAttribPointervRobustANGLE::Reply reply {
-        .pointer = static_cast<Web::WebGL::GLintptr>(reinterpret_cast<uintptr_t>(pointer)),
+        .pointer = static_cast<Compositing::WebGL::GLintptr>(reinterpret_cast<uintptr_t>(pointer)),
     };
     return WebGLSyncCall::encode_reply(reply);
 }

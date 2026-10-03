@@ -6,16 +6,19 @@
 
 #pragma once
 
+#include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Variant.h>
+#include <AK/Vector.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/PercentageOr.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
 #include <LibWeb/Layout/TreeBuilderRustFFI.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 
 namespace Web::CSS {
 
@@ -27,48 +30,46 @@ class Size;
 
 namespace Web::Layout {
 
-class LayoutRustBridge {
-public:
-    LayoutRustBridge();
-    ~LayoutRustBridge();
+// Registers the document-side answers every layout pass needs on the arena, once per document.
+WEB_API void register_layout_host(NodeArena&, DOM::Document&);
 
-    void run_root_layout(Box& viewport, NodeWithStyleAndBoxModelMetrics* document_element_layout_node, CSSPixels viewport_inline_size, CSSPixels viewport_block_size, bool should_collect_devtools_layout_data);
-    void compute_subtree_layout(Box&, Painting::Paintable& paintable_to_replace);
-    void replay_saved_abspos_layout(Box&, Painting::Paintable& paintable_to_replace);
+// Publishes what an SVG element's attributes parse to, under its style node. The publication leaves with the
+// identity. An element's attributes are layout input that no pass can change, so the document publishes them as
+// they are written rather than answering for them while a pass runs.
+void publish_svg_attribute_facts(DOM::Element&);
+void publish_svg_style_references(DOM::Element&);
 
-private:
-    [[nodiscard]] RustFFI::FfiLayoutFcCallbacks formatting_context_callbacks();
-    [[nodiscard]] RustFFI::FfiCommitSink commit_sink();
+// Publishes whether a row built for the node sits in the user agent shadow tree of the focused text control, which is
+// what a caret is painted inside. The overflow pass reserves a pixel for the caret, so it reads the published answer
+// rather than asking the document who has focus.
+void publish_is_in_focused_text_control(DOM::Node const&);
 
-    struct LineCommitContext;
-    Box const* m_commit_root { nullptr };
-    OwnPtr<LineCommitContext> m_line_commit_context;
-    RefPtr<Painting::Paintable> m_replaced_paintable;
-    RefPtr<Painting::Paintable> m_commit_parent_paintable;
-    RefPtr<Painting::Paintable> m_commit_insert_before_paintable;
-};
+// Publishes what the element has scrolled to, under its identity. The element's box is replaced whenever its subtree is
+// rebuilt, so the offset is held against the identity that outlives it, and every row built for the element reads it
+// there.
+void publish_element_scroll_offset(DOM::Element const&);
 
-[[nodiscard]] Optional<RustFFI::FfiFormattingContextType> formatting_context_type_created_by_box(Box const&);
-[[nodiscard]] StringView formatting_context_type_name(RustFFI::FfiFormattingContextType);
-[[nodiscard]] bool box_inset_properties_contain_anchor_functions(Box const&);
-[[nodiscard]] bool can_replay_saved_abspos_layout_inputs_after_style_change(Box const&);
+// Publishes the spans a table cell's or table column's attributes give it, under its identity, which table fixup reads
+// before the build that stamps the element's row is over. Every other element spans one of each and publishes nothing.
+void publish_table_spans(DOM::Element const&);
 
-// True while a synchronous Rust layout pass (including its commit) is on the
-// stack. Computed values must never be replaced in that window: the pass
-// caches decoded style and borrows payload pointers that a replacement would
-// invalidate under it.
-[[nodiscard]] WEB_API bool layout_pass_currently_running();
+inline RustFFI::FfiSvgNumberPercentage to_ffi_number_percentage(SVG::NumberPercentage value)
+{
+    return { .value = value.value(), .is_percentage = value.is_percentage() };
+}
 
 }
 
-// Releases one position-anchor name reference transferred by a lazy style
-// field decode.
-extern "C" WEB_API void ladybird_layout_release_anchor_name_handle(size_t);
-
-// Per-code-point classification lookups for the Rust text chunker. The
+// Per-code-point classification lookups for native text processing. The
 // line-break-class groupings implement the css-text-4 word-break policies.
 extern "C" WEB_API u8 ladybird_layout_text_type_for_code_point(u32);
 extern "C" WEB_API bool ladybird_layout_code_point_has_break_all_line_break_class(u32);
 extern "C" WEB_API bool ladybird_layout_code_point_has_keep_all_line_break_class(u32);
 extern "C" WEB_API bool ladybird_layout_code_point_has_combining_mark_line_break_class(u32);
 extern "C" WEB_API bool ladybird_layout_code_point_has_emoji_property(u32);
+extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layout_code_point_category_facts(u32);
+
+extern "C" WEB_API void ladybird_layout_node_shell_destroy(void*);
+extern "C" WEB_API void ladybird_layout_owned_image_provider_destroy(void*);
+extern "C" WEB_API void ladybird_layout_image_observers_destroy(void*);
+extern "C" WEB_API void ladybird_layout_owned_image_provider_notify_detach(void*);

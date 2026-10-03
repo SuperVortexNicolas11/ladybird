@@ -32,7 +32,6 @@ env:
   # github.workspace = /home/runner/work/ladybird/ladybird
   LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
   CCACHE_DIR: ${{ github.workspace }}/.ccache
-  VCPKG_ROOT: ${{ github.workspace }}/Build/vcpkg
 
   # Use the compiler version for the ccache compiler hash. Otherwise, if plugins are enabled, the plugin .so files
   # are included in the hash. This results in clean builds on every run as the .so files are rebuilt.
@@ -57,6 +56,16 @@ jobs:
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
 
+      # FIXME: The kernel of our Linux runners is built without Landlock, and helpers refuse to run without it. Remove this
+      #        once the runners have Landlock, so that CI tests the sandbox that users get.
+      - name: Check for Landlock
+        if: ${{ inputs.os_name == 'Linux' }}
+        run: |
+          if ! python3 -c 'import ctypes, sys; sys.exit(0 if ctypes.CDLL(None, use_errno=True).syscall(444, None, 0, 1) > 0 else 1)'; then
+            echo "::warning::This kernel has no Landlock, so the helpers run without file system confinement. The rest of the sandbox still applies."
+            echo "LADYBIRD_UNSAFE_ALLOW_MISSING_LANDLOCK=1" >> "$GITHUB_ENV"
+          fi
+
       - name: Set Up Environment
         uses: ./.github/actions/setup
         id: 'setup'
@@ -64,6 +73,7 @@ jobs:
           os: ${{ inputs.os_name }}
           arch: ${{ inputs.arch }}
           toolchain: ${{ inputs.toolchain }}
+          build_preset: ${{ inputs.build_preset }}
 
       # === PREPARE FOR BUILDING ===
 
@@ -171,13 +181,6 @@ jobs:
           cmake --build .
           cmake --install . --strip --prefix "${GITHUB_WORKSPACE}/Install"
 
-      - name: Build with Qt
-        if: ${{ inputs.os_name == 'macOS' && inputs.build_preset == 'Sanitizer' }}
-        working-directory: ${{ github.workspace }}
-        run: |
-          cmake --preset ${{ inputs.build_preset }} -B Build -DLADYBIRD_GUI_FRAMEWORK=Qt
-          cmake --build Build
-
       - name: Save Caches
         uses: ./.github/actions/cache-save
         with:
@@ -197,16 +200,25 @@ jobs:
             --load="module-native-protocol-unix auth-anonymous=1 socket=/tmp/pulse-native" \
             --load="module-null-sink sink_name=virtual_sink"
 
+      - name: Verify StyleEngine invariants
+        if: ${{ inputs.os_name == 'Linux' && (inputs.build_preset == 'Release' || inputs.build_preset == 'Sanitizer') }}
+        timeout-minutes: 5
+        working-directory: ${{ github.workspace }}/Build/Tests/LibWeb/test-web
+        run: |
+          ../../../bin/test-web --verify-style -j10 \
+            -f Text/input/css/style-engine/ \
+            -f Text/input/css/style-invalidation/
+
       - name: Check new tests for flakiness
         if: ${{ github.event_name == 'pull_request' && inputs.build_preset == 'Sanitizer' && (inputs.os_name == 'Linux' || inputs.os_name == 'macOS') }}
         timeout-minutes: 30
         working-directory: ${{ github.workspace }}
         shell: bash
         run: |
-          git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
+          git fetch --no-tags --depth=2 origin "$(git rev-parse HEAD)"
           "${{ env.pythonLocation }}/bin/python" Meta/check-test-flakiness.py \
             --test-web-binary Build/bin/test-web \
-            --base-ref ${{ github.event.pull_request.base.sha }} \
+            --base-ref HEAD^1 \
             --deadline-seconds 1200 \
             --python-executable "${{ env.pythonLocation }}/bin/python" \
             | tee -a "$GITHUB_STEP_SUMMARY"

@@ -6,7 +6,7 @@
 
 #include <LibGC/RootVector.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/SerializationMode.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/AbstractElement.h>
@@ -21,7 +21,7 @@
 
 namespace Web::Editing {
 
-static bool computed_property_values_are_equivalent(CSS::PropertyID property_id, CSS::ComputedProperties const& with_inline_style, CSS::ComputedProperties const& without_inline_style)
+static bool computed_property_values_are_equivalent(CSS::PropertyID property_id, CSS::ComputedStyleWorkingSet const& with_inline_style, CSS::ComputedStyleWorkingSet const& without_inline_style)
 {
     auto const& value_with_inline_style = with_inline_style.property(property_id);
     auto const& value_without_inline_style = without_inline_style.property(property_id);
@@ -61,13 +61,19 @@ void remove_redundant_styles_from_inserted_content(InsertedContent& inserted_con
 
         element->document().update_layout_if_needed_for_node(element, DOM::UpdateLayoutReason::NavigableSelectedText);
         DOM::AbstractElement abstract_element { element };
-        auto const* computed_values = abstract_element.computed_values();
+        auto computed_values = abstract_element.computed_style();
         if (!computed_values)
             continue;
 
         auto& style_computer = element->document().style_computer();
         auto style_with_inline_declaration = style_computer.reconstruct_computed_properties(*computed_values);
-        auto style_without_inline_declaration = style_computer.compute_properties_without_inline_style(abstract_element);
+        // What the element would compute to without its inline declaration, which the style engine answers privately
+        // without touching the live element. An element it gives no answer for keeps its inline style.
+        auto answer = style_computer.style_engine().answer_record_demand(element->style_node_id(), CSS::StyleEngine::RecordDemand::ElementReadWithoutInlineStyle).record;
+        auto view = style_computer.computed_style_record_view(CSS::StyleRecordID { answer.style_record });
+        if (!view)
+            continue;
+        auto style_without_inline_declaration = style_computer.reconstruct_computed_properties(*view);
 
         Vector<CSS::StyleProperty> retained_properties;
         retained_properties.ensure_capacity(inline_style->properties().size());
@@ -79,7 +85,7 @@ void remove_redundant_styles_from_inserted_content(InsertedContent& inserted_con
         if (retained_properties.size() == inline_style->properties().size())
             continue;
 
-        auto retained_style = CSS::CSSStyleProperties::create(element->realm(), move(retained_properties), inline_style->custom_properties());
+        auto retained_style = CSS::CSSStyleProperties::create(move(retained_properties), inline_style->custom_properties());
         auto serialized_style = retained_style->serialized();
         if (!serialized_style.is_empty()) {
             set_attribute_value(element, HTML::AttributeNames::style, serialized_style);

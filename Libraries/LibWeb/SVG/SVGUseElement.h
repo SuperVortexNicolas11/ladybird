@@ -8,7 +8,6 @@
 
 #include <AK/IntrusiveList.h>
 #include <AK/Utf16String.h>
-#include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/DocumentObserver.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
@@ -19,12 +18,10 @@ namespace Web::SVG {
 class SVGUseElement final
     : public SVGGraphicsElement
     , public SVGURIReferenceMixin<SupportsXLinkHref::Yes> {
-    WEB_PLATFORM_OBJECT(SVGUseElement, SVGGraphicsElement);
+    WEB_WRAPPABLE(SVGUseElement, SVGGraphicsElement);
     GC_DECLARE_ALLOCATOR(SVGUseElement);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
     virtual ~SVGUseElement() override = default;
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
@@ -38,26 +35,25 @@ public:
     //         https://github.com/w3c/svgwg/issues/1153
 
     // https://w3c.github.io/svgwg/svg2-draft/struct.html#__svg__SVGUseElement__x
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, SVGLengthValue::number(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/struct.html#__svg__SVGUseElement__y
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, SVGLengthValue::number(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/struct.html#__svg__SVGUseElement__width
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, SVGLengthValue::number(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/struct.html#__svg__SVGUseElement__height
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, SVGLengthValue::number(0));
 
     GC::Ptr<SVGElement> instance_root() const;
-    GC::Ptr<SVGElement> animated_instance_root() const;
 
-    virtual Gfx::AffineTransform element_transform() const override;
+    virtual Gfx::AffineTransform additional_element_transform() const override;
 
 private:
     SVGUseElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void initialize_element() override;
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void finalize() override;
     virtual void adopted_from(DOM::Document&) override;
@@ -67,7 +63,7 @@ private:
 
     virtual bool is_svg_use_element() const override { return true; }
 
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     void process_the_url(Optional<Utf16String> const& href);
     Optional<Utf16String> href_value() const;
@@ -77,15 +73,13 @@ private:
     void fetch_the_document(URL::URL const& url);
     bool is_referenced_element_same_document() const;
 
-    void clone_element_tree_as_our_shadow_tree(Element* to_clone);
+    void clone_element_tree_as_our_shadow_tree(GC::Ptr<Element> to_clone);
     bool is_valid_reference_element(Element const& reference_element) const;
     bool would_create_circular_reference(Element const& target) const;
     bool would_create_circular_reference_impl(Element const& target, GC::HeapHashTable<GC::Ref<Element const>>& visited) const;
     void register_for_referenced_element_changes();
     void unregister_for_referenced_element_changes();
 
-    Optional<NumberPercentage> m_x;
-    Optional<NumberPercentage> m_y;
     bool m_needs_document_complete_reclone { false };
 
     Optional<URL::URL> m_href;

@@ -23,6 +23,8 @@ using ActorRegistry = HashMap<String, NonnullRefPtr<Actor>>;
 
 class DEVTOOLS_API DevToolsServer : public Weakable<DevToolsServer> {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static ErrorOr<NonnullOwnPtr<DevToolsServer>> create(DevToolsDelegate&, u16 port);
     ~DevToolsServer();
 
@@ -60,6 +62,7 @@ private:
     void on_message_received(JsonObject);
 
     void close_connection();
+    void notify_actors_connection_closed();
 
     NonnullRefPtr<Core::TCPServer> m_server;
     RefPtr<Connection> m_connection;
@@ -71,6 +74,8 @@ private:
 
     u64 m_server_id { 0 };
     u64 m_actor_count { 0 };
+    bool m_did_notify_actors_connection_closed { false };
+    bool m_is_closing_connection { false };
     bool m_is_shutting_down { false };
 };
 

@@ -5,9 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGStopElement.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGStopElement.h>
@@ -23,15 +21,15 @@ SVGStopElement::SVGStopElement(DOM::Document& document, DOM::QualifiedName quali
 
 Gfx::Color SVGStopElement::stop_color()
 {
-    if (auto computed_values = this->computed_values())
-        return computed_values->stop_color();
+    if (auto const* values = style_group<CSS::ComputedValues::SVGResetValues>())
+        return Gfx::Color::from_bgra(values->stop_color);
     return CSS::InitialValues::stop_color();
 }
 
 float SVGStopElement::stop_opacity() const
 {
-    if (auto computed_values = this->computed_values())
-        return computed_values->stop_opacity();
+    if (auto const* values = style_group<CSS::ComputedValues::SVGResetValues>())
+        return values->stop_opacity;
     return 1;
 }
 
@@ -39,14 +37,8 @@ float SVGStopElement::stop_opacity() const
 GC::Ref<SVGAnimatedNumber> SVGStopElement::offset()
 {
     if (!m_stop_offset)
-        m_stop_offset = SVGAnimatedNumber::create(realm(), *this, DOM::QualifiedName { AttributeNames::offset, OptionalNone {}, OptionalNone {} }, 0.f);
+        m_stop_offset = SVGAnimatedNumber::create(*this, DOM::QualifiedName { AttributeNames::offset, OptionalNone {}, OptionalNone {} }, 0.f);
     return *m_stop_offset;
-}
-
-void SVGStopElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGStopElement);
-    Base::initialize(realm);
 }
 
 void SVGStopElement::visit_edges(Visitor& visitor)

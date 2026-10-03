@@ -13,9 +13,9 @@
 #include <AK/Utf16String.h>
 #include <LibDatabase/Forward.h>
 #include <LibRequests/CacheSizes.h>
-#include <LibWeb/StorageAPI/StorageEndpoint.h>
+#include <LibWebCommon/StorageAPI/StorageEndpoint.h>
+#include <LibWebCommon/WebView/StorageSetResult.h>
 #include <LibWebView/Forward.h>
-#include <LibWebView/StorageSetResult.h>
 
 namespace WebView {
 
@@ -34,6 +34,8 @@ class WEBVIEW_API StorageJar {
     AK_MAKE_NONMOVABLE(StorageJar);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static ErrorOr<Database::MigrationOutcome> migrate_schema(Database::Database&, Database::MigrationMode = Database::MigrationMode::Apply);
 
     static ErrorOr<NonnullOwnPtr<StorageJar>> create(Database::Database&);
@@ -49,6 +51,8 @@ public:
     Vector<Utf16String> get_all_keys(StorageEndpointType storage_endpoint, String const& storage_key);
     u64 usage(String const& storage_key);
     Requests::CacheSizes estimate_storage_size_accessed_since(UnixDateTime since) const;
+
+    void clone_from(StorageJar const&);
 
 private:
     struct Statements {
@@ -96,7 +100,7 @@ private:
         u64 usage(String const& storage_key);
         Requests::CacheSizes estimate_storage_size_accessed_since(UnixDateTime since) const;
 
-        Database::Database& database;
+        NonnullRefPtr<Database::Database> database;
         Statements statements;
     };
 

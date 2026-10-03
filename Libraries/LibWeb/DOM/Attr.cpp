@@ -6,48 +6,37 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Attr.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
-#include <LibWeb/DOM/MutationType.h>
-#include <LibWeb/DOM/StaticNodeList.h>
-#include <LibWeb/Editing/EditingHistory.h>
-#include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 
 namespace Web::DOM {
 
 GC_DEFINE_ALLOCATOR(Attr);
 
-GC::Ref<Attr> Attr::create(Document& document, Utf16FlyString local_name, Utf16String value, Element* owner_element)
+GC::Ref<Attr> Attr::create(Document& document, Utf16FlyString local_name, Utf16String value, GC::Ptr<Element> owner_element)
 {
-    return document.realm().create<Attr>(document, QualifiedName(move(local_name), OptionalNone {}, OptionalNone {}), move(value), owner_element);
+    return GC::Heap::the().allocate<Attr>(document, QualifiedName(move(local_name), Optional<Utf16FlyString> {}, Optional<Utf16FlyString> {}), move(value), owner_element);
 }
 
-GC::Ref<Attr> Attr::create(Document& document, QualifiedName qualified_name, Utf16String value, Element* owner_element)
+GC::Ref<Attr> Attr::create(Document& document, QualifiedName qualified_name, Utf16String value, GC::Ptr<Element> owner_element)
 {
-    return document.realm().create<Attr>(document, move(qualified_name), move(value), owner_element);
+    return GC::Heap::the().allocate<Attr>(document, move(qualified_name), move(value), owner_element);
 }
 
 GC::Ref<Attr> Attr::clone(Document& document) const
 {
-    return realm().create<Attr>(document, m_qualified_name, m_value, nullptr);
+    return GC::Heap::the().allocate<Attr>(document, m_qualified_name, value(), nullptr);
 }
 
-Attr::Attr(Document& document, QualifiedName qualified_name, Utf16String value, Element* owner_element)
+Attr::Attr(Document& document, QualifiedName qualified_name, Utf16String value, GC::Ptr<Element> owner_element)
     : Node(document, NodeType::ATTRIBUTE_NODE)
     , m_qualified_name(move(qualified_name))
     , m_value(move(value))
     , m_owner_element(owner_element)
 {
-}
-
-void Attr::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(Attr);
-    Base::initialize(realm);
 }
 
 void Attr::visit_edges(Cell::Visitor& visitor)
@@ -69,6 +58,22 @@ Element const* Attr::owner_element() const
 void Attr::set_owner_element(Element* owner_element)
 {
     m_owner_element = owner_element;
+}
+
+Utf16String Attr::value() const
+{
+    if (auto* element = owner_element()) {
+        auto index = element->find_attribute_index_ns(namespace_uri(), local_name());
+        VERIFY(index.has_value());
+        return element->m_attributes->at(*index).value;
+    }
+    return m_value;
+}
+
+void Attr::detach_from_element(Utf16String value)
+{
+    m_value = move(value);
+    m_owner_element = nullptr;
 }
 
 // https://dom.spec.whatwg.org/#set-an-existing-attribute-value
@@ -106,42 +111,11 @@ WebIDL::ExceptionOr<void> Attr::set_value(Utf16String value)
 // https://dom.spec.whatwg.org/#concept-element-attributes-change
 void Attr::change_attribute(Utf16String value)
 {
-    // 1. Let oldValue be attribute’s value.
-    auto old_value = move(m_value);
-
-    // 2. Set attribute’s value to value.
-    m_value = move(value);
-
-    // 3. Handle attribute changes for attribute with attribute’s element, oldValue, and value.
-    handle_attribute_changes(*owner_element(), old_value, m_value);
-}
-
-// https://dom.spec.whatwg.org/#handle-attribute-changes
-void Attr::handle_attribute_changes(Element& element, Optional<Utf16String> const& old_value, Optional<Utf16String> const& new_value)
-{
-    // NB: Mutations during a recorded editing command must go through the Editing proxy functions.
-    if (auto history = element.document().editing_history_if_exists())
-        history->notify_dom_mutation();
-
-    // 1. Queue a mutation record of "attributes" for element with attribute’s local name, attribute’s namespace, oldValue, « », « », null, and null.
-    element.queue_mutation_record(MutationType::attributes, local_name(), namespace_uri(), old_value, {}, {}, nullptr, nullptr);
-
-    // 2. If element is custom, then enqueue a custom element callback reaction with element, callback name "attributeChangedCallback",
-    //    and « attribute’s local name, oldValue, newValue, attribute’s namespace ».
-    if (element.is_custom()) {
-        auto& vm = this->vm();
-
-        GC::RootVector<JS::Value> arguments;
-        arguments.append(JS::PrimitiveString::create(vm, local_name()));
-        arguments.append(!old_value.has_value() ? JS::js_null() : JS::PrimitiveString::create(vm, old_value.value()));
-        arguments.append(!new_value.has_value() ? JS::js_null() : JS::PrimitiveString::create(vm, new_value.value()));
-        arguments.append(!namespace_uri().has_value() ? JS::js_null() : JS::PrimitiveString::create(vm, namespace_uri().value()));
-
-        element.enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::attributeChangedCallback, move(arguments));
+    if (auto* element = owner_element()) {
+        element->change_attribute_value(*this, move(value));
+        return;
     }
-
-    // 3. Run the attribute change steps with element, attribute’s local name, oldValue, newValue, and attribute’s namespace.
-    element.run_attribute_change_steps(local_name(), old_value, new_value, namespace_uri());
+    m_value = move(value);
 }
 
 }
